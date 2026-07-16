@@ -15,11 +15,16 @@ import forge.runtime.model_client as model_client_module
 from forge.runtime.model_client import (
     AnthropicModelClient,
     ModelClient,
+    ModelProtocolError,
 )
 from forge.runtime.state import (
     ModelTextDelta,
+    ModelToolCallArgumentsDelta,
+    ModelToolCallCompleted,
+    ModelToolCallStarted,
     ModelUsageUpdate,
     TokenUsage,
+    ToolCall,
 )
 
 
@@ -139,10 +144,12 @@ def test_stream_delegates_events_and_merges_usage() -> None:
         ),
         SimpleNamespace(
             type='content_block_delta',
+            index=0,
             delta=SimpleNamespace(type='text_delta', text='Hello'),
         ),
         SimpleNamespace(
             type='content_block_delta',
+            index=0,
             delta=SimpleNamespace(type='text_delta', text=' world'),
         ),
         SimpleNamespace(
@@ -200,6 +207,153 @@ def test_stream_delegates_events_and_merges_usage() -> None:
         }
     ]
     assert isinstance(client, ModelClient)
+
+
+def test_stream_emits_multiple_completed_tool_calls() -> None:
+    sdk = FakeAnthropic()
+    sdk.messages.events = [
+        SimpleNamespace(
+            type='message_start',
+            message=SimpleNamespace(
+                usage=usage(input_tokens=80, output_tokens=0)
+            ),
+        ),
+        SimpleNamespace(
+            type='content_block_start',
+            index=0,
+            content_block=SimpleNamespace(
+                type='tool_use',
+                id='toolu_read',
+                name='read_file',
+                input={},
+            ),
+        ),
+        SimpleNamespace(
+            type='content_block_delta',
+            index=0,
+            delta=SimpleNamespace(
+                type='input_json_delta',
+                partial_json='{"path":',
+            ),
+        ),
+        SimpleNamespace(
+            type='content_block_delta',
+            index=0,
+            delta=SimpleNamespace(
+                type='input_json_delta',
+                partial_json='"README.md"}',
+            ),
+        ),
+        SimpleNamespace(type='content_block_stop', index=0),
+        SimpleNamespace(
+            type='content_block_start',
+            index=1,
+            content_block=SimpleNamespace(
+                type='tool_use',
+                id='toolu_grep',
+                name='grep',
+                input={},
+            ),
+        ),
+        SimpleNamespace(
+            type='content_block_delta',
+            index=1,
+            delta=SimpleNamespace(
+                type='input_json_delta',
+                partial_json='{"pattern":"TODO","path":"forge"}',
+            ),
+        ),
+        SimpleNamespace(type='content_block_stop', index=1),
+        SimpleNamespace(
+            type='message_delta',
+            usage=usage(input_tokens=None, output_tokens=24),
+        ),
+    ]
+    sdk.messages.final_message = SimpleNamespace(
+        usage=usage(input_tokens=80, output_tokens=24)
+    )
+    client = AnthropicModelClient(model='claude-test', client=sdk)
+
+    events = collect_stream(
+        client,
+        messages=[{'role': 'user', 'content': 'Inspect the repository.'}],
+    )
+
+    assert events == [
+        ModelUsageUpdate(
+            usage=TokenUsage(input_tokens=80, output_tokens=0)
+        ),
+        ModelToolCallStarted(
+            index=0,
+            id='toolu_read',
+            name='read_file',
+        ),
+        ModelToolCallArgumentsDelta(index=0, partial_json='{"path":'),
+        ModelToolCallArgumentsDelta(
+            index=0,
+            partial_json='"README.md"}',
+        ),
+        ModelToolCallCompleted(
+            tool_call=ToolCall(
+                index=0,
+                id='toolu_read',
+                name='read_file',
+                arguments={'path': 'README.md'},
+            )
+        ),
+        ModelToolCallStarted(
+            index=1,
+            id='toolu_grep',
+            name='grep',
+        ),
+        ModelToolCallArgumentsDelta(
+            index=1,
+            partial_json='{"pattern":"TODO","path":"forge"}',
+        ),
+        ModelToolCallCompleted(
+            tool_call=ToolCall(
+                index=1,
+                id='toolu_grep',
+                name='grep',
+                arguments={'pattern': 'TODO', 'path': 'forge'},
+            )
+        ),
+        ModelUsageUpdate(
+            usage=TokenUsage(input_tokens=80, output_tokens=24)
+        ),
+    ]
+
+
+def test_stream_rejects_invalid_tool_argument_json() -> None:
+    sdk = FakeAnthropic()
+    sdk.messages.events = [
+        SimpleNamespace(
+            type='content_block_start',
+            index=0,
+            content_block=SimpleNamespace(
+                type='tool_use',
+                id='toolu_bad',
+                name='read_file',
+                input={},
+            ),
+        ),
+        SimpleNamespace(
+            type='content_block_delta',
+            index=0,
+            delta=SimpleNamespace(
+                type='input_json_delta',
+                partial_json='["README.md"]',
+            ),
+        ),
+        SimpleNamespace(type='content_block_stop', index=0),
+    ]
+    client = AnthropicModelClient(model='claude-test', client=sdk)
+
+    with pytest.raises(ModelProtocolError, match='must be a JSON object'):
+        collect_stream(
+            client,
+            messages=[{'role': 'user', 'content': 'Read a file.'}],
+        )
 
 
 def test_stream_omits_unused_optional_parameters() -> None:

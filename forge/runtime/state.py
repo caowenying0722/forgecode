@@ -1,6 +1,9 @@
 '''Runtime value objects shared across the Agent Loop and terminal UI.'''
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +46,25 @@ class TurnResult:
 
     text: str
     usage: TokenUsage
+    tool_calls: tuple[ToolCall, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    '''One validated tool request produced by the model.'''
+
+    index: int
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(hash=False)
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise ValueError('index must not be negative')
+        if not self.id:
+            raise ValueError('id must not be empty')
+        if not self.name:
+            raise ValueError('name must not be empty')
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +72,31 @@ class ModelTextDelta:
     '''One text fragment emitted by a streaming model response.'''
 
     text: str
+    index: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ModelToolCallStarted:
+    '''A model started streaming one tool request.'''
+
+    index: int
+    id: str
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelToolCallArgumentsDelta:
+    '''One partial JSON fragment for a streaming tool request.'''
+
+    index: int
+    partial_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelToolCallCompleted:
+    '''A tool request has complete, validated JSON arguments.'''
+
+    tool_call: ToolCall
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,5 +113,11 @@ class TurnCompleted:
     result: TurnResult
 
 
-type ModelStreamEvent = ModelTextDelta | ModelUsageUpdate
+type ModelStreamEvent = (
+    ModelTextDelta
+    | ModelToolCallStarted
+    | ModelToolCallArgumentsDelta
+    | ModelToolCallCompleted
+    | ModelUsageUpdate
+)
 type ConversationEvent = ModelStreamEvent | TurnCompleted

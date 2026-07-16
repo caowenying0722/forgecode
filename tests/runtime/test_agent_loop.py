@@ -15,10 +15,14 @@ from forge.runtime.state import (
     ConversationEvent,
     ModelStreamEvent,
     ModelTextDelta,
+    ModelToolCallArgumentsDelta,
+    ModelToolCallCompleted,
+    ModelToolCallStarted,
     ModelUsageUpdate,
     TokenUsage,
     TurnCompleted,
     TurnResult,
+    ToolCall,
 )
 
 
@@ -123,6 +127,72 @@ def test_conversation_accepts_an_explicit_system_prompt() -> None:
     collect_turn(conversation, 'hello')
 
     assert client.calls[0]['system'] == 'test system'
+
+
+def test_conversation_accepts_a_tool_only_response() -> None:
+    tool_call = ToolCall(
+        index=0,
+        id='toolu_read',
+        name='read_file',
+        arguments={'path': 'README.md'},
+    )
+    client = FakeModelClient(
+        [
+            ModelUsageUpdate(
+                usage=TokenUsage(input_tokens=15, output_tokens=0)
+            ),
+            ModelToolCallStarted(
+                index=0,
+                id='toolu_read',
+                name='read_file',
+            ),
+            ModelToolCallArgumentsDelta(
+                index=0,
+                partial_json='{"path":"README.md"}',
+            ),
+            ModelToolCallCompleted(tool_call=tool_call),
+            ModelUsageUpdate(
+                usage=TokenUsage(input_tokens=15, output_tokens=10)
+            ),
+        ]
+    )
+    tools: list[ToolParam] = [
+        {
+            'name': 'read_file',
+            'description': 'Read one file.',
+            'input_schema': {
+                'type': 'object',
+                'properties': {'path': {'type': 'string'}},
+                'required': ['path'],
+            },
+        }
+    ]
+    conversation = Conversation(client=client, tools=tools)
+
+    events = collect_turn(conversation, 'Read the README')
+
+    assert events[-1] == TurnCompleted(
+        result=TurnResult(
+            text='',
+            usage=TokenUsage(input_tokens=15, output_tokens=10),
+            tool_calls=(tool_call,),
+        )
+    )
+    assert client.calls[0]['tools'] == tools
+    assert conversation.messages == [
+        {'role': 'user', 'content': 'Read the README'},
+        {
+            'role': 'assistant',
+            'content': [
+                {
+                    'type': 'tool_use',
+                    'id': 'toolu_read',
+                    'name': 'read_file',
+                    'input': {'path': 'README.md'},
+                }
+            ],
+        },
+    ]
 
 
 def test_conversation_sends_previous_turns_as_context() -> None:

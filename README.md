@@ -199,7 +199,7 @@ forbidden_paths:
         → 修改代码 → 运行测试 → 输出结果
 ```
 
-### 当前进度：M1.1 可验证的交互式模型调用
+### 当前进度：M1.2 统一 Tool Calling 协议
 
 - [x] 执行 `forge` 后进入持续交互循环，按 `Ctrl+C` 退出；
 - [x] 同一会话保留用户和模型消息，使后续请求携带历史上下文；
@@ -213,13 +213,24 @@ forbidden_paths:
 
 M1.1 当前验证 CLI、配置、ModelClient、流式文本、Token usage 与终端渲染链路，不代表完整 Agent Loop 已完成。工具调用循环、轨迹与验证闭环仍属于后续 M1 工作。
 
+M1.2 在保持 Anthropic SDK 请求类型简洁性的同时，将 Provider 流转换为 ForgeCode 统一响应事件：
+
+- [x] 定义 `ToolCall` 以及工具调用开始、参数增量和完成事件；
+- [x] 解析 Anthropic `tool_use`、`input_json_delta` 和 `content_block_stop`；
+- [x] 按内容块索引独立聚合参数，支持一轮返回多个 Tool Call；
+- [x] 工具参数完成后解析并验证为 JSON 对象，协议错误不会产生半成品 `ToolCall`；
+- [x] `TurnResult` 同时支持文本和工具调用，纯工具调用也是合法模型响应；
+- [x] 将完成的工具调用保存为 Anthropic `tool_use` 助手消息，为后续执行循环提供上下文。
+
+M1.2 只完成“模型表达要调用什么工具”的协议层。CLI 尚未向模型提供真实工具，ForgeCode 也尚未执行 Tool Call；统一 Tool 接口、工具实现和“执行结果反馈给模型”的循环属于 M1.3 及后续工作。
+
 ### 任务
 
 Model Client：
 
-- [ ] 定义统一的模型请求和响应类型；
+- [x] 通过 `ModelClient`、Anthropic SDK 请求类型和 Provider 无关的流式事件定义统一模型边界；
 - [x] 支持文本流式输出；
-- [ ] 支持 Tool Calling 和单轮返回多个 Tool Call；
+- [x] 支持 Tool Calling 和单轮返回多个 Tool Call；
 - [x] 读取并显示每轮输入、输出和缓存 Token；
 - [ ] 记录模型调用耗时；
 - [ ] 处理超时、限流、格式错误和有限次数重试。

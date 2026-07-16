@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+import json
 from typing import Any, Protocol, runtime_checkable
 
 from anthropic import AsyncAnthropic, omit
@@ -12,12 +14,28 @@ from forge.config import ForgeConfig
 from forge.runtime.state import (
     ModelStreamEvent,
     ModelTextDelta,
+    ModelToolCallArgumentsDelta,
+    ModelToolCallCompleted,
+    ModelToolCallStarted,
     ModelUsageUpdate,
     TokenUsage,
+    ToolCall,
 )
 
 
 DEFAULT_MODEL_PROVIDER = 'anthropic'
+
+
+class ModelProtocolError(RuntimeError):
+    '''Raised when a provider emits an invalid model stream.'''
+
+
+@dataclass(slots=True)
+class _PendingToolCall:
+    id: str
+    name: str
+    initial_input: dict[str, Any]
+    json_parts: list[str] = field(default_factory=list)
 
 
 @runtime_checkable
@@ -89,6 +107,7 @@ class AnthropicModelClient:
         system: str | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         current_usage: TokenUsage | None = None
+        pending_tool_calls: dict[int, _PendingToolCall] = {}
         async with self._client.messages.stream(
             model=self.model,
             max_tokens=self.max_tokens,
@@ -101,7 +120,57 @@ class AnthropicModelClient:
                     event.type == 'content_block_delta'
                     and event.delta.type == 'text_delta'
                 ):
-                    yield ModelTextDelta(text=event.delta.text)
+                    yield ModelTextDelta(
+                        text=event.delta.text,
+                        index=event.index,
+                    )
+                elif (
+                    event.type == 'content_block_start'
+                    and event.content_block.type == 'tool_use'
+                ):
+                    block = event.content_block
+                    pending_tool_calls[event.index] = _PendingToolCall(
+                        id=block.id,
+                        name=block.name,
+                        initial_input=dict(block.input),
+                    )
+                    yield ModelToolCallStarted(
+                        index=event.index,
+                        id=block.id,
+                        name=block.name,
+                    )
+                elif (
+                    event.type == 'content_block_delta'
+                    and event.delta.type == 'input_json_delta'
+                ):
+                    pending = pending_tool_calls.get(event.index)
+                    if pending is None:
+                        raise ModelProtocolError(
+                            'Received tool arguments before tool_use started '
+                            f'at content block {event.index}.'
+                        )
+                    pending.json_parts.append(event.delta.partial_json)
+                    yield ModelToolCallArgumentsDelta(
+                        index=event.index,
+                        partial_json=event.delta.partial_json,
+                    )
+                elif (
+                    event.type == 'content_block_stop'
+                    and event.index in pending_tool_calls
+                ):
+                    pending = pending_tool_calls.pop(event.index)
+                    arguments = parse_tool_arguments(
+                        pending,
+                        index=event.index,
+                    )
+                    yield ModelToolCallCompleted(
+                        tool_call=ToolCall(
+                            index=event.index,
+                            id=pending.id,
+                            name=pending.name,
+                            arguments=arguments,
+                        )
+                    )
                 elif event.type == 'message_start':
                     current_usage = merge_usage(
                         event.message.usage,
@@ -117,9 +186,40 @@ class AnthropicModelClient:
 
             final_message = await stream.get_final_message()
 
+        if pending_tool_calls:
+            indexes = ', '.join(str(index) for index in pending_tool_calls)
+            raise ModelProtocolError(
+                f'Tool calls did not finish at content blocks: {indexes}.'
+            )
+
         final_usage = merge_usage(final_message.usage, current_usage)
         if final_usage != current_usage:
             yield ModelUsageUpdate(usage=final_usage)
+
+
+def parse_tool_arguments(
+    pending: _PendingToolCall,
+    *,
+    index: int,
+) -> dict[str, Any]:
+    '''Parse and validate one completed tool call JSON object.'''
+    raw_json = ''.join(pending.json_parts)
+    if not raw_json:
+        return pending.initial_input
+
+    try:
+        arguments = json.loads(raw_json)
+    except json.JSONDecodeError as error:
+        raise ModelProtocolError(
+            f'Invalid JSON arguments for tool {pending.name!r} '
+            f'at content block {index}: {error.msg}.'
+        ) from error
+    if not isinstance(arguments, dict):
+        raise ModelProtocolError(
+            f'Arguments for tool {pending.name!r} at content block '
+            f'{index} must be a JSON object.'
+        )
+    return arguments
 
 
 def merge_usage(
