@@ -11,6 +11,7 @@ requires-python = '>=3.12'
 dependencies = [
     'anthropic>=0.116,<0.117',
     'python-dotenv>=1,<2',
+    "rich>=13,<15",
     'typer>=0.9,<1.0',
 ]
 
@@ -19,6 +20,9 @@ forge = 'forge.cli:app'
 
 [tool.setuptools.packages.find]
 include = ['forge*']
+
+[tool.setuptools.package-data]
+forge = ['prompts/*.md']
 
 [tool.pytest.ini_options]
 testpaths = ['tests']
