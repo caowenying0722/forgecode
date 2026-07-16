@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from forge.tools.base import ToolResult
+
 
 @dataclass(frozen=True, slots=True)
 class TokenUsage:
@@ -107,6 +109,21 @@ class ModelUsageUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolExecutionStarted:
+    '''The runtime started executing one completed model tool request.'''
+
+    tool_call: ToolCall
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionCompleted:
+    '''The runtime finished one tool request with a structured result.'''
+
+    tool_call: ToolCall
+    result: ToolResult
+
+
+@dataclass(frozen=True, slots=True)
 class TurnCompleted:
     '''Final validated result for one streamed conversation turn.'''
 
@@ -120,4 +137,9 @@ type ModelStreamEvent = (
     | ModelToolCallCompleted
     | ModelUsageUpdate
 )
-type ConversationEvent = ModelStreamEvent | TurnCompleted
+type ConversationEvent = (
+    ModelStreamEvent
+    | ToolExecutionStarted
+    | ToolExecutionCompleted
+    | TurnCompleted
+)

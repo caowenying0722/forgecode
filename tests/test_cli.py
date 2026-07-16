@@ -15,9 +15,13 @@ from forge.runtime.state import (
     ModelTextDelta,
     ModelUsageUpdate,
     TokenUsage,
+    ToolCall,
+    ToolExecutionCompleted,
+    ToolExecutionStarted,
     TurnCompleted,
     TurnResult,
 )
+from forge.tools.base import ToolResult
 
 
 runner = CliRunner()
@@ -57,6 +61,16 @@ class FakeResponseView:
     def update_usage(self, usage: TokenUsage) -> None:
         self.actions.append(('usage', usage))
 
+    def start_tool(self, tool_call: ToolCall) -> None:
+        self.actions.append(('tool_started', tool_call))
+
+    def complete_tool(
+        self,
+        tool_call: ToolCall,
+        result: ToolResult,
+    ) -> None:
+        self.actions.append(('tool_completed', (tool_call, result)))
+
     def complete(self, result: TurnResult) -> None:
         self.actions.append(('complete', result))
 
@@ -91,11 +105,23 @@ def test_stream_events_are_forwarded_to_live_view() -> None:
     initial_usage = TokenUsage(input_tokens=10, output_tokens=0)
     final_usage = TokenUsage(input_tokens=10, output_tokens=2)
     result = TurnResult(text='Hello', usage=final_usage)
+    tool_call = ToolCall(
+        index=0,
+        id='toolu_test',
+        name='read_file',
+        arguments={'path': 'README.md'},
+    )
+    tool_result = ToolResult.ok('Read file.', content='README')
     conversation = FakeConversation(
         [
             ModelUsageUpdate(usage=initial_usage),
             ModelTextDelta(text='Hel'),
             ModelTextDelta(text='lo'),
+            ToolExecutionStarted(tool_call=tool_call),
+            ToolExecutionCompleted(
+                tool_call=tool_call,
+                result=tool_result,
+            ),
             ModelUsageUpdate(usage=final_usage),
             TurnCompleted(result=result),
         ]
@@ -114,6 +140,8 @@ def test_stream_events_are_forwarded_to_live_view() -> None:
         ('usage', initial_usage),
         ('text', 'Hel'),
         ('text', 'lo'),
+        ('tool_started', tool_call),
+        ('tool_completed', (tool_call, tool_result)),
         ('usage', final_usage),
         ('complete', result),
     ]
@@ -126,7 +154,11 @@ def test_cli_starts_an_interactive_conversation(
         turn('Hello', input_tokens=10, output_tokens=2),
         turn('I remember', input_tokens=20, output_tokens=3),
     )
-    monkeypatch.setattr(cli_module, 'Conversation', lambda: conversation)
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
 
     result = runner.invoke(app, input='first\nsecond\n')
 
@@ -153,7 +185,11 @@ def test_interactive_conversation_continues_after_model_failure(
         RuntimeError('provider unavailable'),
         turn('Recovered', input_tokens=12, output_tokens=4),
     )
-    monkeypatch.setattr(cli_module, 'Conversation', lambda: conversation)
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
 
     result = runner.invoke(app, input='first\nsecond\n')
 
@@ -167,7 +203,7 @@ def test_interactive_conversation_continues_after_model_failure(
 def test_interactive_conversation_explains_missing_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def missing_conversation() -> None:
+    def missing_conversation(**_kwargs: object) -> None:
         raise ConfigurationError('ANTHROPIC_API_KEY is not set.')
 
     monkeypatch.setattr(cli_module, 'Conversation', missing_conversation)

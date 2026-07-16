@@ -1,6 +1,7 @@
 '''Command-line entry point for ForgeCode.'''
 
 import asyncio
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -11,9 +12,12 @@ from forge.runtime.agent_loop import Conversation
 from forge.runtime.state import (
     ModelTextDelta,
     ModelUsageUpdate,
+    ToolExecutionCompleted,
+    ToolExecutionStarted,
     TurnCompleted,
 )
 from forge.terminal import StreamingResponseView, TerminalUI
+from forge.tools import create_default_registry
 
 
 app = typer.Typer(
@@ -74,7 +78,11 @@ def run_interactive_chat(
     terminal: TerminalUI | None = None,
 ) -> None:
     '''Run a local chat session until the user interrupts it.'''
-    resolved_session = session if session is not None else Conversation()
+    resolved_session = (
+        session
+        if session is not None
+        else Conversation(registry=create_default_registry(Path.cwd()))
+    )
     resolved_terminal = terminal if terminal is not None else TerminalUI()
     client = getattr(resolved_session, 'client', None)
     model = getattr(client, 'model', 'configured model')
@@ -118,6 +126,10 @@ async def render_streamed_turn(
             response_view.append_text(event.text)
         elif isinstance(event, ModelUsageUpdate):
             response_view.update_usage(event.usage)
+        elif isinstance(event, ToolExecutionStarted):
+            response_view.start_tool(event.tool_call)
+        elif isinstance(event, ToolExecutionCompleted):
+            response_view.complete_tool(event.tool_call, event.result)
         elif isinstance(event, TurnCompleted):
             response_view.complete(event.result)
 

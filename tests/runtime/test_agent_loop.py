@@ -2,11 +2,15 @@
 
 import asyncio
 from collections.abc import AsyncIterator
+import json
+from pathlib import Path
 
 import pytest
 from anthropic.types import MessageParam, ToolParam
+from pydantic import Field
 
 from forge.runtime.agent_loop import (
+    AgentLoopLimitError,
     Conversation,
     ModelResponseError,
     load_system_prompt,
@@ -20,10 +24,13 @@ from forge.runtime.state import (
     ModelToolCallStarted,
     ModelUsageUpdate,
     TokenUsage,
+    ToolExecutionCompleted,
+    ToolExecutionStarted,
     TurnCompleted,
     TurnResult,
     ToolCall,
 )
+from forge.tools.base import Tool, ToolInput, ToolRegistry, ToolResult
 
 
 class FakeModelClient:
@@ -80,6 +87,68 @@ def collect_turn(
     return asyncio.run(collect())
 
 
+class ReadFileInput(ToolInput):
+    path: str = Field(min_length=1)
+
+
+class RecordingReadFileTool(Tool[ReadFileInput]):
+    name = 'read_file'
+    description = 'Read a test file.'
+    input_model = ReadFileInput
+
+    def __init__(
+        self,
+        root: Path,
+        result: ToolResult | None = None,
+    ) -> None:
+        super().__init__(root)
+        self.calls: list[str] = []
+        self.result = result or ToolResult.ok(
+            'Read file.',
+            content='file contents',
+        )
+
+    async def execute(self, arguments: ReadFileInput) -> ToolResult:
+        self.calls.append(arguments.path)
+        return self.result
+
+
+def tool_response(
+    *tool_calls: ToolCall,
+    input_tokens: int = 15,
+    output_tokens: int = 10,
+) -> list[ModelStreamEvent]:
+    events: list[ModelStreamEvent] = [
+        ModelUsageUpdate(
+            usage=TokenUsage(input_tokens=input_tokens, output_tokens=0)
+        )
+    ]
+    for tool_call in tool_calls:
+        events.extend(
+            [
+                ModelToolCallStarted(
+                    index=tool_call.index,
+                    id=tool_call.id,
+                    name=tool_call.name,
+                ),
+                ModelToolCallArgumentsDelta(
+                    index=tool_call.index,
+                    partial_json=json.dumps(tool_call.arguments),
+                ),
+                ModelToolCallCompleted(tool_call=tool_call),
+            ]
+        )
+    events.append(
+        ModelUsageUpdate(
+            usage=TokenUsage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        )
+    )
+    return events
+
+
 def test_conversation_forwards_stream_and_returns_final_result() -> None:
     client = FakeModelClient(streamed_response('RE', 'ADY'))
     conversation = Conversation(client=client)
@@ -114,7 +183,10 @@ def test_system_prompt_defines_forgecode_identity() -> None:
 
     assert 'Your product identity is ForgeCode.' in prompt
     assert 'Do not claim to be Anthropic' in prompt
-    assert 'This M1.1 runtime supports conversation only.' in prompt
+    assert 'The M1.4 runtime can use built-in file' in prompt
+    assert 'only when its schema is included' in prompt
+    assert 'call another tool instead of giving a premature' in prompt
+    assert 'Do not run destructive commands' in prompt
 
 
 def test_conversation_accepts_an_explicit_system_prompt() -> None:
@@ -129,7 +201,9 @@ def test_conversation_accepts_an_explicit_system_prompt() -> None:
     assert client.calls[0]['system'] == 'test system'
 
 
-def test_conversation_accepts_a_tool_only_response() -> None:
+def test_conversation_executes_tool_and_continues_until_final_text(
+    tmp_path: Path,
+) -> None:
     tool_call = ToolCall(
         index=0,
         id='toolu_read',
@@ -137,48 +211,70 @@ def test_conversation_accepts_a_tool_only_response() -> None:
         arguments={'path': 'README.md'},
     )
     client = FakeModelClient(
-        [
-            ModelUsageUpdate(
-                usage=TokenUsage(input_tokens=15, output_tokens=0)
-            ),
-            ModelToolCallStarted(
-                index=0,
-                id='toolu_read',
-                name='read_file',
-            ),
-            ModelToolCallArgumentsDelta(
-                index=0,
-                partial_json='{"path":"README.md"}',
-            ),
-            ModelToolCallCompleted(tool_call=tool_call),
-            ModelUsageUpdate(
-                usage=TokenUsage(input_tokens=15, output_tokens=10)
-            ),
-        ]
+        tool_response(tool_call),
+        streamed_response(
+            'Finished',
+            input_tokens=30,
+            output_tokens=4,
+        ),
     )
-    tools: list[ToolParam] = [
-        {
-            'name': 'read_file',
-            'description': 'Read one file.',
-            'input_schema': {
-                'type': 'object',
-                'properties': {'path': {'type': 'string'}},
-                'required': ['path'],
-            },
-        }
-    ]
-    conversation = Conversation(client=client, tools=tools)
+    tool = RecordingReadFileTool(tmp_path)
+    registry = ToolRegistry([tool])
+    conversation = Conversation(client=client, registry=registry)
 
     events = collect_turn(conversation, 'Read the README')
 
+    assert ToolExecutionStarted(tool_call=tool_call) in events
+    assert ToolExecutionCompleted(
+        tool_call=tool_call,
+        result=tool.result,
+    ) in events
     assert events[-1] == TurnCompleted(
         result=TurnResult(
-            text='',
-            usage=TokenUsage(input_tokens=15, output_tokens=10),
+            text='Finished',
+            usage=TokenUsage(input_tokens=45, output_tokens=14),
             tool_calls=(tool_call,),
         )
     )
-    assert client.calls[0]['tools'] == tools
+    assert tool.calls == ['README.md']
+    assert client.calls[0]['tools'] == registry.definitions
+    assert client.calls[1]['messages'] == [
+        {'role': 'user', 'content': 'Read the README'},
+        {
+            'role': 'assistant',
+            'content': [
+                {
+                    'type': 'tool_use',
+                    'id': 'toolu_read',
+                    'name': 'read_file',
+                    'input': {'path': 'README.md'},
+                }
+            ],
+        },
+        {
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': 'toolu_read',
+                    'content': client.calls[1]['messages'][2]['content'][0][
+                        'content'
+                    ],
+                    'is_error': False,
+                }
+            ],
+        },
+    ]
+    payload = json.loads(
+        client.calls[1]['messages'][2]['content'][0]['content']
+    )
+    assert payload == {
+        'success': True,
+        'summary': 'Read file.',
+        'content': 'file contents',
+        'error': None,
+        'metadata': {},
+    }
     assert conversation.messages == [
         {'role': 'user', 'content': 'Read the README'},
         {
@@ -192,7 +288,98 @@ def test_conversation_accepts_a_tool_only_response() -> None:
                 }
             ],
         },
+        client.calls[1]['messages'][2],
+        {'role': 'assistant', 'content': 'Finished'},
     ]
+
+
+def test_conversation_executes_multiple_tool_calls_in_order(
+    tmp_path: Path,
+) -> None:
+    first = ToolCall(
+        index=0,
+        id='toolu_first',
+        name='read_file',
+        arguments={'path': 'a.py'},
+    )
+    second = ToolCall(
+        index=1,
+        id='toolu_second',
+        name='read_file',
+        arguments={'path': 'b.py'},
+    )
+    client = FakeModelClient(
+        tool_response(first, second),
+        streamed_response('Done', input_tokens=25, output_tokens=3),
+    )
+    tool = RecordingReadFileTool(tmp_path)
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry([tool]),
+    )
+
+    events = collect_turn(conversation, 'Read both files')
+
+    assert tool.calls == ['a.py', 'b.py']
+    result_blocks = client.calls[1]['messages'][2]['content']
+    assert [block['tool_use_id'] for block in result_blocks] == [
+        'toolu_first',
+        'toolu_second',
+    ]
+    assert events[-1].result.tool_calls == (first, second)
+
+
+def test_failed_tool_result_is_returned_to_model(
+    tmp_path: Path,
+) -> None:
+    tool_call = ToolCall(
+        index=0,
+        id='toolu_missing',
+        name='missing_tool',
+        arguments={},
+    )
+    client = FakeModelClient(
+        tool_response(tool_call),
+        streamed_response('Could not run that tool.'),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry([RecordingReadFileTool(tmp_path)]),
+    )
+
+    collect_turn(conversation, 'Use a missing tool')
+
+    block = client.calls[1]['messages'][2]['content'][0]
+    payload = json.loads(block['content'])
+    assert block['is_error'] is True
+    assert payload['success'] is False
+    assert payload['error']['code'] == 'unknown_tool'
+
+
+def test_agent_loop_stops_at_model_call_limit(tmp_path: Path) -> None:
+    first = ToolCall(
+        index=0,
+        id='toolu_1',
+        name='read_file',
+        arguments={'path': 'a.py'},
+    )
+    second = ToolCall(
+        index=0,
+        id='toolu_2',
+        name='read_file',
+        arguments={'path': 'b.py'},
+    )
+    client = FakeModelClient(tool_response(first), tool_response(second))
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry([RecordingReadFileTool(tmp_path)]),
+        max_iterations=2,
+    )
+
+    with pytest.raises(AgentLoopLimitError, match='exceeded 2'):
+        collect_turn(conversation, 'Never finish')
+
+    assert len(client.calls) == 2
 
 
 def test_conversation_sends_previous_turns_as_context() -> None:
