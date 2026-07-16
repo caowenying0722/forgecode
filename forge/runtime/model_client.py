@@ -7,6 +7,8 @@ from typing import Protocol, runtime_checkable
 from anthropic import AsyncAnthropic, omit
 from anthropic.types import Message, MessageParam, ToolParam
 
+from forge.config import ForgeConfig
+
 
 DEFAULT_MODEL_PROVIDER = 'anthropic'
 
@@ -36,6 +38,7 @@ class AnthropicModelClient:
         self,
         model: str,
         max_tokens: int = 4096,
+        config: ForgeConfig | None = None,
         client: AsyncAnthropic | None = None,
     ) -> None:
         if not model:
@@ -45,7 +48,16 @@ class AnthropicModelClient:
 
         self.model = model
         self.max_tokens = max_tokens
-        self._client = client if client is not None else AsyncAnthropic()
+        if client is not None:
+            self._client = client
+        else:
+            resolved_config = (
+                config if config is not None else ForgeConfig.from_env()
+            )
+            self._client = AsyncAnthropic(
+                api_key=resolved_config.api_key,
+                base_url=resolved_config.base_url,
+            )
 
     async def generate(
         self,

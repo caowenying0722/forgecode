@@ -10,6 +10,7 @@ readme = 'README.md'
 requires-python = '>=3.12'
 dependencies = [
     'anthropic>=0.116,<0.117',
+    'python-dotenv>=1,<2',
     'typer>=0.9,<1.0',
 ]
 
@@ -21,7 +22,6 @@ include = ['forge*']
 
 [tool.pytest.ini_options]
 testpaths = ['tests']
-pythonpath = ['.']
 
 [dependency-groups]
 dev = [

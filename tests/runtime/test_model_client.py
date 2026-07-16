@@ -7,6 +7,8 @@ import pytest
 from anthropic import omit
 from anthropic.types import MessageParam, ToolParam
 
+from forge.config import ForgeConfig
+import forge.runtime.model_client as model_client_module
 from forge.runtime.model_client import (
     AnthropicModelClient,
     ModelClient,
@@ -26,6 +28,34 @@ class FakeMessages:
 class FakeAnthropic:
     def __init__(self) -> None:
         self.messages = FakeMessages()
+
+
+def test_client_passes_explicit_config_to_anthropic_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sdk = FakeAnthropic()
+    constructor_calls: list[dict[str, str]] = []
+
+    def create_sdk(**kwargs: str) -> FakeAnthropic:
+        constructor_calls.append(kwargs)
+        return sdk
+
+    monkeypatch.setattr(model_client_module, 'AsyncAnthropic', create_sdk)
+
+    AnthropicModelClient(
+        model='claude-test',
+        config=ForgeConfig(
+            api_key='test-api-key',
+            base_url='https://gateway.example.com/anthropic',
+        ),
+    )
+
+    assert constructor_calls == [
+        {
+            'api_key': 'test-api-key',
+            'base_url': 'https://gateway.example.com/anthropic',
+        }
+    ]
 
 
 def test_generate_delegates_to_anthropic_sdk() -> None:
