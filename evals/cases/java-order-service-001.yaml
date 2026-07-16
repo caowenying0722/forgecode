@@ -1,0 +1,19 @@
+id: java-order-service-001
+repo: fixtures/java-order-service
+base_commit_repository: .
+base_commit: 57317f640278ed1ca9270bfaf0bef450be53d781
+task: 修复订单总额计算忽略商品数量的问题，确保每个订单项按单价乘数量计入总额，并补充或调整公开测试。
+build_command: mvn -q -DskipTests package
+test_command: mvn -q test
+hidden_test_command: mvn -q -Phidden-tests -Dtest=OrderServiceHiddenTest test
+timeout_seconds: 300
+allowed_paths:
+  - src/main/**
+  - src/test/**
+forbidden_paths:
+  - tests/hidden/**
+success_criteria:
+  build_passed: true
+  public_tests_passed: true
+  hidden_tests_passed: true
+  git_diff_nonempty: true

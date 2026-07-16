@@ -1,0 +1,20 @@
+id: typescript-todo-001
+repo: fixtures/typescript-todo
+base_commit_repository: .
+base_commit: 6ed3549e0d7ff48c1f6171938d38dafadd43e0e9
+task: 修复 complete 根据数组下标而不是 Todo id 选择任务的问题，确保只完成指定 id 的任务，并补充或调整公开测试。
+setup_command: npm ci
+build_command: npm run build
+test_command: npm test
+hidden_test_command: npm run test:hidden
+timeout_seconds: 300
+allowed_paths:
+  - src/**
+  - tests/public/**
+forbidden_paths:
+  - tests/hidden/**
+success_criteria:
+  build_passed: true
+  public_tests_passed: true
+  hidden_tests_passed: true
+  git_diff_nonempty: true
