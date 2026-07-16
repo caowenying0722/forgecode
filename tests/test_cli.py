@@ -1,5 +1,7 @@
 '''Tests for the ForgeCode CLI.'''
 
+import asyncio
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,14 @@ from typer.testing import CliRunner
 import forge.cli as cli_module
 from forge.cli import app
 from forge.config import ConfigurationError
+from forge.runtime.state import (
+    ConversationEvent,
+    ModelTextDelta,
+    ModelUsageUpdate,
+    TokenUsage,
+    TurnCompleted,
+    TurnResult,
+)
 
 
 runner = CliRunner()
@@ -16,22 +26,106 @@ runner = CliRunner()
 class FakeConversation:
     '''Return scripted responses for interactive CLI tests.'''
 
-    def __init__(self, *responses: str | Exception) -> None:
+    def __init__(
+        self,
+        *responses: list[ConversationEvent] | Exception,
+    ) -> None:
         self.responses = list(responses)
         self.prompts: list[str] = []
 
-    async def send(self, prompt: str) -> str:
+    async def stream(
+        self,
+        prompt: str,
+    ) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return response
+        for event in response:
+            yield event
+
+
+class FakeResponseView:
+    '''Record live UI updates without rendering a terminal.'''
+
+    def __init__(self) -> None:
+        self.actions: list[tuple[str, object]] = []
+
+    def append_text(self, text: str) -> None:
+        self.actions.append(('text', text))
+
+    def update_usage(self, usage: TokenUsage) -> None:
+        self.actions.append(('usage', usage))
+
+    def complete(self, result: TurnResult) -> None:
+        self.actions.append(('complete', result))
+
+
+def turn(
+    text: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> list[ConversationEvent]:
+    usage = TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+    result = TurnResult(
+        text=text,
+        usage=usage,
+    )
+    return [
+        ModelUsageUpdate(
+            usage=TokenUsage(
+                input_tokens=input_tokens,
+                output_tokens=0,
+            )
+        ),
+        ModelTextDelta(text=text),
+        ModelUsageUpdate(usage=usage),
+        TurnCompleted(result=result),
+    ]
+
+
+def test_stream_events_are_forwarded_to_live_view() -> None:
+    initial_usage = TokenUsage(input_tokens=10, output_tokens=0)
+    final_usage = TokenUsage(input_tokens=10, output_tokens=2)
+    result = TurnResult(text='Hello', usage=final_usage)
+    conversation = FakeConversation(
+        [
+            ModelUsageUpdate(usage=initial_usage),
+            ModelTextDelta(text='Hel'),
+            ModelTextDelta(text='lo'),
+            ModelUsageUpdate(usage=final_usage),
+            TurnCompleted(result=result),
+        ]
+    )
+    response_view = FakeResponseView()
+
+    asyncio.run(
+        cli_module.render_streamed_turn(
+            conversation,
+            'hello',
+            response_view,
+        )
+    )
+
+    assert response_view.actions == [
+        ('usage', initial_usage),
+        ('text', 'Hel'),
+        ('text', 'lo'),
+        ('usage', final_usage),
+        ('complete', result),
+    ]
 
 
 def test_cli_starts_an_interactive_conversation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conversation = FakeConversation('Hello', 'I remember')
+    conversation = FakeConversation(
+        turn('Hello', input_tokens=10, output_tokens=2),
+        turn('I remember', input_tokens=20, output_tokens=3),
+    )
     monkeypatch.setattr(cli_module, 'Conversation', lambda: conversation)
 
     result = runner.invoke(app, input='first\nsecond\n')
@@ -42,6 +136,12 @@ def test_cli_starts_an_interactive_conversation(
     assert 'Ask a question or describe a coding task.' in result.output
     assert 'Hello' in result.output
     assert 'I remember' in result.output
+    assert 'input 10' in result.output
+    assert 'output 2' in result.output
+    assert 'total 12' in result.output
+    assert 'input 20' in result.output
+    assert 'output 3' in result.output
+    assert 'total 23' in result.output
     assert 'Session ended.' in result.output
     assert conversation.prompts == ['first', 'second']
 
@@ -51,7 +151,7 @@ def test_interactive_conversation_continues_after_model_failure(
 ) -> None:
     conversation = FakeConversation(
         RuntimeError('provider unavailable'),
-        'Recovered',
+        turn('Recovered', input_tokens=12, output_tokens=4),
     )
     monkeypatch.setattr(cli_module, 'Conversation', lambda: conversation)
 
@@ -60,6 +160,7 @@ def test_interactive_conversation_continues_after_model_failure(
     assert result.exit_code == 0
     assert 'Model request failed: provider unavailable' in result.output
     assert 'Recovered' in result.output
+    assert 'total 16' in result.output
     assert conversation.prompts == ['first', 'second']
 
 
@@ -84,7 +185,7 @@ def test_cli_help() -> None:
     assert result.exit_code == 0
     assert 'ForgeCode terminal Agent Harness.' in result.stdout
     assert '--version' in result.stdout
-    assert '--prompt' in result.stdout
+    assert '--prompt' not in result.stdout
 
 
 def test_cli_version() -> None:
@@ -94,58 +195,11 @@ def test_cli_version() -> None:
     assert 'ForgeCode 0.1.0' in result.stdout
 
 
-def test_prompt_option_prints_single_turn_response(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    prompts: list[str] = []
-
-    async def fake_run_single_turn(prompt: str) -> str:
-        prompts.append(prompt)
-        return 'READY'
-
-    monkeypatch.setattr(cli_module, 'run_single_turn', fake_run_single_turn)
-
-    result = runner.invoke(app, ['-p', 'Only reply READY'])
-
-    assert result.exit_code == 0
-    assert result.stdout == 'READY\n'
-    assert prompts == ['Only reply READY']
-
-
-def test_prompt_option_rejects_empty_prompt() -> None:
-    result = runner.invoke(app, ['--prompt', '   '])
+def test_cli_rejects_removed_prompt_option() -> None:
+    result = runner.invoke(app, ['-p', 'hello'])
 
     assert result.exit_code == 2
-    assert 'Prompt must not be empty.' in result.output
-
-
-def test_prompt_option_reports_model_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def failing_run_single_turn(prompt: str) -> str:
-        raise RuntimeError('provider unavailable')
-
-    monkeypatch.setattr(cli_module, 'run_single_turn', failing_run_single_turn)
-
-    result = runner.invoke(app, ['-p', 'hello'])
-
-    assert result.exit_code == 1
-    assert 'Model request failed: provider unavailable' in result.output
-
-
-def test_prompt_option_explains_missing_configuration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def missing_config(prompt: str) -> str:
-        raise ConfigurationError('ANTHROPIC_API_KEY is not set.')
-
-    monkeypatch.setattr(cli_module, 'run_single_turn', missing_config)
-
-    result = runner.invoke(app, ['-p', 'hello'])
-
-    assert result.exit_code == 1
-    assert 'Model configuration is incomplete.' in result.output
-    assert 'ANTHROPIC_API_KEY is not set.' in result.output
+    assert 'No such option' in result.output
 
 
 def test_config_command_reports_ready_without_exposing_api_key() -> None:

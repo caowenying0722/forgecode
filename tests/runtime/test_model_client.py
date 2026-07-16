@@ -1,6 +1,9 @@
 '''Tests for the thin Anthropic SDK adapter.'''
 
+from __future__ import annotations
+
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,16 +16,61 @@ from forge.runtime.model_client import (
     AnthropicModelClient,
     ModelClient,
 )
+from forge.runtime.state import (
+    ModelTextDelta,
+    ModelUsageUpdate,
+    TokenUsage,
+)
+
+
+def usage(
+    *,
+    input_tokens: int | None,
+    output_tokens: int,
+    cache_creation_input_tokens: int | None = None,
+    cache_read_input_tokens: int | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+    )
+
+
+class FakeStream:
+    def __init__(self, events: list[Any], final_message: Any) -> None:
+        self.events = events
+        self.final_message = final_message
+
+    async def __aenter__(self) -> FakeStream:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    def __aiter__(self) -> Any:
+        async def iterate() -> Any:
+            for event in self.events:
+                yield event
+
+        return iterate()
+
+    async def get_final_message(self) -> Any:
+        return self.final_message
 
 
 class FakeMessages:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.response = object()
+        self.events: list[Any] = []
+        self.final_message = SimpleNamespace(
+            usage=usage(input_tokens=0, output_tokens=0)
+        )
 
-    async def create(self, **kwargs: Any) -> Any:
+    def stream(self, **kwargs: Any) -> FakeStream:
         self.calls.append(kwargs)
-        return self.response
+        return FakeStream(self.events, self.final_message)
 
 
 class FakeAnthropic:
@@ -73,8 +121,38 @@ def test_client_can_use_model_id_from_config() -> None:
     assert client.model == 'configured-model'
 
 
-def test_generate_delegates_to_anthropic_sdk() -> None:
+def collect_stream(client: AnthropicModelClient, **kwargs: Any) -> list[Any]:
+    async def collect() -> list[Any]:
+        return [event async for event in client.stream(**kwargs)]
+
+    return asyncio.run(collect())
+
+
+def test_stream_delegates_events_and_merges_usage() -> None:
     sdk = FakeAnthropic()
+    sdk.messages.events = [
+        SimpleNamespace(
+            type='message_start',
+            message=SimpleNamespace(
+                usage=usage(input_tokens=100, output_tokens=0)
+            ),
+        ),
+        SimpleNamespace(
+            type='content_block_delta',
+            delta=SimpleNamespace(type='text_delta', text='Hello'),
+        ),
+        SimpleNamespace(
+            type='content_block_delta',
+            delta=SimpleNamespace(type='text_delta', text=' world'),
+        ),
+        SimpleNamespace(
+            type='message_delta',
+            usage=usage(input_tokens=None, output_tokens=2),
+        ),
+    ]
+    sdk.messages.final_message = SimpleNamespace(
+        usage=usage(input_tokens=100, output_tokens=2)
+    )
     client = AnthropicModelClient(
         model='claude-test',
         max_tokens=2048,
@@ -95,15 +173,23 @@ def test_generate_delegates_to_anthropic_sdk() -> None:
         },
     ]
 
-    response = asyncio.run(
-        client.generate(
-            messages=messages,
-            tools=tools,
-            system='You are a coding agent.',
-        )
+    events = collect_stream(
+        client,
+        messages=messages,
+        tools=tools,
+        system='You are a coding agent.',
     )
 
-    assert response is sdk.messages.response
+    assert events == [
+        ModelUsageUpdate(
+            usage=TokenUsage(input_tokens=100, output_tokens=0)
+        ),
+        ModelTextDelta(text='Hello'),
+        ModelTextDelta(text=' world'),
+        ModelUsageUpdate(
+            usage=TokenUsage(input_tokens=100, output_tokens=2)
+        ),
+    ]
     assert sdk.messages.calls == [
         {
             'model': 'claude-test',
@@ -111,18 +197,18 @@ def test_generate_delegates_to_anthropic_sdk() -> None:
             'messages': messages,
             'tools': tools,
             'system': 'You are a coding agent.',
-            'stream': False,
         }
     ]
     assert isinstance(client, ModelClient)
 
 
-def test_generate_omits_unused_optional_parameters() -> None:
+def test_stream_omits_unused_optional_parameters() -> None:
     sdk = FakeAnthropic()
     client = AnthropicModelClient(model='claude-test', client=sdk)
 
-    asyncio.run(
-        client.generate(messages=[{'role': 'user', 'content': 'Hello'}])
+    collect_stream(
+        client,
+        messages=[{'role': 'user', 'content': 'Hello'}],
     )
 
     call = sdk.messages.calls[0]

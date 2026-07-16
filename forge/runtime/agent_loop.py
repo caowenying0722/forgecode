@@ -1,11 +1,20 @@
 '''Minimal model execution for the M1 Agent Loop.'''
 
+from collections.abc import AsyncIterator
 from functools import cache
 from pathlib import Path
 
-from anthropic.types import Message, MessageParam
+from anthropic.types import MessageParam
 
 from forge.runtime.model_client import AnthropicModelClient, ModelClient
+from forge.runtime.state import (
+    ConversationEvent,
+    ModelTextDelta,
+    ModelUsageUpdate,
+    TokenUsage,
+    TurnCompleted,
+    TurnResult,
+)
 
 
 class ModelResponseError(RuntimeError):
@@ -40,41 +49,41 @@ class Conversation:
         )
         self.messages: list[MessageParam] = []
 
-    async def send(self, prompt: str) -> str:
-        '''Send one turn and commit it to history after a valid response.'''
+    async def stream(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+        '''Stream one turn and commit it after a valid final result.'''
         if not prompt.strip():
             raise ValueError('prompt must not be empty')
 
         user_message: MessageParam = {'role': 'user', 'content': prompt}
         request_messages = [*self.messages, user_message]
-        response = await self.client.generate(
+        text_parts: list[str] = []
+        final_usage: TokenUsage | None = None
+
+        async for event in self.client.stream(
             messages=request_messages,
             system=self.system_prompt,
-        )
-        text = extract_text(response)
+        ):
+            if isinstance(event, ModelTextDelta):
+                text_parts.append(event.text)
+            elif isinstance(event, ModelUsageUpdate):
+                final_usage = event.usage
+            yield event
+
+        text = ''.join(text_parts).strip()
+        if not text:
+            raise ModelResponseError(
+                'Model response did not contain any text.'
+            )
+        if final_usage is None:
+            raise ModelResponseError(
+                'Model response did not contain token usage.'
+            )
+
         assistant_message: MessageParam = {
             'role': 'assistant',
             'content': text,
         }
         self.messages.extend([user_message, assistant_message])
-        return text
-
-
-def extract_text(message: Message) -> str:
-    '''Extract displayable text blocks from an Anthropic message.'''
-    text = '\n'.join(
-        block.text for block in message.content if block.type == 'text'
-    ).strip()
-    if not text:
-        raise ModelResponseError('Model response did not contain any text.')
-    return text
-
-
-async def run_single_turn(
-    prompt: str,
-    client: ModelClient | None = None,
-) -> str:
-    '''Send one user prompt and return the model's text response.'''
-    if not prompt.strip():
-        raise ValueError('prompt must not be empty')
-    return await Conversation(client=client).send(prompt)
+        yield TurnCompleted(
+            result=TurnResult(text=text, usage=final_usage)
+        )

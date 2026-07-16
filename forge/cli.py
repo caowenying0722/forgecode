@@ -1,14 +1,19 @@
 '''Command-line entry point for ForgeCode.'''
 
 import asyncio
-from typing import Annotated, Optional
+from typing import Annotated
 
 import typer
 
 from forge import __version__
 from forge.config import ConfigurationError, ForgeConfig
-from forge.runtime.agent_loop import Conversation, run_single_turn
-from forge.terminal import TerminalUI
+from forge.runtime.agent_loop import Conversation
+from forge.runtime.state import (
+    ModelTextDelta,
+    ModelUsageUpdate,
+    TurnCompleted,
+)
+from forge.terminal import StreamingResponseView, TerminalUI
 
 
 app = typer.Typer(
@@ -40,37 +45,9 @@ def main(
             help='Show the ForgeCode version and exit.',
         ),
     ] = False,
-    prompt: Annotated[
-        Optional[str],
-        typer.Option(
-            '--prompt',
-            '-p',
-            help='Send one prompt to the configured model.',
-        ),
-    ] = None,
 ) -> None:
     '''Start the ForgeCode command-line interface.'''
     if ctx.invoked_subcommand is None:
-        if prompt is not None:
-            if not prompt.strip():
-                typer.echo('Prompt must not be empty.', err=True)
-                raise typer.Exit(code=2)
-
-            try:
-                response = asyncio.run(run_single_turn(prompt))
-            except ConfigurationError as error:
-                print_configuration_error(error)
-                raise typer.Exit(code=1) from error
-            except KeyboardInterrupt as error:
-                typer.echo('Model request interrupted.', err=True)
-                raise typer.Exit(code=130) from error
-            except Exception as error:
-                typer.echo(f'Model request failed: {error}', err=True)
-                raise typer.Exit(code=1) from error
-
-            typer.echo(response)
-            return
-
         try:
             run_interactive_chat()
         except ConfigurationError as error:
@@ -114,8 +91,14 @@ def run_interactive_chat(
             continue
 
         try:
-            with resolved_terminal.thinking():
-                response = asyncio.run(resolved_session.send(prompt))
+            with resolved_terminal.stream_response() as response_view:
+                asyncio.run(
+                    render_streamed_turn(
+                        resolved_session,
+                        prompt,
+                        response_view,
+                    )
+                )
         except (KeyboardInterrupt, typer.Abort):
             resolved_terminal.show_goodbye()
             return
@@ -123,7 +106,20 @@ def run_interactive_chat(
             resolved_terminal.show_error(error)
             continue
 
-        resolved_terminal.show_response(response)
+
+async def render_streamed_turn(
+    session: Conversation,
+    prompt: str,
+    response_view: StreamingResponseView,
+) -> None:
+    '''Forward conversation stream events to the live terminal view.'''
+    async for event in session.stream(prompt):
+        if isinstance(event, ModelTextDelta):
+            response_view.append_text(event.text)
+        elif isinstance(event, ModelUsageUpdate):
+            response_view.update_usage(event.usage)
+        elif isinstance(event, TurnCompleted):
+            response_view.complete(event.result)
 
 
 @app.command('config')
