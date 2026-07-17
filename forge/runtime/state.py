@@ -109,6 +109,38 @@ class ModelUsageUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelCallStarted:
+    '''One model request started inside the current user turn.'''
+
+    iteration: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRetryScheduled:
+    '''A transient provider failure will be retried after a delay.'''
+
+    attempt: int
+    reason: str
+    delay_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCallCompleted:
+    '''One model request completed successfully.'''
+
+    iteration: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCallFailed:
+    '''One model request ended without a usable response.'''
+
+    iteration: int
+    reason: str
+    retryable: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ToolExecutionStarted:
     '''The runtime started executing one completed model tool request.'''
 
@@ -136,9 +168,13 @@ type ModelStreamEvent = (
     | ModelToolCallArgumentsDelta
     | ModelToolCallCompleted
     | ModelUsageUpdate
+    | ModelRetryScheduled
 )
 type ConversationEvent = (
     ModelStreamEvent
+    | ModelCallStarted
+    | ModelCallCompleted
+    | ModelCallFailed
     | ToolExecutionStarted
     | ToolExecutionCompleted
     | TurnCompleted

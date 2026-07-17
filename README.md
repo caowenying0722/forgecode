@@ -94,7 +94,7 @@ macOS/Linux：
 
     uv run forge
 
-启动后可以连续输入消息，每一轮都会携带当前会话的历史上下文；按 `Ctrl+C` 退出。模型文本按照 Provider 的 delta 实时显示，Token 根据流中实际返回的 usage 事件刷新；如果使用了 Prompt Cache，还会显示缓存读写 Token。
+启动后可以连续输入消息，每一轮都会携带当前会话的历史上下文；按 `Ctrl+C` 退出。终端支持直接粘贴包含换行的多行 Prompt，粘贴内容会作为一条完整消息提交。模型文本按照 Provider 的 delta 实时显示，Token 根据流中实际返回的 usage 事件刷新；如果使用了 Prompt Cache，还会显示缓存读写 Token。
 
 `.env` 已被 Git 忽略，仓库只提交不含真实凭据的 `.env.example`。系统环境变量优先于 `.env` 中的同名配置。`ANTHROPIC_API_KEY` 和 `MODEL_ID` 必填；`ANTHROPIC_BASE_URL` 可以省略，默认使用 `https://api.anthropic.com`，只有使用 Anthropic 兼容网关或代理时才需要覆盖。`forge config` 显示 Model ID、Base URL 和密钥配置状态，但不会回显 API Key。交互模式的每轮消息都会发起真实 API 请求，可能产生 Provider 费用。当前会话历史仅保存在内存中，退出后不会恢复；持久化将在 M4 实现。M1.1 已使用流式响应；精确输出 Token 何时更新取决于 Provider 发送 usage 的时机，重试和完整错误映射将在后续 M1 阶段实现。
 
@@ -246,7 +246,7 @@ M1.4 将模型决策和内置工具连接成真正的执行循环：
 - [x] 一次用户请求内累计所有模型调用的输入、输出和缓存 Token；
 - [x] 保存完整的 `user → assistant(tool_use) → user(tool_result) → assistant(final)` 会话上下文；
 - [x] 终端按事件时间线内联显示模型文本与工具组，并展示工具名称、参数摘要、成功或失败状态和结果摘要；
-- [x] 默认最多执行 20 次模型调用，超过上限时安全停止。
+- [x] 默认最多执行 100 次模型调用，超过上限时安全停止。
 
 M1.4 已形成可执行的 Agent Loop，但命令审批、敏感路径治理和更强的本机安全限制仍属于 M3；当前工具层不是安全沙箱。最大 Token 预算、重复工具调用检测和 JSONL 轨迹仍是完整 M1 的后续任务。
 

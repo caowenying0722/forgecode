@@ -13,6 +13,16 @@ from forge.terminal import (
 from forge.tools.base import ToolResult
 
 
+class FakePromptSession:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.messages: list[object] = []
+
+    def prompt(self, message: object = '') -> str:
+        self.messages.append(message)
+        return self.response
+
+
 def terminal_with_output() -> tuple[TerminalUI, StringIO]:
     output = StringIO()
     console = Console(
@@ -21,6 +31,21 @@ def terminal_with_output() -> tuple[TerminalUI, StringIO]:
         width=100,
     )
     return TerminalUI(console=console), output
+
+
+def test_terminal_preserves_multiline_prompt_from_interactive_session() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=True, width=100)
+    prompt_session = FakePromptSession('first line\nsecond line\nthird line')
+    terminal = TerminalUI(
+        console=console,
+        prompt_session=prompt_session,
+    )
+
+    prompt = terminal.read_prompt()
+
+    assert prompt == 'first line\nsecond line\nthird line'
+    assert len(prompt_session.messages) == 1
 
 
 def test_terminal_renders_session_header_and_markdown_response() -> None:

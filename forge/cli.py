@@ -16,6 +16,7 @@ from forge.runtime.state import (
     ToolExecutionStarted,
     TurnCompleted,
 )
+from forge.sessions.trajectory import TrajectoryRecorder
 from forge.terminal import StreamingResponseView, TerminalUI
 from forge.tools import create_default_registry
 
@@ -76,6 +77,7 @@ def print_configuration_error(error: ConfigurationError) -> None:
 def run_interactive_chat(
     session: Conversation | None = None,
     terminal: TerminalUI | None = None,
+    recorder: TrajectoryRecorder | None = None,
 ) -> None:
     '''Run a local chat session until the user interrupts it.'''
     resolved_session = (
@@ -84,6 +86,11 @@ def run_interactive_chat(
         else Conversation(registry=create_default_registry(Path.cwd()))
     )
     resolved_terminal = terminal if terminal is not None else TerminalUI()
+    resolved_recorder = (
+        recorder
+        if recorder is not None
+        else create_trajectory_recorder(Path.cwd())
+    )
     client = getattr(resolved_session, 'client', None)
     model = getattr(client, 'model', 'configured model')
     resolved_terminal.show_welcome(model)
@@ -105,6 +112,7 @@ def run_interactive_chat(
                         resolved_session,
                         prompt,
                         response_view,
+                        resolved_recorder,
                     )
                 )
         except (KeyboardInterrupt, typer.Abort):
@@ -119,19 +127,34 @@ async def render_streamed_turn(
     session: Conversation,
     prompt: str,
     response_view: StreamingResponseView,
+    recorder: TrajectoryRecorder | None = None,
 ) -> None:
     '''Forward conversation stream events to the live terminal view.'''
-    async for event in session.stream(prompt):
-        if isinstance(event, ModelTextDelta):
-            response_view.append_text(event.text)
-        elif isinstance(event, ModelUsageUpdate):
-            response_view.update_usage(event.usage)
-        elif isinstance(event, ToolExecutionStarted):
-            response_view.start_tool(event.tool_call)
-        elif isinstance(event, ToolExecutionCompleted):
-            response_view.complete_tool(event.tool_call, event.result)
-        elif isinstance(event, TurnCompleted):
-            response_view.complete(event.result)
+    if recorder is not None:
+        recorder.record_user_message(prompt)
+    try:
+        async for event in session.stream(prompt):
+            if recorder is not None:
+                recorder.record_event(event)
+            if isinstance(event, ModelTextDelta):
+                response_view.append_text(event.text)
+            elif isinstance(event, ModelUsageUpdate):
+                response_view.update_usage(event.usage)
+            elif isinstance(event, ToolExecutionStarted):
+                response_view.start_tool(event.tool_call)
+            elif isinstance(event, ToolExecutionCompleted):
+                response_view.complete_tool(event.tool_call, event.result)
+            elif isinstance(event, TurnCompleted):
+                response_view.complete(event.result)
+    except Exception as error:
+        if recorder is not None:
+            recorder.record_error(error)
+        raise
+
+
+def create_trajectory_recorder(root: Path) -> TrajectoryRecorder:
+    '''Create the default append-only recorder for one CLI session.'''
+    return TrajectoryRecorder.create(root)
 
 
 @app.command('config')

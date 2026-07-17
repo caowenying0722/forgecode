@@ -20,6 +20,7 @@ from forge.runtime.state import (
     ModelToolCallArgumentsDelta,
     ModelToolCallCompleted,
     ModelToolCallStarted,
+    ModelRetryScheduled,
     ModelUsageUpdate,
     TokenUsage,
     ToolCall,
@@ -55,6 +56,8 @@ class FakeStream:
     def __aiter__(self) -> Any:
         async def iterate() -> Any:
             for event in self.events:
+                if isinstance(event, Exception):
+                    raise event
                 yield event
 
         return iterate()
@@ -67,12 +70,15 @@ class FakeMessages:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.events: list[Any] = []
+        self.errors: list[Exception] = []
         self.final_message = SimpleNamespace(
             usage=usage(input_tokens=0, output_tokens=0)
         )
 
     def stream(self, **kwargs: Any) -> FakeStream:
         self.calls.append(kwargs)
+        if self.errors:
+            raise self.errors.pop(0)
         return FakeStream(self.events, self.final_message)
 
 
@@ -427,17 +433,85 @@ def test_stream_omits_unused_optional_parameters() -> None:
     assert 'system' not in call
 
 
+def test_stream_retries_connection_error_before_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sdk = FakeAnthropic()
+    sdk.messages.errors.append(
+        model_client_module.APIConnectionError(request=SimpleNamespace())
+    )
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(model_client_module.asyncio, 'sleep', record_sleep)
+    monkeypatch.setattr(model_client_module.random, 'uniform', lambda *_: 0)
+    client = AnthropicModelClient(
+        model='claude-test',
+        max_retries=1,
+        client=sdk,
+    )
+
+    events = collect_stream(
+        client,
+        messages=[{'role': 'user', 'content': 'Hello'}],
+    )
+
+    assert events[0] == ModelRetryScheduled(
+        attempt=2,
+        reason='connection_error',
+        delay_seconds=0.5,
+    )
+    assert delays == [0.5]
+    assert len(sdk.messages.calls) == 2
+
+
+def test_stream_does_not_retry_after_text_started() -> None:
+    sdk = FakeAnthropic()
+    sdk.messages.events = [
+        SimpleNamespace(
+            type='content_block_delta',
+            index=0,
+            delta=SimpleNamespace(type='text_delta', text='Partial'),
+        ),
+        model_client_module.APIConnectionError(request=SimpleNamespace()),
+    ]
+    client = AnthropicModelClient(model='claude-test', client=sdk)
+    collected: list[Any] = []
+
+    async def collect() -> model_client_module.ModelCallError:
+        with pytest.raises(
+            model_client_module.ModelCallError,
+            match='avoid duplicate output',
+        ) as captured:
+            async for event in client.stream(
+                messages=[{'role': 'user', 'content': 'Hello'}]
+            ):
+                collected.append(event)
+        return captured.value
+
+    error = asyncio.run(collect())
+
+    assert collected == [ModelTextDelta(text='Partial')]
+    assert error.reason == 'stream_interrupted'
+    assert error.retryable is False
+    assert len(sdk.messages.calls) == 1
+
+
 @pytest.mark.parametrize(
-    ('model', 'max_tokens'),
-    [('', 1), ('claude-test', 0)],
+    ('model', 'max_tokens', 'max_retries'),
+    [('', 1, 3), ('claude-test', 0, 3), ('claude-test', 1, -1)],
 )
 def test_invalid_configuration_is_rejected(
     model: str,
     max_tokens: int,
+    max_retries: int,
 ) -> None:
     with pytest.raises(ValueError):
         AnthropicModelClient(
             model=model,
             max_tokens=max_tokens,
+            max_retries=max_retries,
             client=FakeAnthropic(),
         )

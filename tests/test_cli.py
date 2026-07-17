@@ -27,6 +27,31 @@ from forge.tools.base import ToolResult
 runner = CliRunner()
 
 
+class FakeTrajectoryRecorder:
+    def __init__(self) -> None:
+        self.user_messages: list[str] = []
+        self.events: list[ConversationEvent] = []
+        self.errors: list[Exception] = []
+
+    def record_user_message(self, content: str) -> None:
+        self.user_messages.append(content)
+
+    def record_event(self, event: ConversationEvent) -> None:
+        self.events.append(event)
+
+    def record_error(self, error: Exception) -> None:
+        self.errors.append(error)
+
+
+@pytest.fixture(autouse=True)
+def avoid_real_trajectory_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        'create_trajectory_recorder',
+        lambda _root: FakeTrajectoryRecorder(),
+    )
+
+
 class FakeConversation:
     '''Return scripted responses for interactive CLI tests.'''
 
@@ -112,30 +137,34 @@ def test_stream_events_are_forwarded_to_live_view() -> None:
         arguments={'path': 'README.md'},
     )
     tool_result = ToolResult.ok('Read file.', content='README')
-    conversation = FakeConversation(
-        [
-            ModelUsageUpdate(usage=initial_usage),
-            ModelTextDelta(text='Hel'),
-            ModelTextDelta(text='lo'),
-            ToolExecutionStarted(tool_call=tool_call),
-            ToolExecutionCompleted(
-                tool_call=tool_call,
-                result=tool_result,
-            ),
-            ModelUsageUpdate(usage=final_usage),
-            TurnCompleted(result=result),
-        ]
-    )
+    streamed_events: list[ConversationEvent] = [
+        ModelUsageUpdate(usage=initial_usage),
+        ModelTextDelta(text='Hel'),
+        ModelTextDelta(text='lo'),
+        ToolExecutionStarted(tool_call=tool_call),
+        ToolExecutionCompleted(
+            tool_call=tool_call,
+            result=tool_result,
+        ),
+        ModelUsageUpdate(usage=final_usage),
+        TurnCompleted(result=result),
+    ]
+    conversation = FakeConversation(streamed_events)
     response_view = FakeResponseView()
+    recorder = FakeTrajectoryRecorder()
 
     asyncio.run(
         cli_module.render_streamed_turn(
             conversation,
             'hello',
             response_view,
+            recorder,
         )
     )
 
+    assert recorder.user_messages == ['hello']
+    assert recorder.events == streamed_events
+    assert recorder.errors == []
     assert response_view.actions == [
         ('usage', initial_usage),
         ('text', 'Hel'),

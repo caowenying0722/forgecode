@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+from typing import Any, Protocol
 
+from prompt_toolkit import PromptSession
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -39,11 +41,23 @@ class _ToolTimelineBlock:
 type _TimelineBlock = _TextTimelineBlock | _ToolTimelineBlock
 
 
+class _InteractivePrompt(Protocol):
+    def prompt(self, message: Any = '') -> str:
+        ...
+
+
 class TerminalUI:
     '''Render the interactive ForgeCode conversation.'''
 
-    def __init__(self, console: Console | None = None) -> None:
+    def __init__(
+        self,
+        console: Console | None = None,
+        prompt_session: _InteractivePrompt | None = None,
+    ) -> None:
         self.console = console if console is not None else Console()
+        self.prompt_session = prompt_session
+        if self.prompt_session is None and self.console.is_terminal:
+            self.prompt_session = PromptSession()
 
     def show_welcome(self, model: str) -> None:
         '''Show a compact session header inspired by modern coding agents.'''
@@ -73,7 +87,11 @@ class TerminalUI:
         self.console.print()
 
     def read_prompt(self) -> str:
-        '''Read one user message with a compact agent-style prompt.'''
+        '''Read one message, preserving bracketed multi-line terminal paste.'''
+        if self.prompt_session is not None:
+            return self.prompt_session.prompt(
+                [('ansibrightcyan bold', '\u276f ')]
+            )
         return self.console.input('[bold bright_cyan]\u276f[/] ')
 
     def stream_response(self) -> StreamingResponseView:

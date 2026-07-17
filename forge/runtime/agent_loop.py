@@ -6,9 +6,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from forge.runtime.model_client import AnthropicModelClient, ModelClient
+from forge.runtime.model_client import (
+    AnthropicModelClient,
+    ModelCallError,
+    ModelClient,
+)
 from forge.runtime.state import (
     ConversationEvent,
+    ModelCallCompleted,
+    ModelCallFailed,
+    ModelCallStarted,
     ModelTextDelta,
     ModelToolCallCompleted,
     ModelUsageUpdate,
@@ -49,7 +56,7 @@ class Conversation:
         system_prompt: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         registry: ToolRegistry | None = None,
-        max_iterations: int = 20,
+        max_iterations: int = 100,
     ) -> None:
         if tools is not None and registry is not None:
             raise ValueError('Pass tools or registry, not both.')
@@ -78,29 +85,50 @@ class Conversation:
         completed_usage = TokenUsage(input_tokens=0, output_tokens=0)
         all_tool_calls: list[ToolCall] = []
 
-        for _ in range(self.max_iterations):
+        for iteration in range(1, self.max_iterations + 1):
             text_parts: list[str] = []
             tool_calls: list[ToolCall] = []
             request_usage: TokenUsage | None = None
 
-            async for event in self.client.stream(
-                messages=[*request_messages],
-                tools=self.tools,
-                system=self.system_prompt,
-            ):
-                if isinstance(event, ModelTextDelta):
-                    text_parts.append(event.text)
-                    yield event
-                elif isinstance(event, ModelToolCallCompleted):
-                    tool_calls.append(event.tool_call)
-                    yield event
-                elif isinstance(event, ModelUsageUpdate):
-                    request_usage = event.usage
-                    yield ModelUsageUpdate(
-                        usage=add_token_usage(completed_usage, request_usage)
-                    )
-                else:
-                    yield event
+            yield ModelCallStarted(iteration=iteration)
+            try:
+                async for event in self.client.stream(
+                    messages=[*request_messages],
+                    tools=self.tools,
+                    system=self.system_prompt,
+                ):
+                    if isinstance(event, ModelTextDelta):
+                        text_parts.append(event.text)
+                        yield event
+                    elif isinstance(event, ModelToolCallCompleted):
+                        tool_calls.append(event.tool_call)
+                        yield event
+                    elif isinstance(event, ModelUsageUpdate):
+                        request_usage = event.usage
+                        yield ModelUsageUpdate(
+                            usage=add_token_usage(
+                                completed_usage,
+                                request_usage,
+                            )
+                        )
+                    else:
+                        yield event
+            except Exception as error:
+                yield ModelCallFailed(
+                    iteration=iteration,
+                    reason=(
+                        error.reason
+                        if isinstance(error, ModelCallError)
+                        else type(error).__name__
+                    ),
+                    retryable=(
+                        error.retryable
+                        if isinstance(error, ModelCallError)
+                        else False
+                    ),
+                )
+                raise
+            yield ModelCallCompleted(iteration=iteration)
 
             text = ''.join(text_parts).strip()
             if not text and not tool_calls:

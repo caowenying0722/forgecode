@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 import json
+import random
 from typing import Any, Protocol, runtime_checkable
 
-from anthropic import AsyncAnthropic
+from anthropic import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncAnthropic,
+    InternalServerError,
+    RateLimitError,
+)
 
 from forge.config import ForgeConfig
 from forge.runtime.state import (
@@ -16,6 +25,7 @@ from forge.runtime.state import (
     ModelToolCallArgumentsDelta,
     ModelToolCallCompleted,
     ModelToolCallStarted,
+    ModelRetryScheduled,
     ModelUsageUpdate,
     TokenUsage,
     ToolCall,
@@ -27,6 +37,15 @@ DEFAULT_MODEL_PROVIDER = 'anthropic'
 
 class ModelProtocolError(RuntimeError):
     '''Raised when a provider emits an invalid model stream.'''
+
+
+class ModelCallError(RuntimeError):
+    '''Provider-neutral model request failure exposed to the runtime.'''
+
+    def __init__(self, reason: str, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.retryable = retryable
 
 
 @dataclass(slots=True)
@@ -63,6 +82,7 @@ class AnthropicModelClient:
         cls,
         config: ForgeConfig | None = None,
         max_tokens: int = 4096,
+        max_retries: int = 3,
         client: AsyncAnthropic | None = None,
     ) -> AnthropicModelClient:
         '''Create a model client from .env or an explicit ForgeConfig.'''
@@ -70,6 +90,7 @@ class AnthropicModelClient:
         return cls(
             model=resolved_config.model_id,
             max_tokens=max_tokens,
+            max_retries=max_retries,
             config=resolved_config,
             client=client,
         )
@@ -78,6 +99,7 @@ class AnthropicModelClient:
         self,
         model: str,
         max_tokens: int = 4096,
+        max_retries: int = 3,
         config: ForgeConfig | None = None,
         client: AsyncAnthropic | None = None,
     ) -> None:
@@ -85,9 +107,12 @@ class AnthropicModelClient:
             raise ValueError('model must not be empty')
         if max_tokens < 1:
             raise ValueError('max_tokens must be positive')
+        if max_retries < 0:
+            raise ValueError('max_retries must not be negative')
 
         self.model = model
         self.max_tokens = max_tokens
+        self.max_retries = max_retries
         if client is not None:
             self._client = client
         else:
@@ -105,8 +130,6 @@ class AnthropicModelClient:
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        current_usage: TokenUsage | None = None
-        pending_tool_calls: dict[int, _PendingToolCall] = {}
         sdk_arguments: dict[str, Any] = {
             'model': self.model,
             'max_tokens': self.max_tokens,
@@ -117,6 +140,58 @@ class AnthropicModelClient:
         if system is not None:
             sdk_arguments['system'] = system
 
+        for attempt in range(1, self.max_retries + 2):
+            response_started = False
+            try:
+                async for event in self._stream_once(sdk_arguments):
+                    if isinstance(
+                        event,
+                        (
+                            ModelTextDelta,
+                            ModelToolCallStarted,
+                            ModelToolCallArgumentsDelta,
+                            ModelToolCallCompleted,
+                        ),
+                    ):
+                        response_started = True
+                    yield event
+                return
+            except (
+                APIConnectionError,
+                APIStatusError,
+            ) as error:
+                reason, retryable = classify_provider_error(error)
+                can_retry = (
+                    retryable
+                    and not response_started
+                    and attempt <= self.max_retries
+                )
+                if not can_retry:
+                    if response_started and retryable:
+                        reason = 'stream_interrupted'
+                    raise ModelCallError(
+                        reason,
+                        model_error_message(reason, response_started),
+                        retryable=retryable and not response_started,
+                    ) from error
+
+                delay = retry_delay(attempt)
+                yield ModelRetryScheduled(
+                    attempt=attempt + 1,
+                    reason=reason,
+                    delay_seconds=delay,
+                )
+                await asyncio.sleep(delay)
+
+        raise AssertionError('model retry loop ended unexpectedly')
+
+    async def _stream_once(
+        self,
+        sdk_arguments: dict[str, Any],
+    ) -> AsyncIterator[ModelStreamEvent]:
+        '''Perform one provider request without retry policy.'''
+        current_usage: TokenUsage | None = None
+        pending_tool_calls: dict[int, _PendingToolCall] = {}
         async with self._client.messages.stream(**sdk_arguments) as stream:
             async for event in stream:
                 if (
@@ -198,6 +273,39 @@ class AnthropicModelClient:
         final_usage = merge_usage(final_message.usage, current_usage)
         if final_usage != current_usage:
             yield ModelUsageUpdate(usage=final_usage)
+
+
+def classify_provider_error(error: Exception) -> tuple[str, bool]:
+    '''Map Anthropic transport failures to stable ForgeCode reasons.'''
+    if isinstance(error, RateLimitError):
+        return 'rate_limit', True
+    if isinstance(error, APITimeoutError):
+        return 'timeout', True
+    if isinstance(error, APIConnectionError):
+        return 'connection_error', True
+    if isinstance(error, InternalServerError):
+        if getattr(error, 'status_code', None) == 529:
+            return 'overloaded', True
+        return 'server_error', True
+    if isinstance(error, APIStatusError):
+        return f'http_{error.status_code}', False
+    return 'provider_error', False
+
+
+def retry_delay(retry_number: int) -> float:
+    '''Return bounded exponential backoff with up to 25% jitter.'''
+    base = min(0.5 * (2 ** (retry_number - 1)), 8.0)
+    return base + random.uniform(0, base * 0.25)
+
+
+def model_error_message(reason: str, response_started: bool) -> str:
+    '''Build a concise error safe to show in the terminal.'''
+    if response_started:
+        return (
+            'The model stream was interrupted after output started; '
+            'ForgeCode did not retry to avoid duplicate output.'
+        )
+    return f'Model request failed: {reason}.'
 
 
 def parse_tool_arguments(

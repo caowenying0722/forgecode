@@ -17,6 +17,8 @@ from forge.runtime.agent_loop import (
 )
 from forge.runtime.state import (
     ConversationEvent,
+    ModelCallCompleted,
+    ModelCallStarted,
     ModelStreamEvent,
     ModelTextDelta,
     ModelToolCallArgumentsDelta,
@@ -156,6 +158,7 @@ def test_conversation_forwards_stream_and_returns_final_result() -> None:
     events = collect_turn(conversation, 'Only reply READY')
 
     assert events == [
+        ModelCallStarted(iteration=1),
         ModelUsageUpdate(
             usage=TokenUsage(input_tokens=10, output_tokens=0)
         ),
@@ -164,6 +167,7 @@ def test_conversation_forwards_stream_and_returns_final_result() -> None:
         ModelUsageUpdate(
             usage=TokenUsage(input_tokens=10, output_tokens=2)
         ),
+        ModelCallCompleted(iteration=1),
         TurnCompleted(
             result=TurnResult(
                 text='READY',
