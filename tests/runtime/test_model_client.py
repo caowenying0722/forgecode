@@ -7,8 +7,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from anthropic import omit
-from anthropic.types import MessageParam, ToolParam
 
 from forge.config import ForgeConfig
 import forge.runtime.model_client as model_client_module
@@ -126,9 +124,22 @@ def test_client_can_use_model_id_from_config() -> None:
     assert client.model == 'configured-model'
 
 
-def collect_stream(client: AnthropicModelClient, **kwargs: Any) -> list[Any]:
+def collect_stream(
+    client: AnthropicModelClient,
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    system: str | None = None,
+) -> list[Any]:
     async def collect() -> list[Any]:
-        return [event async for event in client.stream(**kwargs)]
+        return [
+            event
+            async for event in client.stream(
+                messages=messages,
+                tools=tools,
+                system=system,
+            )
+        ]
 
     return asyncio.run(collect())
 
@@ -165,10 +176,8 @@ def test_stream_delegates_events_and_merges_usage() -> None:
         max_tokens=2048,
         client=sdk,
     )
-    messages: list[MessageParam] = [
-        {'role': 'user', 'content': 'Read the repository.'},
-    ]
-    tools: list[ToolParam] = [
+    messages = [{'role': 'user', 'content': 'Read the repository.'}]
+    tools = [
         {
             'name': 'read_file',
             'description': 'Read one repository file.',
@@ -177,7 +186,7 @@ def test_stream_delegates_events_and_merges_usage() -> None:
                 'properties': {'path': {'type': 'string'}},
                 'required': ['path'],
             },
-        },
+        }
     ]
 
     events = collect_stream(
@@ -201,12 +210,58 @@ def test_stream_delegates_events_and_merges_usage() -> None:
         {
             'model': 'claude-test',
             'max_tokens': 2048,
-            'messages': messages,
-            'tools': tools,
+            'messages': [
+                {'role': 'user', 'content': 'Read the repository.'}
+            ],
+            'tools': [
+                {
+                    'name': 'read_file',
+                    'description': 'Read one repository file.',
+                    'input_schema': {
+                        'type': 'object',
+                        'properties': {'path': {'type': 'string'}},
+                        'required': ['path'],
+                    },
+                }
+            ],
             'system': 'You are a coding agent.',
         }
     ]
     assert isinstance(client, ModelClient)
+
+
+def test_adapter_passes_plain_message_dicts_to_sdk() -> None:
+    sdk = FakeAnthropic()
+    client = AnthropicModelClient(model='claude-test', client=sdk)
+    messages = [
+        {
+            'role': 'assistant',
+            'content': [
+                {'type': 'text', 'text': 'I will inspect it.'},
+                {
+                    'type': 'tool_use',
+                    'id': 'toolu_read',
+                    'name': 'read_file',
+                    'input': {'path': 'README.md'},
+                },
+            ],
+        },
+        {
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': 'toolu_read',
+                    'content': 'file contents',
+                    'is_error': False,
+                }
+            ],
+        },
+    ]
+
+    collect_stream(client, messages=messages)
+
+    assert sdk.messages.calls[0]['messages'] == messages
 
 
 def test_stream_emits_multiple_completed_tool_calls() -> None:
@@ -276,7 +331,9 @@ def test_stream_emits_multiple_completed_tool_calls() -> None:
 
     events = collect_stream(
         client,
-        messages=[{'role': 'user', 'content': 'Inspect the repository.'}],
+        messages=[
+            {'role': 'user', 'content': 'Inspect the repository.'}
+        ],
     )
 
     assert events == [
@@ -366,8 +423,8 @@ def test_stream_omits_unused_optional_parameters() -> None:
     )
 
     call = sdk.messages.calls[0]
-    assert call['tools'] is omit
-    assert call['system'] is omit
+    assert 'tools' not in call
+    assert 'system' not in call
 
 
 @pytest.mark.parametrize(

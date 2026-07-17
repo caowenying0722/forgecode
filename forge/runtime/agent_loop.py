@@ -4,13 +4,7 @@ from collections.abc import AsyncIterator
 from functools import cache
 import json
 from pathlib import Path
-
-from anthropic.types import (
-    ContentBlockParam,
-    MessageParam,
-    ToolParam,
-    ToolResultBlockParam,
-)
+from typing import Any
 
 from forge.runtime.model_client import AnthropicModelClient, ModelClient
 from forge.runtime.state import (
@@ -53,7 +47,7 @@ class Conversation:
         self,
         client: ModelClient | None = None,
         system_prompt: str | None = None,
-        tools: list[ToolParam] | None = None,
+        tools: list[dict[str, Any]] | None = None,
         registry: ToolRegistry | None = None,
         max_iterations: int = 20,
     ) -> None:
@@ -69,7 +63,7 @@ class Conversation:
             if system_prompt is not None
             else load_system_prompt()
         )
-        self.messages: list[MessageParam] = []
+        self.messages: list[dict[str, Any]] = []
         self.registry = registry
         self.tools = registry.definitions if registry is not None else tools
         self.max_iterations = max_iterations
@@ -79,7 +73,7 @@ class Conversation:
         if not prompt.strip():
             raise ValueError('prompt must not be empty')
 
-        user_message: MessageParam = {'role': 'user', 'content': prompt}
+        user_message = {'role': 'user', 'content': prompt}
         request_messages = [*self.messages, user_message]
         completed_usage = TokenUsage(input_tokens=0, output_tokens=0)
         all_tool_calls: list[ToolCall] = []
@@ -166,12 +160,12 @@ class Conversation:
 def build_assistant_message(
     text: str,
     tool_calls: list[ToolCall],
-) -> MessageParam:
+) -> dict[str, Any]:
     '''Build model-visible assistant history from a completed response.'''
     if not tool_calls:
         return {'role': 'assistant', 'content': text}
 
-    content: list[ContentBlockParam] = []
+    content: list[dict[str, Any]] = []
     if text:
         content.append({'type': 'text', 'text': text})
     content.extend(
@@ -188,9 +182,9 @@ def build_assistant_message(
 
 def build_tool_result_message(
     tool_results: list[tuple[ToolCall, ToolResult]],
-) -> MessageParam:
+) -> dict[str, Any]:
     '''Build one user message containing ordered Anthropic tool results.'''
-    content: list[ToolResultBlockParam] = []
+    content: list[dict[str, Any]] = []
     for tool_call, result in tool_results:
         content.append(
             {

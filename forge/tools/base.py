@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Generic, TypeVar
 
-from anthropic.types import ToolParam
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 
@@ -114,8 +113,8 @@ class Tool(ABC, Generic[InputT]):
         self.root = resolved_root
 
     @property
-    def definition(self) -> ToolParam:
-        '''Return the Anthropic-compatible schema sent through ModelClient.'''
+    def definition(self) -> dict[str, Any]:
+        '''Return a plain tool schema understood by the model adapter.'''
         return {
             'name': self.name,
             'description': self.description,
@@ -172,7 +171,7 @@ class ToolRegistry:
         self._tools[tool.name] = tool
 
     @property
-    def definitions(self) -> list[ToolParam]:
+    def definitions(self) -> list[dict[str, Any]]:
         return [tool.definition for tool in self._tools.values()]
 
     @property

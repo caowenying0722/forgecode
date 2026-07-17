@@ -4,9 +4,9 @@ import asyncio
 from collections.abc import AsyncIterator
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
-from anthropic.types import MessageParam, ToolParam
 from pydantic import Field
 
 from forge.runtime.agent_loop import (
@@ -40,12 +40,12 @@ class FakeModelClient:
 
     def __init__(self, *responses: list[ModelStreamEvent]) -> None:
         self.responses = list(responses)
-        self.calls: list[dict[str, object]] = []
+        self.calls: list[dict[str, Any]] = []
 
     async def stream(
         self,
-        messages: list[MessageParam],
-        tools: list[ToolParam] | None = None,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         self.calls.append(
@@ -172,7 +172,7 @@ def test_conversation_forwards_stream_and_returns_final_result() -> None:
         ),
     ]
     assert client.calls[0]['messages'] == [
-        {'role': 'user', 'content': 'Only reply READY'},
+        {'role': 'user', 'content': 'Only reply READY'}
     ]
     assert client.calls[0]['tools'] is None
     assert client.calls[0]['system'] == load_system_prompt()
@@ -238,7 +238,8 @@ def test_conversation_executes_tool_and_continues_until_final_text(
     )
     assert tool.calls == ['README.md']
     assert client.calls[0]['tools'] == registry.definitions
-    assert client.calls[1]['messages'] == [
+    second_request = client.calls[1]
+    assert second_request['messages'][:2] == [
         {'role': 'user', 'content': 'Read the README'},
         {
             'role': 'assistant',
@@ -251,23 +252,14 @@ def test_conversation_executes_tool_and_continues_until_final_text(
                 }
             ],
         },
-        {
-            'role': 'user',
-            'content': [
-                {
-                    'type': 'tool_result',
-                    'tool_use_id': 'toolu_read',
-                    'content': client.calls[1]['messages'][2]['content'][0][
-                        'content'
-                    ],
-                    'is_error': False,
-                }
-            ],
-        },
     ]
-    payload = json.loads(
-        client.calls[1]['messages'][2]['content'][0]['content']
-    )
+    tool_result_message = second_request['messages'][2]
+    assert tool_result_message['role'] == 'user'
+    assert len(tool_result_message['content']) == 1
+    result_block = tool_result_message['content'][0]
+    assert result_block['tool_use_id'] == 'toolu_read'
+    assert result_block['is_error'] is False
+    payload = json.loads(result_block['content'])
     assert payload == {
         'success': True,
         'summary': 'Read file.',
@@ -288,7 +280,7 @@ def test_conversation_executes_tool_and_continues_until_final_text(
                 }
             ],
         },
-        client.calls[1]['messages'][2],
+        tool_result_message,
         {'role': 'assistant', 'content': 'Finished'},
     ]
 
@@ -322,7 +314,10 @@ def test_conversation_executes_multiple_tool_calls_in_order(
 
     assert tool.calls == ['a.py', 'b.py']
     result_blocks = client.calls[1]['messages'][2]['content']
-    assert [block['tool_use_id'] for block in result_blocks] == [
+    assert [
+        block['tool_use_id']
+        for block in result_blocks
+    ] == [
         'toolu_first',
         'toolu_second',
     ]
@@ -349,7 +344,8 @@ def test_failed_tool_result_is_returned_to_model(
 
     collect_turn(conversation, 'Use a missing tool')
 
-    block = client.calls[1]['messages'][2]['content'][0]
+    blocks = client.calls[1]['messages'][2]['content']
+    block = blocks[0]
     payload = json.loads(block['content'])
     assert block['is_error'] is True
     assert payload['success'] is False

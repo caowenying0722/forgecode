@@ -7,8 +7,7 @@ from dataclasses import dataclass, field
 import json
 from typing import Any, Protocol, runtime_checkable
 
-from anthropic import AsyncAnthropic, omit
-from anthropic.types import MessageParam, ToolParam
+from anthropic import AsyncAnthropic
 
 from forge.config import ForgeConfig
 from forge.runtime.state import (
@@ -46,8 +45,8 @@ class ModelClient(Protocol):
 
     def stream(
         self,
-        messages: list[MessageParam],
-        tools: list[ToolParam] | None = None,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         '''Stream text and exact provider usage updates.'''
@@ -102,19 +101,23 @@ class AnthropicModelClient:
 
     async def stream(
         self,
-        messages: list[MessageParam],
-        tools: list[ToolParam] | None = None,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         current_usage: TokenUsage | None = None
         pending_tool_calls: dict[int, _PendingToolCall] = {}
-        async with self._client.messages.stream(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            messages=messages,
-            tools=tools if tools else omit,
-            system=system if system is not None else omit,
-        ) as stream:
+        sdk_arguments: dict[str, Any] = {
+            'model': self.model,
+            'max_tokens': self.max_tokens,
+            'messages': messages,
+        }
+        if tools:
+            sdk_arguments['tools'] = tools
+        if system is not None:
+            sdk_arguments['system'] = system
+
+        async with self._client.messages.stream(**sdk_arguments) as stream:
             async for event in stream:
                 if (
                     event.type == 'content_block_delta'
