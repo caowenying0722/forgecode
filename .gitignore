@@ -11,3 +11,4 @@ dist/
 target/
 **/.forge/trajectories/
 **/.forge/evals/
+**/.forge/context/

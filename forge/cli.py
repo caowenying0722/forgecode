@@ -106,6 +106,77 @@ def run_interactive_chat(
         if not prompt.strip():
             continue
 
+        if prompt.strip() == '/context':
+            stats = getattr(resolved_session, 'context_stats', None)
+            if stats is None:
+                resolved_terminal.show_error(
+                    RuntimeError('Context statistics are unavailable.')
+                )
+            else:
+                resolved_terminal.show_context(stats)
+            continue
+
+        if prompt.strip() == '/compact':
+            compact = getattr(resolved_session, 'compact', None)
+            if compact is None:
+                resolved_terminal.show_error(
+                    RuntimeError('Context compaction is unavailable.')
+                )
+            else:
+                resolved_terminal.show_compaction(asyncio.run(compact()))
+            continue
+
+        if prompt.startswith('/remember '):
+            payload = prompt[len('/remember '):].strip()
+            name, separator, content = payload.partition('|')
+            if not separator:
+                resolved_terminal.show_error(
+                    ValueError('Usage: /remember name | content')
+                )
+            else:
+                try:
+                    notice = resolved_session.remember(name.strip(), content.strip())
+                    resolved_terminal.show_notice('Memory', notice)
+                except ValueError as error:
+                    resolved_terminal.show_error(error)
+            continue
+
+        if prompt == '/memory list':
+            resolved_terminal.show_notice(
+                'Memory', resolved_session.memory_list()
+            )
+            continue
+
+        if prompt.startswith('/memory show '):
+            resolved_terminal.show_notice(
+                'Memory',
+                resolved_session.memory_show(
+                    prompt[len('/memory show '):].strip()
+                ),
+            )
+            continue
+
+        if prompt.startswith('/memory forget '):
+            resolved_terminal.show_notice(
+                'Memory',
+                resolved_session.memory_forget(
+                    prompt[len('/memory forget '):].strip()
+                ),
+            )
+            continue
+
+        if prompt == '/memory rebuild':
+            resolved_terminal.show_notice(
+                'Memory', resolved_session.memory_rebuild()
+            )
+            continue
+
+        if prompt == '/memory consolidate':
+            resolved_terminal.show_notice(
+                'Memory', resolved_session.memory_consolidate()
+            )
+            continue
+
         try:
             with resolved_terminal.stream_response() as response_view:
                 asyncio.run(

@@ -123,6 +123,8 @@ forge-code/
 
 ## 里程碑总览
 
+里程碑编号表示能力主题，不再强制表示实施顺序。当前优先级是先完成 M2 的真实模型验收，然后优先建设 M5；M3 暂缓实现。
+
 ```text
 M0  项目基线与评测样例
  ↓
@@ -130,11 +132,11 @@ M1  最小可用 Agent Loop
  ↓
 M2  可靠的代码修改与验证闭环
  ↓
-M3  权限、安全与代码回滚
+M5  上下文工程与仓库记忆（下一阶段）
  ↓
 M4  会话持久化与任务恢复
  ↓
-M5  上下文工程与仓库记忆
+M3  权限、安全与代码回滚（暂缓）
  ↓
 M6  Hooks、MCP 与子 Agent 扩展
  ↓
@@ -396,6 +398,10 @@ uv run python evals/runner.py
 
 ## M3：权限、安全与代码回滚
 
+### 当前状态：暂缓实现
+
+M3 的规划继续保留，但当前不进入开发。M5 可以先在固定 Fixture 和用户明确授信的本机仓库中推进；涉及不可信仓库、高风险命令和操作系统级隔离的使用场景，仍必须等待 M3。
+
 ### 目标
 
 把 ForgeCode 从“能够运行”提升为“能够在真实仓库中谨慎运行”。权限决定操作是否允许，原生操作系统沙箱限制 Shell 及其子进程，不要求 Docker。
@@ -446,7 +452,7 @@ Checkpoint：
 - 用户原有未提交代码不会丢失；
 - 每次审批都有审计日志。
 
-达到 M3 后，ForgeCode 才进入较大真实仓库的试用阶段。
+达到 M3 后，ForgeCode 才进入不可信或高风险大型仓库的试用阶段。
 
 ## M4：会话持久化与任务恢复
 
@@ -489,11 +495,15 @@ Checkpoint：
 
 ## M5：上下文工程与仓库记忆
 
+### 当前状态：核心能力已完成
+
+M5 已实现本机仓库中的上下文统计、分级压缩、结构化摘要、项目规则加载和持久化仓库记忆，不扩大现有权限边界。真实模型下的大规模策略对比继续归入 M7 Benchmark。
+
 ### 目标
 
 解决长任务中上下文持续膨胀、Agent 遗忘任务目标、重复读取文件和重复执行命令的问题。
 
-### 任务
+### 已实现
 
 上下文分层：
 
@@ -522,53 +532,71 @@ Working Layer
 └── 当前 Patch
 ```
 
-Token Budget：
+上下文统计与廉价压缩：
 
-- [ ] 统计各类上下文的 Token；
-- [ ] 分别限制文件、日志、历史和工具描述的预算；
-- [ ] 避免重复注入相同文件，并按行范围加载文件；
-- [ ] 命令输出只保留开头、结尾、错误附近和结构化摘要；
-- [ ] 旧 Diff 只保留摘要与引用；
-- [ ] 文件更新后使上下文中的旧版本失效。
+- [x] `/context` 显示消息数、字符数、工具结果字符数和近似 Token；
+- [x] 单个大型工具结果写入 `.forge/context/tool-results/`，模型上下文只保留路径、哈希、大小和预览；
+- [x] 中段历史超过预算后裁剪，并把 `tool_use` 与对应 `tool_result` 作为不可拆分单元；
+- [x] 旧工具结果缩为占位符，保留最近 3 个完整结果；
+- [x] 临时工具输出和压缩前转录不提交到 Git。
 
-结构化 Task Memory：
+结构化任务摘要：
 
 ```json
 {
-  goal: ",
-  plan: [],
-  confirmed_facts: [],
-  open_questions: [],
-  modified_files: [],
-  failed_attempts: [],
-  verification: {},
-  next_action: "
+  "goal": "",
+  "constraints": [],
+  "findings": [],
+  "modified_files": [],
+  "failed_attempts": [],
+  "verification": [],
+  "open_questions": [],
+  "next_action": ""
 }
 ```
 
-- [ ] 压缩时强制保留目标、失败尝试、未解决问题和验证状态；
-- [ ] 压缩后重新注入项目规则；
-- [ ] 实现 `/context` 和 `/compact`；
-- [ ] 支持自动压缩。
+- [x] 廉价压缩仍超限时，请求模型生成固定字段的 JSON 摘要；
+- [x] 摘要前把完整会话保存为 `.forge/context/transcripts/*.jsonl`；
+- [x] 摘要保留目标、约束、发现、修改文件、失败尝试、验证、未决问题和下一步；
+- [x] `/compact` 支持手动压缩，超过字符阈值时支持自动压缩；
+- [x] 自动摘要连续失败 3 次后熔断；Provider 明确报告上下文超限时只恢复重试一次。
 
 项目指令与仓库记忆：
 
-- [ ] 支持 `AGENTS.md`、`FORGE.md`、`.forge/rules/*.md` 和 `.forge/memory.md`；
-- [ ] 启动时加载根目录规则，按需加载子目录规则；
-- [ ] 支持按路径设置规则 Scope，并检测冲突规则；
-- [ ] 分离项目规则与个人规则；
-- [ ] Memory 可以查看、编辑和删除；
-- [ ] 项目指令作为模型上下文，强制安全限制仍由权限系统或 Hook 执行。
+- [x] 加载根目录 `AGENTS.md`、`FORGE.md` 和 `.forge/rules/*.md`；
+- [x] 记忆使用 `.forge/memory/MEMORY.md` 索引和带 YAML frontmatter 的独立 Markdown 文件；
+- [x] 支持 `user`、`feedback`、`project`、`reference` 四类记忆；
+- [x] 使用确定性关键词相关度选择最多 5 条记忆，单条最多 4 KB、总计最多 20 KB；
+- [x] 相关记忆仅注入当前模型请求，不写入会话历史；
+- [x] `/remember name | content`、`/memory list/show/forget/rebuild/consolidate` 提供可解释的管理入口；
+- [x] 用户输入“记住：...”时自动保存显式事实；疑似 API Key、Token、密码和私钥的内容拒绝写入；
+- [x] 记忆达到 10 条后自动整理完全重复的内容并重建索引。
+
+当前有意保持简单：不使用向量数据库、Embedding、全局/云端记忆或额外子 Agent。项目规则是模型上下文，不代替 M3 的强制权限控制。
 
 ### 验收条件
 
-设计一个至少需要十几轮工具调用的固定任务，对比以下三种策略：
+- [x] 自动测试构造 20 轮工具调用，压缩后所有 `tool_use` 与 `tool_result` 仍严格配对；
+- [x] 大型工具输出可从落盘文件恢复，原始会话对象不被廉价压缩修改；
+- [x] 结构化摘要保留目标、限制、修改文件、失败尝试和验证依据；
+- [x] 新建 MemoryStore（模拟进程重启）后仍能读取已有记忆；
+- [x] 无关记忆不会注入当前请求，敏感内容不会落盘；
+- [x] 全部功能使用 FakeModelClient 和临时仓库测试，不依赖真实 API。
 
-- 无压缩；
-- 普通历史摘要；
-- 结构化 Task Memory。
+### 本地命令
 
-记录成功率、Token 消耗、重复文件读取、重复命令调用、压缩后目标遗忘次数和平均完成轮数。这组实验将作为 M5 的核心成果。
+在交互终端输入 `/` 会显示命令、用法和说明；继续输入可以过滤候选，使用方向键选择并通过 Tab 或 Enter 补全。
+
+```text
+/context
+/compact
+/remember testing | 项目测试命令是 uv run pytest
+/memory list
+/memory show testing
+/memory forget testing
+/memory rebuild
+/memory consolidate
+```
 
 ## M6：Hooks、MCP 与子 Agent 扩展
 

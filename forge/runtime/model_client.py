@@ -288,6 +288,17 @@ def classify_provider_error(error: Exception) -> tuple[str, bool]:
             return 'overloaded', True
         return 'server_error', True
     if isinstance(error, APIStatusError):
+        details = str(error).lower()
+        if error.status_code == 400 and any(
+            marker in details
+            for marker in (
+                'context window',
+                'prompt is too long',
+                'too many tokens',
+                'input length',
+            )
+        ):
+            return 'context_overflow', False
         return f'http_{error.status_code}', False
     return 'provider_error', False
 

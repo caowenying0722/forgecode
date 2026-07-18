@@ -345,6 +345,7 @@ def test_failed_tool_result_is_returned_to_model(
     conversation = Conversation(
         client=client,
         registry=ToolRegistry([RecordingReadFileTool(tmp_path)]),
+        context_root=tmp_path,
     )
 
     collect_turn(conversation, 'Use a missing tool')
@@ -424,6 +425,27 @@ def test_conversation_does_not_commit_stream_without_text() -> None:
         collect_turn(conversation, 'Hello')
 
     assert conversation.messages == []
+
+
+def test_relevant_repository_memory_is_injected_only_for_current_query(
+    tmp_path: Path,
+) -> None:
+    client = FakeModelClient(
+        streamed_response('Use pytest'),
+        streamed_response('Use the formatter'),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry([RecordingReadFileTool(tmp_path)]),
+        context_root=tmp_path,
+    )
+    conversation.context.remember('testing', 'Calculator tests use pytest.')
+
+    collect_turn(conversation, 'How do calculator tests run?')
+    collect_turn(conversation, 'How should formatting work?')
+
+    assert 'Calculator tests use pytest.' in client.calls[0]['system']
+    assert 'Calculator tests use pytest.' not in client.calls[1]['system']
 
 
 def test_conversation_does_not_commit_stream_without_usage() -> None:

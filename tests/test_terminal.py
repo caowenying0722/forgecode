@@ -2,6 +2,8 @@
 
 from io import StringIO
 
+from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.document import Document
 from rich.console import Console
 
 from forge.runtime.state import (
@@ -11,6 +13,7 @@ from forge.runtime.state import (
     VerificationEvidence,
 )
 from forge.terminal import (
+    SLASH_COMMAND_COMPLETER,
     TerminalUI,
     streaming_preview,
     token_usage_summary,
@@ -51,6 +54,40 @@ def test_terminal_preserves_multiline_prompt_from_interactive_session() -> None:
 
     assert prompt == 'first line\nsecond line\nthird line'
     assert len(prompt_session.messages) == 1
+
+
+def completions_for(text: str) -> list[object]:
+    return list(
+        SLASH_COMMAND_COMPLETER.get_completions(
+            Document(text=text, cursor_position=len(text)),
+            CompleteEvent(completion_requested=True),
+        )
+    )
+
+
+def test_slash_opens_command_completion_menu() -> None:
+    completions = completions_for('/')
+
+    usages = [completion.display_text for completion in completions]
+    descriptions = [completion.display_meta_text for completion in completions]
+
+    assert '/context' in usages
+    assert '/remember name | content' in usages
+    assert '/memory consolidate' in usages
+    assert '查看当前上下文统计' in descriptions
+
+
+def test_slash_completion_filters_and_replaces_current_input() -> None:
+    completions = completions_for('/memory s')
+
+    assert [completion.text for completion in completions] == [
+        '/memory show '
+    ]
+    assert completions[0].start_position == -len('/memory s')
+
+
+def test_normal_prompt_does_not_offer_slash_commands() -> None:
+    assert completions_for('fix this bug') == []
 
 
 def test_terminal_renders_session_header_and_markdown_response() -> None:

@@ -6,6 +6,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from forge.context.compactor import CompactionConfig
+from forge.context.manager import (
+    CompactionReport,
+    ContextManager,
+    ContextStats,
+)
 from forge.runtime.model_client import (
     AnthropicModelClient,
     ModelCallError,
@@ -65,6 +71,8 @@ class Conversation:
         max_iterations: int = 100,
         task_policy: TaskPolicy | None = None,
         max_completion_blocks: int = 3,
+        context_config: CompactionConfig | None = None,
+        context_root: Path | None = None,
     ) -> None:
         if tools is not None and registry is not None:
             raise ValueError('Pass tools or registry, not both.')
@@ -90,12 +98,29 @@ class Conversation:
             else None
         )
         self.workspace_tracker: WorkspaceTracker | None = tracker
+        resolved_context_root = (
+            context_root
+            if context_root is not None
+            else tracker.root
+            if tracker is not None
+            else Path.cwd()
+        )
+        self.context = ContextManager(
+            self.messages,
+            resolved_context_root,
+            context_config,
+        )
         self.completion_gate = (
             CompletionGate(tracker.root, task_policy)
             if tracker is not None
             else None
         )
         self.max_completion_blocks = max_completion_blocks
+
+    @property
+    def context_stats(self) -> ContextStats:
+        '''Return current committed conversation context statistics.'''
+        return self.context.stats
 
     async def stream(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         '''Run model-tool cycles until the model returns a final text answer.'''
@@ -112,6 +137,12 @@ class Conversation:
         if self.workspace_tracker is not None:
             await self.workspace_tracker.begin_turn()
 
+        await self.context.compact_history(
+            request_messages,
+            self.client,
+        )
+        reactive_compaction_attempted = False
+
         for iteration in range(1, self.max_iterations + 1):
             text_parts: list[str] = []
             tool_calls: list[ToolCall] = []
@@ -120,9 +151,12 @@ class Conversation:
             yield ModelCallStarted(iteration=iteration)
             try:
                 async for event in self.client.stream(
-                    messages=[*request_messages],
+                    messages=self.context.prepare(request_messages),
                     tools=self.tools,
-                    system=self.system_prompt,
+                    system=self.context.build_system_prompt(
+                        self.system_prompt,
+                        prompt,
+                    ),
                 ):
                     if isinstance(event, ModelTextDelta):
                         text_parts.append(event.text)
@@ -141,6 +175,19 @@ class Conversation:
                     else:
                         yield event
             except Exception as error:
+                if (
+                    isinstance(error, ModelCallError)
+                    and error.reason == 'context_overflow'
+                    and not reactive_compaction_attempted
+                ):
+                    reactive_compaction_attempted = True
+                    report = await self.context.compact_history(
+                        request_messages,
+                        self.client,
+                        force=True,
+                    )
+                    if report is not None and report.success:
+                        continue
                 yield ModelCallFailed(
                     iteration=iteration,
                     reason=(
@@ -203,7 +250,8 @@ class Conversation:
                                 build_completion_feedback(decision.reasons)
                             )
                             continue
-                        self.messages = request_messages
+                        self.messages[:] = request_messages
+                        self.context.capture_explicit_memory(prompt)
                         yield TurnCompleted(
                             result=TurnResult(
                                 text=text,
@@ -218,7 +266,8 @@ class Conversation:
                             )
                         )
                         return
-                self.messages = request_messages
+                self.messages[:] = request_messages
+                self.context.capture_explicit_memory(prompt)
                 yield TurnCompleted(
                     result=TurnResult(
                         text=text,
@@ -272,6 +321,60 @@ class Conversation:
         raise AgentLoopLimitError(
             f'Agent Loop exceeded {self.max_iterations} model calls.'
         )
+
+    async def compact(self) -> CompactionReport:
+        '''Manually summarize committed history for the /compact command.'''
+        if not self.messages:
+            return CompactionReport(
+                success=True,
+                automatic=False,
+                before_characters=0,
+                after_characters=0,
+                transcript_path=None,
+                reason='conversation history is empty',
+            )
+        report = await self.context.compact_history(
+            self.messages,
+            self.client,
+            force=True,
+        )
+        if report is None:
+            raise AssertionError('Forced compaction did not return a report.')
+        return report
+
+    def remember(self, name: str, content: str) -> str:
+        record = self.context.remember(name, content)
+        return f'Remembered {record.name} in {record.path.as_posix()}'
+
+    def memory_list(self) -> str:
+        records = self.context.repository.memory.list()
+        if not records:
+            return 'No repository memories.'
+        return '\n'.join(
+            f'- {record.name} [{record.memory_type}]: {record.description}'
+            for record in records
+        )
+
+    def memory_show(self, name: str) -> str:
+        record = self.context.repository.memory.get(name)
+        if record is None:
+            return f'Memory not found: {name}'
+        return (
+            f'{record.name} [{record.memory_type}]\n'
+            f'{record.description}\n\n{record.content}'
+        )
+
+    def memory_forget(self, name: str) -> str:
+        removed = self.context.repository.memory.forget(name)
+        return f'Forgot {name}.' if removed else f'Memory not found: {name}'
+
+    def memory_rebuild(self) -> str:
+        path = self.context.repository.memory.rebuild_index()
+        return f'Rebuilt memory index: {path.as_posix()}'
+
+    def memory_consolidate(self) -> str:
+        removed = self.context.repository.memory.consolidate()
+        return f'Consolidated memory; removed {removed} duplicate(s).'
 
 
 def build_assistant_message(

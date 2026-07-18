@@ -21,6 +21,7 @@ from forge.runtime.state import (
     TurnCompleted,
     TurnResult,
 )
+from forge.context.manager import ContextStats
 from forge.tools.base import ToolResult
 
 
@@ -61,6 +62,7 @@ class FakeConversation:
     ) -> None:
         self.responses = list(responses)
         self.prompts: list[str] = []
+        self.context_stats = ContextStats(2, 120, 40)
 
     async def stream(
         self,
@@ -72,6 +74,24 @@ class FakeConversation:
             raise response
         for event in response:
             yield event
+
+    def remember(self, name: str, content: str) -> str:
+        return f'Remembered {name}: {content}'
+
+    def memory_list(self) -> str:
+        return '- testing [project]: test command'
+
+    def memory_show(self, name: str) -> str:
+        return f'{name}\nUse pytest.'
+
+    def memory_forget(self, name: str) -> str:
+        return f'Forgot {name}.'
+
+    def memory_rebuild(self) -> str:
+        return 'Rebuilt memory index.'
+
+    def memory_consolidate(self) -> str:
+        return 'Consolidated memory; removed 0 duplicate(s).'
 
 
 class FakeResponseView:
@@ -205,6 +225,56 @@ def test_cli_starts_an_interactive_conversation(
     assert 'total 23' in result.output
     assert 'Session ended.' in result.output
     assert conversation.prompts == ['first', 'second']
+
+
+def test_context_command_does_not_call_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(app, input='/context\n')
+
+    assert result.exit_code == 0
+    assert 'messages 2' in result.output
+    assert 'estimated tokens 30' in result.output
+    assert 'tool results 40 chars' in result.output
+    assert conversation.prompts == []
+
+
+def test_memory_commands_do_not_call_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(
+        app,
+        input=(
+            '/remember testing | Use pytest.\n'
+            '/memory list\n'
+            '/memory show testing\n'
+            '/memory forget testing\n'
+            '/memory rebuild\n'
+            '/memory consolidate\n'
+        ),
+    )
+
+    assert result.exit_code == 0
+    assert 'Remembered testing: Use pytest.' in result.output
+    assert 'Use pytest.' in result.output
+    assert 'Forgot testing.' in result.output
+    assert 'Rebuilt memory index.' in result.output
+    assert 'Consolidated memory' in result.output
+    assert conversation.prompts == []
 
 
 def test_interactive_conversation_continues_after_model_failure(

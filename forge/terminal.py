@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -19,7 +21,77 @@ from rich.text import Text
 
 from forge import __version__
 from forge.runtime.state import TokenUsage, ToolCall, TurnResult
+from forge.context.manager import ContextStats
+from forge.context.manager import CompactionReport
 from forge.tools.base import ToolResult
+
+
+@dataclass(frozen=True, slots=True)
+class SlashCommandSpec:
+    '''One discoverable local command shown by the interactive prompt.'''
+
+    completion: str
+    usage: str
+    description: str
+
+
+SLASH_COMMANDS = (
+    SlashCommandSpec('/context', '/context', '查看当前上下文统计'),
+    SlashCommandSpec('/compact', '/compact', '立即压缩当前会话'),
+    SlashCommandSpec(
+        '/remember ',
+        '/remember name | content',
+        '保存一条仓库记忆',
+    ),
+    SlashCommandSpec('/memory list', '/memory list', '列出仓库记忆'),
+    SlashCommandSpec(
+        '/memory show ',
+        '/memory show name',
+        '查看一条仓库记忆',
+    ),
+    SlashCommandSpec(
+        '/memory forget ',
+        '/memory forget name',
+        '删除一条仓库记忆',
+    ),
+    SlashCommandSpec(
+        '/memory rebuild',
+        '/memory rebuild',
+        '重建记忆索引',
+    ),
+    SlashCommandSpec(
+        '/memory consolidate',
+        '/memory consolidate',
+        '整理重复记忆',
+    ),
+)
+
+
+class SlashCommandCompleter(Completer):
+    '''Offer local commands only while the input starts with a slash.'''
+
+    def get_completions(
+        self,
+        document: Document,
+        complete_event: object,
+    ):
+        del complete_event
+        text = document.text_before_cursor
+        if not text.startswith('/'):
+            return
+        normalized = text.casefold()
+        for command in SLASH_COMMANDS:
+            if not command.completion.casefold().startswith(normalized):
+                continue
+            yield Completion(
+                command.completion,
+                start_position=-len(text),
+                display=command.usage,
+                display_meta=command.description,
+            )
+
+
+SLASH_COMMAND_COMPLETER = SlashCommandCompleter()
 
 
 @dataclass(slots=True)
@@ -57,7 +129,11 @@ class TerminalUI:
         self.console = console if console is not None else Console()
         self.prompt_session = prompt_session
         if self.prompt_session is None and self.console.is_terminal:
-            self.prompt_session = PromptSession()
+            self.prompt_session = PromptSession(
+                completer=SLASH_COMMAND_COMPLETER,
+                complete_while_typing=True,
+                reserve_space_for_menu=8,
+            )
 
     def show_welcome(self, model: str) -> None:
         '''Show a compact session header inspired by modern coding agents.'''
@@ -109,6 +185,40 @@ class TerminalUI:
         '''Render the session exit message.'''
         self.console.print()
         self.console.print('[dim]Session ended.[/]')
+
+    def show_context(self, stats: ContextStats) -> None:
+        '''Render a compact, provider-neutral context snapshot.'''
+        self.console.print(
+            '[bold bright_cyan]Context[/]  '
+            f'messages {stats.message_count:,}  '
+            f'characters {stats.estimated_characters:,}  '
+            f'estimated tokens {stats.estimated_tokens:,}  '
+            f'tool results {stats.tool_result_characters:,} chars'
+        )
+
+    def show_compaction(self, report: CompactionReport) -> None:
+        '''Render the result of an explicit /compact request.'''
+        if report.success:
+            self.console.print(
+                '[bold green]Context compacted[/]  '
+                f'{report.before_characters:,} → '
+                f'{report.after_characters:,} characters'
+            )
+            if report.transcript_path:
+                self.console.print(
+                    f'[dim]Full transcript: {report.transcript_path}[/]'
+                )
+            elif report.reason:
+                self.console.print(f'[dim]{report.reason}[/]')
+            return
+        self.console.print(
+            f'[bold red]Compaction failed[/] [dim]{escape(report.reason)}[/]'
+        )
+
+    def show_notice(self, title: str, content: str) -> None:
+        '''Render a local command result without starting a model turn.'''
+        self.console.print(f'[bold bright_cyan]{escape(title)}[/]')
+        self.console.print(escape(content))
 
 
 class StreamingResponseView:
