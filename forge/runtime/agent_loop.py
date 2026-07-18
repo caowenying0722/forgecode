@@ -214,6 +214,11 @@ class Conversation:
                             error,
                             attempt=protocol_recoveries,
                             maximum=self.max_protocol_recoveries,
+                            available_tools=(
+                                self.registry.names
+                                if self.registry is not None
+                                else ()
+                            ),
                         )
                     )
                     continue
@@ -323,7 +328,8 @@ class Conversation:
             all_tool_calls.extend(tool_calls)
             tool_results: list[tuple[ToolCall, ToolResult]] = []
             for tool_call in tool_calls:
-                if tool_call.name == 'apply_patch':
+                tool_effect = self.registry.effect(tool_call.name)
+                if tool_effect == 'workspace_write':
                     mutation_attempted = True
                 yield ToolExecutionStarted(tool_call=tool_call)
                 result = await self.registry.execute(
@@ -338,6 +344,8 @@ class Conversation:
                 if self.workspace_tracker is not None:
                     change = await self.workspace_tracker.refresh()
                     if change is not None:
+                        if tool_effect == 'process':
+                            mutation_attempted = True
                         yield WorkspaceChanged(
                             revision=change.revision,
                             paths=change.paths,
@@ -510,13 +518,28 @@ def build_protocol_recovery_feedback(
     *,
     attempt: int,
     maximum: int,
+    available_tools: tuple[str, ...],
 ) -> list[dict[str, Any]]:
     '''Represent a rejected response and request one smaller valid retry.'''
     tool = f' for tool {error.tool_name!r}' if error.tool_name else ''
     if error.reason == 'output_truncated':
         problem = 'The previous response reached the max_tokens limit.'
+    elif error.reason == 'unavailable_tool':
+        problem = f'The previous response requested unavailable tool{tool}.'
     else:
         problem = f'The previous tool call{tool} had invalid arguments.'
+    available = (
+        ', '.join(available_tools) if available_tools else 'none'
+    )
+    retry_limit = 4_000 if attempt == 1 else 2_000
+    retry_strategy = (
+        'Modify only one function or one file section.'
+        if attempt == 1
+        else (
+            'Create only a minimal skeleton. Keep HTML, CSS, and JavaScript '
+            'in separate tool calls.'
+        )
+    )
     return [
         {
             'role': 'assistant',
@@ -527,11 +550,14 @@ def build_protocol_recovery_feedback(
             'content': (
                 f'{problem}\nError: {error}\n'
                 'No tool was executed and no file was changed by that '
-                'response. Retry with the available tools. For file creation '
-                'or editing, use apply_patch with one focused patch below '
-                '8000 characters, and split large HTML, CSS, or JavaScript '
-                'across multiple calls. Do not invent a write_file tool and '
-                'do not repeat the same invalid arguments.\n'
+                f'response. Available tools: {available}. For a small complete '
+                f'file, use write_file with at most {retry_limit} characters. '
+                'For a '
+                'focused exact change, use replace_text. For structured edits, '
+                f'use apply_patch with at most {retry_limit} characters. '
+                f'{retry_strategy} Split large '
+                'HTML, CSS, or JavaScript across multiple calls and do not '
+                'repeat the same invalid arguments.\n'
                 f'Recovery attempt {attempt} of {maximum}.'
             ),
         },

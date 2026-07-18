@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 import subprocess
-import sys
 from typing import Any
 
 from forge.runtime.agent_loop import Conversation
@@ -91,31 +90,19 @@ def collect_turn(
     return asyncio.run(collect())
 
 
-def edit_command() -> str:
-    script = (
-        'open('
-        + repr('sample.txt')
-        + ', '
-        + repr('w')
-        + ').write('
-        + repr('new\n')
-        + ')'
-    )
-    return subprocess.list2cmdline(
-        [
-            sys.executable,
-            '-c',
-            script,
-        ]
-    )
-
-
 def test_agent_loop_rejects_early_answer_then_accepts_verify_evidence(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
     edit = ToolCall(
-        0, 'toolu_edit', 'run_command', {'command': edit_command()}
+        0,
+        'toolu_edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
     )
     verify = ToolCall(
         0, 'toolu_verify', 'verify', {'command': 'git diff --check'}
@@ -149,7 +136,14 @@ def test_agent_loop_stops_after_three_completion_rejections(
 ) -> None:
     initialize_git_repository(tmp_path)
     edit = ToolCall(
-        0, 'toolu_edit', 'run_command', {'command': edit_command()}
+        0,
+        'toolu_edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
     )
     client = FakeModelClient(
         response_with_tool(edit),

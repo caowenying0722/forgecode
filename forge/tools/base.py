@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -105,6 +105,7 @@ class Tool(ABC, Generic[InputT]):
     name: ClassVar[str]
     description: ClassVar[str]
     input_model: ClassVar[type[ToolInput]]
+    effect: ClassVar[ToolEffect] = 'read_only'
 
     def __init__(self, root: Path) -> None:
         resolved_root = root.resolve()
@@ -184,6 +185,10 @@ class ToolRegistry:
     def names(self) -> tuple[str, ...]:
         return tuple(self._tools)
 
+    def effect(self, name: str) -> ToolEffect | None:
+        tool = self._tools.get(name)
+        return None if tool is None else tool.effect
+
     async def execute(
         self,
         name: str,
@@ -197,6 +202,9 @@ class ToolRegistry:
                 details={'available_tools': list(self._tools)},
             )
         return await tool.run(arguments)
+
+
+ToolEffect = Literal['read_only', 'workspace_write', 'process']
 
 
 def resolve_repository_path(

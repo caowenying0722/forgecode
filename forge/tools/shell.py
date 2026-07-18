@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from time import perf_counter
 
 from pydantic import Field
@@ -110,12 +111,23 @@ class RunCommandInput(ToolInput):
 class RunCommandTool(Tool[RunCommandInput]):
     name = 'run_command'
     description = (
-        'Run a local shell command inside the repository and return its exit '
-        'code, stdout, stderr, and duration.'
+        'Run a local shell command inside the repository for inspection, '
+        'tests, builds, or validation. Do not write repository files through '
+        'inline Node, Python, PowerShell, or shell redirection. Use write_file, '
+        'replace_text, or apply_patch for source changes.'
     )
     input_model = RunCommandInput
+    effect = 'process'
 
     async def execute(self, arguments: RunCommandInput) -> ToolResult:
+        denied_reason = shell_file_write_reason(arguments.command)
+        if denied_reason is not None:
+            raise ToolExecutionError(
+                'shell_file_write_denied',
+                'run_command cannot be used to write repository files. '
+                'Use write_file, replace_text, or apply_patch instead.',
+                details={'detected': denied_reason},
+            )
         cwd = resolve_repository_path(self.root, arguments.cwd)
         if not cwd.is_dir():
             raise ToolExecutionError(
@@ -154,3 +166,69 @@ class RunCommandTool(Tool[RunCommandInput]):
             content=content,
             metadata=metadata,
         )
+
+
+SCRIPT_WRITE_PATTERNS = (
+    (
+        re.compile(
+            r'\b(?:writeFile|writeFileSync|appendFile|appendFileSync)\s*\(',
+            re.IGNORECASE,
+        ),
+        'Node filesystem write API',
+    ),
+    (
+        re.compile(r'\.(?:write_text|write_bytes)\s*\(', re.IGNORECASE),
+        'Python pathlib write API',
+    ),
+    (
+        re.compile(
+            r'\bopen\s*\([^\n]*,\s*[\x27\x22](?:w|a|x|\+)',
+            re.IGNORECASE,
+        ),
+        'Python writable open mode',
+    ),
+    (
+        re.compile(
+            r'\b(?:Set-Content|Add-Content|Out-File)\b',
+            re.IGNORECASE,
+        ),
+        'PowerShell file-writing command',
+    ),
+)
+
+
+def shell_file_write_reason(command: str) -> str | None:
+    '''Detect common direct file-writing shortcuts before shell execution.'''
+    for pattern, reason in SCRIPT_WRITE_PATTERNS:
+        if pattern.search(command):
+            return reason
+    if has_unquoted_output_redirection(command):
+        return 'shell output redirection'
+    return None
+
+
+def has_unquoted_output_redirection(command: str) -> bool:
+    single_quoted = False
+    double_quoted = False
+    escaped = False
+    for index, character in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if character == '\\':
+            escaped = True
+            continue
+        if character == chr(39) and not double_quoted:
+            single_quoted = not single_quoted
+            continue
+        if character == chr(34) and not single_quoted:
+            double_quoted = not double_quoted
+            continue
+        if character != '>' or single_quoted or double_quoted:
+            continue
+        following = command[index + 1:index + 2]
+        preceding = command[index - 1:index] if index else ''
+        if following == '&' or preceding == '=':
+            continue
+        return True
+    return False

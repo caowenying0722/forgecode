@@ -3,7 +3,12 @@
 from pathlib import Path
 
 from forge.tools.base import ToolRegistry
-from forge.tools.filesystem import ListDirectoryTool, ReadFileTool
+from forge.tools.filesystem import (
+    ListDirectoryTool,
+    ReadFileTool,
+    ReplaceTextTool,
+    WriteFileTool,
+)
 from forge.tools.git import GitDiffTool, GitStatusTool
 from forge.tools.patch import ApplyPatchTool
 from forge.tools.search import FindFilesTool, GrepTool
@@ -21,6 +26,8 @@ def create_default_registry(root: Path) -> ToolRegistry:
             FindFilesTool(root),
             ReadFileTool(root),
             GrepTool(root),
+            WriteFileTool(root),
+            ReplaceTextTool(root),
             ApplyPatchTool(root),
             RunCommandTool(root),
             VerifyTool(root, tracker),
@@ -39,8 +46,10 @@ __all__ = [
     'GrepTool',
     'ListDirectoryTool',
     'ReadFileTool',
+    'ReplaceTextTool',
     'RunCommandTool',
     'VerifyTool',
+    'WriteFileTool',
     'ToolRegistry',
     'create_default_registry',
 ]

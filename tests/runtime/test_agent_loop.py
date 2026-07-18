@@ -424,7 +424,8 @@ def test_invalid_tool_json_is_retried_without_executing_partial_calls(
     assert events[-1].result.usage.input_tokens == 22
     feedback = client.calls[1]['messages'][-1]['content']
     assert 'No tool was executed' in feedback
-    assert 'do not invent a write_file tool' in feedback.casefold()
+    assert 'Available tools: read_file' in feedback
+    assert 'write_file with at most 4000 characters' in feedback
     assert 'Recovery attempt 1 of 2' in feedback
 
 
@@ -443,7 +444,8 @@ def test_max_tokens_truncation_retries_with_small_patch_feedback() -> None:
     assert events[-1].result.text == 'Retried in smaller steps.'
     feedback = client.calls[1]['messages'][-1]['content']
     assert 'reached the max_tokens limit' in feedback
-    assert 'below 8000 characters' in feedback
+    assert 'apply_patch with at most 4000 characters' in feedback
+    assert 'Modify only one function or one file section' in feedback
 
 
 def test_protocol_recovery_stops_after_configured_limit() -> None:
@@ -462,6 +464,24 @@ def test_protocol_recovery_stops_after_configured_limit() -> None:
         collect_turn(conversation, 'Build a page')
 
     assert len(client.calls) == 2
+
+
+def test_second_protocol_recovery_requests_minimal_skeleton() -> None:
+    error = ModelOutputTruncatedError(('apply_patch',))
+    client = FakeModelClient(
+        [error],
+        [error],
+        streamed_response('Recovered with a skeleton.'),
+    )
+    conversation = Conversation(client=client)
+
+    events = collect_turn(conversation, 'Build a game')
+
+    assert events[-1].result.text == 'Recovered with a skeleton.'
+    feedback = client.calls[2]['messages'][-1]['content']
+    assert 'at most 2000 characters' in feedback
+    assert 'Create only a minimal skeleton' in feedback
+    assert 'HTML, CSS, and JavaScript in separate tool calls' in feedback
 
 
 def test_conversation_sends_previous_turns_as_context() -> None:

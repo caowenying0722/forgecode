@@ -36,6 +36,7 @@ class VerifyTool(Tool[VerifyInput]):
         'revision.'
     )
     input_model = VerifyInput
+    effect = 'process'
 
     def __init__(self, root: Path, tracker: WorkspaceTracker) -> None:
         super().__init__(root)

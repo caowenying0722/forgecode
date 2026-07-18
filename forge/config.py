@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 
 DEFAULT_ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
+DEFAULT_MODEL_MAX_TOKENS = 8_192
 
 
 class ConfigurationError(ValueError):
@@ -25,6 +26,7 @@ class ForgeConfig:
     api_key: str
     model_id: str
     base_url: str = DEFAULT_ANTHROPIC_BASE_URL
+    max_tokens: int = DEFAULT_MODEL_MAX_TOKENS
 
     def __post_init__(self) -> None:
         api_key = self.api_key.strip()
@@ -35,6 +37,10 @@ class ForgeConfig:
             raise ConfigurationError('ANTHROPIC_API_KEY is not set.')
         if not model_id:
             raise ConfigurationError('MODEL_ID is not set.')
+        if not 1_024 <= self.max_tokens <= 32_768:
+            raise ConfigurationError(
+                'MODEL_MAX_TOKENS must be between 1024 and 32768.'
+            )
 
         parsed_url = urlsplit(base_url)
         if parsed_url.scheme not in {'http', 'https'} or not parsed_url.netloc:
@@ -58,6 +64,17 @@ class ForgeConfig:
         else:
             source = environ
 
+        raw_max_tokens = source.get(
+            'MODEL_MAX_TOKENS',
+            str(DEFAULT_MODEL_MAX_TOKENS),
+        )
+        try:
+            max_tokens = int(raw_max_tokens)
+        except ValueError as error:
+            raise ConfigurationError(
+                'MODEL_MAX_TOKENS must be an integer.'
+            ) from error
+
         return cls(
             api_key=source.get('ANTHROPIC_API_KEY', ''),
             model_id=source.get('MODEL_ID', ''),
@@ -65,4 +82,5 @@ class ForgeConfig:
                 'ANTHROPIC_BASE_URL',
                 DEFAULT_ANTHROPIC_BASE_URL,
             ),
+            max_tokens=max_tokens,
         )

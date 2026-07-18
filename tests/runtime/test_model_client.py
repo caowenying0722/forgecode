@@ -129,6 +129,23 @@ def test_client_can_use_model_id_from_config() -> None:
     )
 
     assert client.model == 'configured-model'
+    assert client.max_tokens == 8_192
+
+
+def test_client_uses_configured_max_tokens() -> None:
+    sdk = FakeAnthropic()
+    client = AnthropicModelClient.from_config(
+        config=ForgeConfig(
+            api_key='test-api-key',
+            model_id='configured-model',
+            max_tokens=16_384,
+        ),
+        client=sdk,
+    )
+
+    collect_stream(client, messages=[{'role': 'user', 'content': 'Hello'}])
+
+    assert sdk.messages.calls[0]['max_tokens'] == 16_384
 
 
 def collect_stream(
@@ -341,6 +358,18 @@ def test_stream_emits_multiple_completed_tool_calls() -> None:
         messages=[
             {'role': 'user', 'content': 'Inspect the repository.'}
         ],
+        tools=[
+            {
+                'name': 'read_file',
+                'description': 'read',
+                'input_schema': {'type': 'object'},
+            },
+            {
+                'name': 'grep',
+                'description': 'search',
+                'input_schema': {'type': 'object'},
+            },
+        ],
     )
 
     assert events == [
@@ -417,6 +446,13 @@ def test_stream_rejects_invalid_tool_argument_json() -> None:
         collect_stream(
             client,
             messages=[{'role': 'user', 'content': 'Read a file.'}],
+            tools=[
+                {
+                    'name': 'read_file',
+                    'description': 'read',
+                    'input_schema': {'type': 'object'},
+                }
+            ],
         )
 
 
@@ -450,7 +486,17 @@ def test_stream_reports_unterminated_tool_json_with_tool_details() -> None:
     client = AnthropicModelClient(model='test', client=sdk)
 
     with pytest.raises(ModelProtocolError) as captured:
-        collect_stream(client, messages=[{'role': 'user', 'content': 'build'}])
+        collect_stream(
+            client,
+            messages=[{'role': 'user', 'content': 'build'}],
+            tools=[
+                {
+                    'name': 'write_file',
+                    'description': 'write',
+                    'input_schema': {'type': 'object'},
+                }
+            ],
+        )
 
     assert captured.value.reason == 'invalid_tool_arguments'
     assert captured.value.tool_name == 'write_file'
@@ -491,6 +537,53 @@ def test_stream_classifies_pending_tool_call_at_max_tokens() -> None:
     assert captured.value.reason == 'output_truncated'
     assert captured.value.tool_name == 'apply_patch'
     assert 'max_tokens' in str(captured.value)
+
+
+def test_stream_rejects_unavailable_tool_before_parsing_bad_json() -> None:
+    sdk = FakeAnthropic()
+    sdk.messages.events = [
+        SimpleNamespace(
+            type='content_block_start',
+            index=0,
+            content_block=SimpleNamespace(
+                type='tool_use',
+                id='toolu_unknown',
+                name='invented_writer',
+                input={},
+            ),
+        ),
+        SimpleNamespace(
+            type='content_block_delta',
+            index=0,
+            delta=SimpleNamespace(
+                type='input_json_delta',
+                partial_json='not valid json',
+            ),
+        ),
+        SimpleNamespace(type='content_block_stop', index=0),
+    ]
+    sdk.messages.final_message = SimpleNamespace(
+        usage=usage(input_tokens=20, output_tokens=5),
+        stop_reason='end_turn',
+    )
+    client = AnthropicModelClient(model='test', client=sdk)
+    tools = [
+        {
+            'name': 'apply_patch',
+            'description': 'patch',
+            'input_schema': {'type': 'object'},
+        }
+    ]
+
+    with pytest.raises(ModelProtocolError) as captured:
+        collect_stream(
+            client,
+            messages=[{'role': 'user', 'content': 'build'}],
+            tools=tools,
+        )
+
+    assert captured.value.reason == 'unavailable_tool'
+    assert captured.value.tool_name == 'invented_writer'
 
 
 def test_stream_omits_unused_optional_parameters() -> None:

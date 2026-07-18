@@ -3,7 +3,12 @@
 import asyncio
 from pathlib import Path
 
-from forge.tools.filesystem import ListDirectoryTool, ReadFileTool
+from forge.tools.filesystem import (
+    ListDirectoryTool,
+    ReadFileTool,
+    ReplaceTextTool,
+    WriteFileTool,
+)
 from forge.tools.search import FindFilesTool, GrepTool
 from forge.tools.base import ToolResult
 
@@ -80,6 +85,68 @@ def test_read_file_rejects_an_inverted_range(tmp_path: Path) -> None:
     assert result.success is False
     assert result.error is not None
     assert result.error.code == 'invalid_arguments'
+
+
+def test_write_file_creates_and_atomically_replaces_small_text(
+    tmp_path: Path,
+) -> None:
+    tool = WriteFileTool(tmp_path)
+
+    created = run(tool.run({'path': 'game.html', 'content': 'first'}))
+    replaced = run(tool.run({'path': 'game.html', 'content': 'second'}))
+
+    assert created.success is True
+    assert created.metadata['created'] is True
+    assert replaced.success is True
+    assert replaced.metadata['created'] is False
+    assert (tmp_path / 'game.html').read_text(encoding='utf-8') == 'second'
+    assert not list(tmp_path.glob('*.forge-tmp'))
+
+
+def test_write_file_rejects_content_over_8000_characters(
+    tmp_path: Path,
+) -> None:
+    result = run(
+        WriteFileTool(tmp_path).run(
+            {'path': 'large.html', 'content': 'x' * 8_001}
+        )
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'invalid_arguments'
+    assert not (tmp_path / 'large.html').exists()
+
+
+def test_replace_text_requires_one_exact_occurrence(tmp_path: Path) -> None:
+    path = tmp_path / 'game.js'
+    path.write_text('const gravity = 1;\n', encoding='utf-8')
+    tool = ReplaceTextTool(tmp_path)
+
+    replaced = run(
+        tool.run(
+            {
+                'path': 'game.js',
+                'old_text': 'gravity = 1',
+                'new_text': 'gravity = 0.08',
+            }
+        )
+    )
+    missing = run(
+        tool.run(
+            {
+                'path': 'game.js',
+                'old_text': 'missing',
+                'new_text': 'value',
+            }
+        )
+    )
+
+    assert replaced.success is True
+    assert 'gravity = 0.08' in path.read_text(encoding='utf-8')
+    assert missing.success is False
+    assert missing.error is not None
+    assert missing.error.code == 'text_not_unique'
 
 
 def test_find_files_uses_globs_and_ignores_generated_directories(

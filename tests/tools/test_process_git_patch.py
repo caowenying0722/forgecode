@@ -80,7 +80,32 @@ def test_run_command_returns_nonzero_exit_as_structured_error(
     assert result.metadata['exit_code'] == 7
 
 
+def test_run_command_allows_stderr_merge_redirection(tmp_path: Path) -> None:
+    redirect = '2' + chr(62) + chr(38) + '1'
+    result = run(
+        RunCommandTool(tmp_path).run(
+            {'command': f'echo inspected {redirect}'}
+        )
+    )
+
+    assert result.success is True
+
+
 def test_verify_returns_revision_bound_evidence(tmp_path: Path) -> None:
+    denied_commands = [
+        'node -e writeFileSync(',
+        'python -c Path.write_text(',
+        'powershell Set-Content marker',
+        'echo changed ' + chr(62) + ' game.html',
+    ]
+    for denied_command in denied_commands:
+        denied = run(
+            RunCommandTool(tmp_path).run({'command': denied_command})
+        )
+        assert denied.success is False
+        assert denied.error is not None
+        assert denied.error.code == 'shell_file_write_denied'
+
     initialize_git_repository(tmp_path)
     tracker = WorkspaceTracker(tmp_path)
     asyncio.run(tracker.begin_turn())
@@ -176,6 +201,16 @@ def test_apply_patch_description_requires_small_focused_writes(
 ) -> None:
     description = ApplyPatchTool(tmp_path).definition['description']
 
-    assert 'below 8000 characters' in description
+    assert 'limited to 8000 characters' in description
     assert 'split large HTML' in description
-    assert 'do not invent or request a write_file tool' in description
+    assert 'Use write_file only for small full-file content' in description
+
+
+def test_apply_patch_rejects_payload_over_8000_characters(
+    tmp_path: Path,
+) -> None:
+    result = run(ApplyPatchTool(tmp_path).run({'patch': 'x' * 8_001}))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'invalid_arguments'

@@ -162,23 +162,13 @@ def test_run_case_passes_with_fake_agent_and_independent_hidden_test(
 ) -> None:
     commit = initialize_project(tmp_path)
     case = make_case(commit)
-    edit_script = (
-        'open('
-        + repr('value.txt')
-        + ', '
-        + repr('w')
-        + ').write('
-        + repr('new\n')
-        + ')'
-    )
     edit = ToolCall(
         index=0,
         id='toolu_edit',
-        name='run_command',
+        name='write_file',
         arguments={
-            'command': subprocess.list2cmdline(
-                [sys.executable, '-c', edit_script]
-            )
+            'path': 'value.txt',
+            'content': 'new\n',
         },
     )
     verify = ToolCall(

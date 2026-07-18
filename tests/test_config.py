@@ -6,6 +6,7 @@ import pytest
 
 from forge.config import (
     DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_MODEL_MAX_TOKENS,
     ConfigurationError,
     ForgeConfig,
 )
@@ -22,6 +23,7 @@ def test_config_uses_official_base_url_by_default() -> None:
     assert config.api_key == 'test-key'
     assert config.model_id == 'claude-test'
     assert config.base_url == DEFAULT_ANTHROPIC_BASE_URL
+    assert config.max_tokens == DEFAULT_MODEL_MAX_TOKENS
 
 
 def test_config_accepts_anthropic_compatible_base_url() -> None:
@@ -96,4 +98,28 @@ def test_config_rejects_invalid_base_url() -> None:
             api_key='test-key',
             model_id='claude-test',
             base_url='localhost:8080',
+        )
+
+
+def test_config_reads_and_validates_model_max_tokens() -> None:
+    config = ForgeConfig.from_env(
+        {
+            'ANTHROPIC_API_KEY': 'test-key',
+            'MODEL_ID': 'test-model',
+            'MODEL_MAX_TOKENS': '16384',
+        }
+    )
+
+    assert config.max_tokens == 16_384
+
+
+@pytest.mark.parametrize('value', ['invalid', '1000', '40000'])
+def test_config_rejects_invalid_model_max_tokens(value: str) -> None:
+    with pytest.raises(ConfigurationError, match='MODEL_MAX_TOKENS'):
+        ForgeConfig.from_env(
+            {
+                'ANTHROPIC_API_KEY': 'test-key',
+                'MODEL_ID': 'test-model',
+                'MODEL_MAX_TOKENS': value,
+            }
         )

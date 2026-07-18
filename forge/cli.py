@@ -243,6 +243,7 @@ def show_config() -> None:
     typer.echo('Anthropic configuration is ready.')
     typer.echo(f'Model ID: {config.model_id}')
     typer.echo(f'Base URL: {config.base_url}')
+    typer.echo(f'Max output tokens: {config.max_tokens:,}')
     typer.echo('API key: configured')
 
 

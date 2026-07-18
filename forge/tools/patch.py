@@ -13,19 +13,20 @@ from forge.tools.shell import (
 
 
 class ApplyPatchInput(ToolInput):
-    patch: str = Field(min_length=1)
+    patch: str = Field(min_length=1, max_length=8_000)
 
 
 class ApplyPatchTool(Tool[ApplyPatchInput]):
     name = 'apply_patch'
     description = (
         'Create or modify repository text files with one focused unified diff '
-        'after validating it with git apply --check. Keep the patch below '
+        'after validating it with git apply --check. The patch is limited to '
         '8000 characters; split large HTML, CSS, JavaScript, or source files '
-        'across multiple calls and verify each step. This is the available '
-        'file-writing tool; do not invent or request a write_file tool.'
+        'across multiple calls and verify each step. Use write_file only for '
+        'small full-file content and replace_text for one exact replacement.'
     )
     input_model = ApplyPatchInput
+    effect = 'workspace_write'
 
     async def execute(self, arguments: ApplyPatchInput) -> ToolResult:
         check = await run_process(

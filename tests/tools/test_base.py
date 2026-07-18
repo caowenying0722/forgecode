@@ -19,6 +19,8 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'find_files',
         'read_file',
         'grep',
+        'write_file',
+        'replace_text',
         'apply_patch',
         'run_command',
         'verify',
@@ -32,6 +34,12 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         definition['input_schema']['type'] == 'object'
         for definition in registry.definitions
     )
+    assert registry.effect('read_file') == 'read_only'
+    assert registry.effect('write_file') == 'workspace_write'
+    assert registry.effect('replace_text') == 'workspace_write'
+    assert registry.effect('apply_patch') == 'workspace_write'
+    assert registry.effect('run_command') == 'process'
+    assert registry.effect('missing') is None
 
 
 def test_registry_returns_structured_unknown_tool_error(

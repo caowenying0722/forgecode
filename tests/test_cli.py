@@ -353,6 +353,7 @@ def test_config_command_reports_ready_without_exposing_api_key() -> None:
     assert 'Model ID: claude-test' in result.stdout
     assert 'https://gateway.example.com/anthropic' in result.stdout
     assert 'API key: configured' in result.stdout
+    assert 'Max output tokens: 8,192' in result.stdout
     assert 'secret-test-key' not in result.stdout
 
 

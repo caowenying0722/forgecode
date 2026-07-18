@@ -18,7 +18,7 @@ from anthropic import (
     RateLimitError,
 )
 
-from forge.config import ForgeConfig
+from forge.config import DEFAULT_MODEL_MAX_TOKENS, ForgeConfig
 from forge.runtime.state import (
     ModelStreamEvent,
     ModelTextDelta,
@@ -82,6 +82,7 @@ class _PendingToolCall:
     name: str
     initial_input: dict[str, Any]
     json_parts: list[str] = field(default_factory=list)
+    available: bool = True
 
 
 @runtime_checkable
@@ -109,7 +110,7 @@ class AnthropicModelClient:
     def from_config(
         cls,
         config: ForgeConfig | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         max_retries: int = 3,
         client: AsyncAnthropic | None = None,
     ) -> AnthropicModelClient:
@@ -117,7 +118,11 @@ class AnthropicModelClient:
         resolved_config = config if config is not None else ForgeConfig.from_env()
         return cls(
             model=resolved_config.model_id,
-            max_tokens=max_tokens,
+            max_tokens=(
+                resolved_config.max_tokens
+                if max_tokens is None
+                else max_tokens
+            ),
             max_retries=max_retries,
             config=resolved_config,
             client=client,
@@ -126,7 +131,7 @@ class AnthropicModelClient:
     def __init__(
         self,
         model: str,
-        max_tokens: int = 4096,
+        max_tokens: int = DEFAULT_MODEL_MAX_TOKENS,
         max_retries: int = 3,
         config: ForgeConfig | None = None,
         client: AsyncAnthropic | None = None,
@@ -221,6 +226,10 @@ class AnthropicModelClient:
         current_usage: TokenUsage | None = None
         pending_tool_calls: dict[int, _PendingToolCall] = {}
         protocol_error: ModelProtocolError | None = None
+        allowed_tool_names = {
+            str(tool.get('name', ''))
+            for tool in sdk_arguments.get('tools', [])
+        }
         async with self._client.messages.stream(**sdk_arguments) as stream:
             async for event in stream:
                 if (
@@ -236,16 +245,25 @@ class AnthropicModelClient:
                     and event.content_block.type == 'tool_use'
                 ):
                     block = event.content_block
+                    available = block.name in allowed_tool_names
                     pending_tool_calls[event.index] = _PendingToolCall(
                         id=block.id,
                         name=block.name,
                         initial_input=dict(block.input),
+                        available=available,
                     )
-                    yield ModelToolCallStarted(
-                        index=event.index,
-                        id=block.id,
-                        name=block.name,
-                    )
+                    if not available:
+                        protocol_error = protocol_error or ModelProtocolError(
+                            f'Model requested unavailable tool: {block.name}.',
+                            reason='unavailable_tool',
+                            tool_name=block.name,
+                        )
+                    else:
+                        yield ModelToolCallStarted(
+                            index=event.index,
+                            id=block.id,
+                            name=block.name,
+                        )
                 elif (
                     event.type == 'content_block_delta'
                     and event.delta.type == 'input_json_delta'
@@ -257,15 +275,18 @@ class AnthropicModelClient:
                             f'at content block {event.index}.'
                         )
                     pending.json_parts.append(event.delta.partial_json)
-                    yield ModelToolCallArgumentsDelta(
-                        index=event.index,
-                        partial_json=event.delta.partial_json,
-                    )
+                    if pending.available:
+                        yield ModelToolCallArgumentsDelta(
+                            index=event.index,
+                            partial_json=event.delta.partial_json,
+                        )
                 elif (
                     event.type == 'content_block_stop'
                     and event.index in pending_tool_calls
                 ):
                     pending = pending_tool_calls.pop(event.index)
+                    if not pending.available:
+                        continue
                     try:
                         arguments = parse_tool_arguments(
                             pending,

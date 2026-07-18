@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
+import tempfile
 
 from pydantic import Field, model_validator
 
@@ -116,3 +119,133 @@ class ReadFileTool(Tool[ReadFileInput]):
                 'total_lines': total_lines,
             },
         )
+
+
+class WriteFileInput(ToolInput):
+    path: str = Field(min_length=1)
+    content: str = Field(max_length=8_000)
+
+
+class WriteFileTool(Tool[WriteFileInput]):
+    name = 'write_file'
+    description = (
+        'Create or fully replace one small UTF-8 repository text file '
+        'atomically. Content is limited to 8000 characters. For larger files, '
+        'write a minimal skeleton first, then use replace_text or apply_patch '
+        'in multiple focused calls.'
+    )
+    input_model = WriteFileInput
+    effect = 'workspace_write'
+
+    async def execute(self, arguments: WriteFileInput) -> ToolResult:
+        return await asyncio.to_thread(self._execute_sync, arguments)
+
+    def _execute_sync(self, arguments: WriteFileInput) -> ToolResult:
+        path = resolve_repository_path(
+            self.root,
+            arguments.path,
+            must_exist=False,
+        )
+        if path.exists() and not path.is_file():
+            raise ToolExecutionError(
+                'not_a_file',
+                f'Path is not a file: {arguments.path}',
+            )
+        if not path.parent.is_dir():
+            raise ToolExecutionError(
+                'parent_not_found',
+                f'Parent directory does not exist: {arguments.path}',
+            )
+        existed = path.exists()
+        atomic_write_text(path, arguments.content)
+        shown_path = display_path(self.root, path)
+        action = 'Replaced' if existed else 'Created'
+        return ToolResult.ok(
+            f'{action} {shown_path} with {len(arguments.content)} characters.',
+            metadata={
+                'path': shown_path,
+                'characters': len(arguments.content),
+                'created': not existed,
+            },
+        )
+
+
+class ReplaceTextInput(ToolInput):
+    path: str = Field(min_length=1)
+    old_text: str = Field(min_length=1, max_length=8_000)
+    new_text: str = Field(max_length=8_000)
+
+
+class ReplaceTextTool(Tool[ReplaceTextInput]):
+    name = 'replace_text'
+    description = (
+        'Replace one exact, unique UTF-8 text fragment in an existing '
+        'repository file. Both old_text and new_text are limited to 8000 '
+        'characters. Use multiple focused calls for large edits.'
+    )
+    input_model = ReplaceTextInput
+    effect = 'workspace_write'
+
+    async def execute(self, arguments: ReplaceTextInput) -> ToolResult:
+        return await asyncio.to_thread(self._execute_sync, arguments)
+
+    def _execute_sync(self, arguments: ReplaceTextInput) -> ToolResult:
+        path = resolve_repository_path(self.root, arguments.path)
+        if not path.is_file():
+            raise ToolExecutionError(
+                'not_a_file',
+                f'Path is not a file: {arguments.path}',
+            )
+        try:
+            content = path.read_text(encoding='utf-8')
+        except UnicodeDecodeError as error:
+            raise ToolExecutionError(
+                'not_utf8_text',
+                f'File is not valid UTF-8 text: {arguments.path}',
+            ) from error
+        occurrences = content.count(arguments.old_text)
+        if occurrences != 1:
+            raise ToolExecutionError(
+                'text_not_unique',
+                'old_text must occur exactly once in '
+                f'{arguments.path}; found {occurrences}.',
+                details={'occurrences': occurrences},
+            )
+        updated = content.replace(
+            arguments.old_text,
+            arguments.new_text,
+            1,
+        )
+        atomic_write_text(path, updated)
+        shown_path = display_path(self.root, path)
+        return ToolResult.ok(
+            f'Replaced one text fragment in {shown_path}.',
+            metadata={
+                'path': shown_path,
+                'old_characters': len(arguments.old_text),
+                'new_characters': len(arguments.new_text),
+            },
+        )
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    '''Replace one text file without exposing a partially written result.'''
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            encoding='utf-8',
+            newline='',
+            dir=path.parent,
+            prefix=f'.{path.name}.',
+            suffix='.forge-tmp',
+            delete=False,
+        ) as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
