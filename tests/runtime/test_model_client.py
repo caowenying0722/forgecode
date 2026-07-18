@@ -538,6 +538,7 @@ def test_stream_classifies_pending_tool_call_at_max_tokens() -> None:
 
     assert captured.value.reason == 'output_truncated'
     assert captured.value.tool_name == 'apply_patch'
+    assert captured.value.tool_names == ('apply_patch',)
     assert 'max_tokens' in str(captured.value)
 
 

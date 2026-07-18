@@ -54,6 +54,7 @@ class ModelOutputTruncatedError(ModelProtocolError):
     '''Raised when the provider stops because max_tokens was reached.'''
 
     def __init__(self, tool_names: tuple[str, ...] = ()) -> None:
+        self.tool_names = tool_names
         detail = (
             f' while generating tool arguments for {", ".join(tool_names)}'
             if tool_names

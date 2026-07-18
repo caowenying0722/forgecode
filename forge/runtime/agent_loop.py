@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from functools import cache
+from itertools import count
 import json
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from forge.runtime.model_client import (
     AnthropicModelClient,
     ModelCallError,
     ModelClient,
+    ModelOutputTruncatedError,
     ModelProtocolError,
 )
 from forge.runtime.completion import CompletionGate, TaskPolicy
@@ -69,21 +71,24 @@ class Conversation:
         system_prompt: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         registry: ToolRegistry | None = None,
-        max_iterations: int = 100,
+        max_iterations: int | None = None,
         task_policy: TaskPolicy | None = None,
         max_completion_blocks: int = 3,
         context_config: CompactionConfig | None = None,
         context_root: Path | None = None,
         max_protocol_recoveries: int = 2,
+        max_output_continuations: int = 2,
     ) -> None:
         if tools is not None and registry is not None:
             raise ValueError('Pass tools or registry, not both.')
-        if max_iterations < 1:
+        if max_iterations is not None and max_iterations < 1:
             raise ValueError('max_iterations must be positive')
         if max_completion_blocks < 1:
             raise ValueError('max_completion_blocks must be positive')
         if max_protocol_recoveries < 0:
             raise ValueError('max_protocol_recoveries must not be negative')
+        if max_output_continuations < 0:
+            raise ValueError('max_output_continuations must not be negative')
         self.client = (
             client if client is not None else AnthropicModelClient.from_config()
         )
@@ -121,6 +126,7 @@ class Conversation:
         )
         self.max_completion_blocks = max_completion_blocks
         self.max_protocol_recoveries = max_protocol_recoveries
+        self.max_output_continuations = max_output_continuations
         self._last_repository_context = self.context.repository.system_suffix('')
 
     @property
@@ -178,8 +184,15 @@ class Conversation:
         )
         reactive_compaction_attempted = False
         protocol_recoveries = 0
+        output_continuations = 0
+        continued_text_parts: list[str] = []
 
-        for iteration in range(1, self.max_iterations + 1):
+        iterations = (
+            count(1)
+            if self.max_iterations is None
+            else range(1, self.max_iterations + 1)
+        )
+        for iteration in iterations:
             text_parts: list[str] = []
             tool_calls: list[ToolCall] = []
             request_usage: TokenUsage | None = None
@@ -208,6 +221,48 @@ class Conversation:
                     else:
                         yield event
             except Exception as error:
+                partial_text = ''.join(text_parts)
+                if (
+                    isinstance(error, ModelOutputTruncatedError)
+                    and not error.tool_names
+                    and not tool_calls
+                    and partial_text.strip()
+                ):
+                    if (
+                        output_continuations
+                        < self.max_output_continuations
+                        and request_usage is not None
+                    ):
+                        output_continuations += 1
+                        completed_usage = add_token_usage(
+                            completed_usage,
+                            request_usage,
+                        )
+                        continued_text_parts.append(partial_text)
+                        request_messages.extend(
+                            [
+                                {
+                                    'role': 'assistant',
+                                    'content': partial_text,
+                                },
+                                build_output_continuation_feedback(
+                                    attempt=output_continuations,
+                                    maximum=self.max_output_continuations,
+                                ),
+                            ]
+                        )
+                        yield ModelCallFailed(
+                            iteration=iteration,
+                            reason=error.reason,
+                            retryable=True,
+                        )
+                        continue
+                    yield ModelCallFailed(
+                        iteration=iteration,
+                        reason=error.reason,
+                        retryable=False,
+                    )
+                    raise
                 if (
                     isinstance(error, ModelCallError)
                     and error.reason == 'context_overflow'
@@ -269,6 +324,9 @@ class Conversation:
             yield ModelCallCompleted(iteration=iteration)
 
             text = ''.join(text_parts).strip()
+            complete_text = ''.join(
+                [*continued_text_parts, text]
+            ).strip()
             if not text and not tool_calls:
                 raise ModelResponseError(
                     'Model response did not contain any text or tool calls.'
@@ -318,7 +376,7 @@ class Conversation:
                         self.context.capture_explicit_memory(prompt)
                         yield TurnCompleted(
                             result=TurnResult(
-                                text=text,
+                                text=complete_text,
                                 usage=completed_usage,
                                 tool_calls=tuple(all_tool_calls),
                                 status='blocked',
@@ -334,7 +392,7 @@ class Conversation:
                 self.context.capture_explicit_memory(prompt)
                 yield TurnCompleted(
                     result=TurnResult(
-                        text=text,
+                        text=complete_text,
                         usage=completed_usage,
                         tool_calls=tuple(all_tool_calls),
                         changed_paths=(
@@ -385,9 +443,11 @@ class Conversation:
                         )
             request_messages.append(build_tool_result_message(tool_results))
 
-        raise AgentLoopLimitError(
-            f'Agent Loop exceeded {self.max_iterations} model calls.'
-        )
+        if self.max_iterations is not None:
+            raise AgentLoopLimitError(
+                f'Agent Loop exceeded {self.max_iterations} model calls.'
+            )
+        raise AssertionError('Unlimited Agent Loop stopped unexpectedly.')
 
     async def compact(self) -> CompactionReport:
         '''Manually summarize committed history for the /compact command.'''
@@ -536,6 +596,25 @@ def build_completion_feedback(reasons: tuple[str, ...]) -> dict[str, Any]:
             f'{details}\n'
             'Continue using the available tools, then provide a new final '
             'answer after every condition is satisfied.'
+        ),
+    }
+
+
+def build_output_continuation_feedback(
+    *,
+    attempt: int,
+    maximum: int,
+) -> dict[str, str]:
+    '''Ask the model to continue preserved text without repeating it.'''
+    return {
+        'role': 'user',
+        'content': (
+            'The previous response reached the output token limit. The text '
+            'already generated has been preserved. Continue directly from '
+            'where it stopped without repeating earlier content, and finish '
+            'concisely. If work remains, use the available tools instead of '
+            'printing large code blocks. '
+            f'Continuation attempt {attempt} of {maximum}.'
         ),
     }
 

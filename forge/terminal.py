@@ -338,10 +338,18 @@ class StreamingResponseView:
 
     def complete(self, result: TurnResult) -> None:
         '''Finalize the view with validated text and exact final usage.'''
+        visible_text = ''.join(
+            block.text
+            for block in self.timeline
+            if isinstance(block, _TextTimelineBlock)
+        ).strip()
         final_text_is_present = (
-            bool(self.timeline)
-            and isinstance(self.timeline[-1], _TextTimelineBlock)
-            and self.timeline[-1].text.strip() == result.text
+            visible_text == result.text
+            or (
+                bool(self.timeline)
+                and isinstance(self.timeline[-1], _TextTimelineBlock)
+                and self.timeline[-1].text.strip() == result.text
+            )
         )
         if result.text and not final_text_is_present:
             self.timeline.append(_TextTimelineBlock(text=result.text))

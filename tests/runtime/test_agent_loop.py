@@ -390,6 +390,12 @@ def test_agent_loop_stops_at_model_call_limit(tmp_path: Path) -> None:
     assert len(client.calls) == 2
 
 
+def test_agent_loop_has_no_model_call_limit_by_default() -> None:
+    conversation = Conversation(client=FakeModelClient())
+
+    assert conversation.max_iterations is None
+
+
 def test_invalid_tool_json_is_retried_without_executing_partial_calls(
     tmp_path: Path,
 ) -> None:
@@ -446,6 +452,69 @@ def test_max_tokens_truncation_retries_with_small_patch_feedback() -> None:
     assert 'reached the max_tokens limit' in feedback
     assert 'apply_patch with at most 4000 characters' in feedback
     assert 'Modify only one function or one file section' in feedback
+
+
+def test_plain_text_truncation_preserves_and_continues_response() -> None:
+    client = FakeModelClient(
+        [
+            ModelUsageUpdate(usage=TokenUsage(10, 0)),
+            ModelTextDelta(text='First half, '),
+            ModelUsageUpdate(usage=TokenUsage(10, 8192)),
+            ModelOutputTruncatedError(),
+        ],
+        streamed_response(
+            'second half.',
+            input_tokens=15,
+            output_tokens=3,
+        ),
+    )
+    conversation = Conversation(client=client)
+
+    events = collect_turn(conversation, 'Explain the result')
+
+    result = events[-1].result
+    assert result.text == 'First half, second half.'
+    assert result.usage == TokenUsage(25, 8195)
+    continuation_messages = client.calls[1]['messages'][-2:]
+    assert continuation_messages[0] == {
+        'role': 'assistant',
+        'content': 'First half, ',
+    }
+    assert 'already generated has been preserved' in (
+        continuation_messages[1]['content']
+    )
+    assert 'without repeating earlier content' in (
+        continuation_messages[1]['content']
+    )
+    assert 'Continuation attempt 1 of 2' in (
+        continuation_messages[1]['content']
+    )
+    assert conversation.messages[-1] == {
+        'role': 'assistant',
+        'content': 'second half.',
+    }
+
+
+def test_plain_text_continuation_stops_after_configured_limit() -> None:
+    truncated = [
+        ModelUsageUpdate(usage=TokenUsage(10, 0)),
+        ModelTextDelta(text='partial'),
+        ModelUsageUpdate(usage=TokenUsage(10, 8192)),
+        ModelOutputTruncatedError(),
+    ]
+    client = FakeModelClient(truncated, truncated)
+    conversation = Conversation(
+        client=client,
+        max_output_continuations=1,
+    )
+
+    with pytest.raises(
+        ModelOutputTruncatedError,
+        match='max_tokens limit',
+    ):
+        collect_turn(conversation, 'Explain at length')
+
+    assert len(client.calls) == 2
 
 
 def test_protocol_recovery_stops_after_configured_limit() -> None:

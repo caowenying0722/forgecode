@@ -223,6 +223,34 @@ def test_terminal_places_tool_group_between_model_text_blocks() -> None:
     assert rendered.index('read_file') < rendered.index('grep')
 
 
+def test_terminal_does_not_repeat_continued_text_around_tools() -> None:
+    terminal, output = terminal_with_output()
+    usage = TokenUsage(input_tokens=40, output_tokens=8)
+    tool_call = ToolCall(
+        index=0,
+        id='toolu_read',
+        name='read_file',
+        arguments={'path': 'README.md'},
+    )
+
+    with terminal.stream_response() as response:
+        response.append_text('First half, ')
+        response.start_tool(tool_call)
+        response.complete_tool(tool_call, ToolResult.ok('Read file.'))
+        response.append_text('second half.')
+        response.complete(
+            TurnResult(
+                text='First half, second half.',
+                usage=usage,
+                tool_calls=(tool_call,),
+            )
+        )
+
+    rendered = output.getvalue()
+    assert rendered.count('First half') == 1
+    assert rendered.count('second half.') == 1
+
+
 def test_terminal_renders_live_usage_state() -> None:
     terminal, output = terminal_with_output()
 
