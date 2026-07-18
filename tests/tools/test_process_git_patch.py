@@ -9,6 +9,8 @@ from forge.tools.base import ToolResult
 from forge.tools.git import GitDiffTool, GitStatusTool
 from forge.tools.patch import ApplyPatchTool
 from forge.tools.shell import RunCommandTool
+from forge.tools.verify import VerifyTool
+from forge.runtime.workspace import WorkspaceTracker
 
 
 def run(coroutine: object) -> ToolResult:
@@ -76,6 +78,37 @@ def test_run_command_returns_nonzero_exit_as_structured_error(
     assert result.error is not None
     assert result.error.code == 'command_failed'
     assert result.metadata['exit_code'] == 7
+
+
+def test_verify_returns_revision_bound_evidence(tmp_path: Path) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    asyncio.run(tracker.begin_turn())
+    script = 'print(' + repr('verified') + ')'
+    command = subprocess.list2cmdline([sys.executable, '-c', script])
+
+    result = run(VerifyTool(tmp_path, tracker).run({'command': command}))
+
+    assert result.success is True
+    assert result.metadata['verification'] is True
+    assert result.metadata['workspace_revision'] == 0
+    assert result.metadata['exit_code'] == 0
+    assert 'verified' in result.content
+
+
+def test_verify_failure_is_structured(tmp_path: Path) -> None:
+    tracker = WorkspaceTracker(tmp_path)
+    asyncio.run(tracker.begin_turn())
+    command = subprocess.list2cmdline(
+        [sys.executable, '-c', 'raise SystemExit(3)']
+    )
+
+    result = run(VerifyTool(tmp_path, tracker).run({'command': command}))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'verification_failed'
+    assert result.metadata['exit_code'] == 3
 
 
 def test_git_status_and_diff_return_real_working_tree_state(

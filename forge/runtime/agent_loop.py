@@ -11,7 +11,9 @@ from forge.runtime.model_client import (
     ModelCallError,
     ModelClient,
 )
+from forge.runtime.completion import CompletionGate, TaskPolicy
 from forge.runtime.state import (
+    CompletionBlocked,
     ConversationEvent,
     ModelCallCompleted,
     ModelCallFailed,
@@ -25,7 +27,11 @@ from forge.runtime.state import (
     TurnCompleted,
     TurnResult,
     ToolCall,
+    VerificationCompleted,
+    VerificationEvidence,
+    WorkspaceChanged,
 )
+from forge.runtime.workspace import WorkspaceTracker
 from forge.tools.base import ToolRegistry, ToolResult
 
 
@@ -57,11 +63,15 @@ class Conversation:
         tools: list[dict[str, Any]] | None = None,
         registry: ToolRegistry | None = None,
         max_iterations: int = 100,
+        task_policy: TaskPolicy | None = None,
+        max_completion_blocks: int = 3,
     ) -> None:
         if tools is not None and registry is not None:
             raise ValueError('Pass tools or registry, not both.')
         if max_iterations < 1:
             raise ValueError('max_iterations must be positive')
+        if max_completion_blocks < 1:
+            raise ValueError('max_completion_blocks must be positive')
         self.client = (
             client if client is not None else AnthropicModelClient.from_config()
         )
@@ -74,6 +84,18 @@ class Conversation:
         self.registry = registry
         self.tools = registry.definitions if registry is not None else tools
         self.max_iterations = max_iterations
+        tracker = (
+            getattr(registry, 'workspace_tracker', None)
+            if registry is not None
+            else None
+        )
+        self.workspace_tracker: WorkspaceTracker | None = tracker
+        self.completion_gate = (
+            CompletionGate(tracker.root, task_policy)
+            if tracker is not None
+            else None
+        )
+        self.max_completion_blocks = max_completion_blocks
 
     async def stream(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         '''Run model-tool cycles until the model returns a final text answer.'''
@@ -84,6 +106,11 @@ class Conversation:
         request_messages = [*self.messages, user_message]
         completed_usage = TokenUsage(input_tokens=0, output_tokens=0)
         all_tool_calls: list[ToolCall] = []
+        latest_verification: VerificationEvidence | None = None
+        mutation_attempted = False
+        completion_blocks = 0
+        if self.workspace_tracker is not None:
+            await self.workspace_tracker.begin_turn()
 
         for iteration in range(1, self.max_iterations + 1):
             text_parts: list[str] = []
@@ -150,12 +177,59 @@ class Conversation:
             )
 
             if not tool_calls:
+                if (
+                    self.workspace_tracker is not None
+                    and self.completion_gate is not None
+                ):
+                    change = await self.workspace_tracker.refresh()
+                    if change is not None:
+                        yield WorkspaceChanged(
+                            revision=change.revision,
+                            paths=change.paths,
+                        )
+                    decision = await self.completion_gate.evaluate(
+                        self.workspace_tracker,
+                        latest_verification,
+                        mutation_attempted=mutation_attempted,
+                    )
+                    if not decision.allowed:
+                        completion_blocks += 1
+                        yield CompletionBlocked(
+                            attempt=completion_blocks,
+                            reasons=decision.reasons,
+                        )
+                        if completion_blocks < self.max_completion_blocks:
+                            request_messages.append(
+                                build_completion_feedback(decision.reasons)
+                            )
+                            continue
+                        self.messages = request_messages
+                        yield TurnCompleted(
+                            result=TurnResult(
+                                text=text,
+                                usage=completed_usage,
+                                tool_calls=tuple(all_tool_calls),
+                                status='blocked',
+                                changed_paths=(
+                                    self.workspace_tracker.changed_paths
+                                ),
+                                verification=latest_verification,
+                                completion_reasons=decision.reasons,
+                            )
+                        )
+                        return
                 self.messages = request_messages
                 yield TurnCompleted(
                     result=TurnResult(
                         text=text,
                         usage=completed_usage,
                         tool_calls=tuple(all_tool_calls),
+                        changed_paths=(
+                            self.workspace_tracker.changed_paths
+                            if self.workspace_tracker is not None
+                            else ()
+                        ),
+                        verification=latest_verification,
                     )
                 )
                 return
@@ -168,6 +242,8 @@ class Conversation:
             all_tool_calls.extend(tool_calls)
             tool_results: list[tuple[ToolCall, ToolResult]] = []
             for tool_call in tool_calls:
+                if tool_call.name == 'apply_patch':
+                    mutation_attempted = True
                 yield ToolExecutionStarted(tool_call=tool_call)
                 result = await self.registry.execute(
                     tool_call.name,
@@ -178,6 +254,19 @@ class Conversation:
                     tool_call=tool_call,
                     result=result,
                 )
+                if self.workspace_tracker is not None:
+                    change = await self.workspace_tracker.refresh()
+                    if change is not None:
+                        yield WorkspaceChanged(
+                            revision=change.revision,
+                            paths=change.paths,
+                        )
+                if tool_call.name == 'verify':
+                    latest_verification = verification_from_result(result)
+                    if latest_verification is not None:
+                        yield VerificationCompleted(
+                            evidence=latest_verification
+                        )
             request_messages.append(build_tool_result_message(tool_results))
 
         raise AgentLoopLimitError(
@@ -245,6 +334,40 @@ def serialize_tool_result(result: ToolResult) -> str:
         ensure_ascii=False,
         default=str,
     )
+
+
+def verification_from_result(
+    result: ToolResult,
+) -> VerificationEvidence | None:
+    '''Build stable evidence from one verify ToolResult metadata payload.'''
+    metadata = result.metadata
+    if metadata.get('verification') is not True:
+        return None
+    try:
+        return VerificationEvidence(
+            command=str(metadata['command']),
+            cwd=str(metadata['cwd']),
+            exit_code=int(metadata['exit_code']),
+            duration_seconds=float(metadata['duration_seconds']),
+            timed_out=bool(metadata['timed_out']),
+            workspace_revision=int(metadata['workspace_revision']),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def build_completion_feedback(reasons: tuple[str, ...]) -> dict[str, Any]:
+    '''Tell the model exactly why its final answer was not accepted.'''
+    details = '\n'.join(f'- {reason}' for reason in reasons)
+    return {
+        'role': 'user',
+        'content': (
+            'ForgeCode completion check rejected the previous final answer.\n'
+            f'{details}\n'
+            'Continue using the available tools, then provide a new final '
+            'answer after every condition is satisfied.'
+        ),
+    }
 
 
 def add_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:

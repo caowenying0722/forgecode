@@ -4,7 +4,12 @@ from io import StringIO
 
 from rich.console import Console
 
-from forge.runtime.state import TokenUsage, ToolCall, TurnResult
+from forge.runtime.state import (
+    TokenUsage,
+    ToolCall,
+    TurnResult,
+    VerificationEvidence,
+)
 from forge.terminal import (
     TerminalUI,
     streaming_preview,
@@ -228,3 +233,32 @@ def test_terminal_renders_error_text_literally() -> None:
     terminal.show_error(RuntimeError('[provider] unavailable'))
 
     assert 'Model request failed: [provider] unavailable' in output.getvalue()
+
+
+def test_terminal_renders_final_change_and_verification_evidence() -> None:
+    terminal, output = terminal_with_output()
+    usage = TokenUsage(input_tokens=20, output_tokens=4)
+    evidence = VerificationEvidence(
+        command='pytest -q',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=1.25,
+        timed_out=False,
+        workspace_revision=1,
+    )
+
+    with terminal.stream_response() as response:
+        response.complete(
+            TurnResult(
+                text='Done.',
+                usage=usage,
+                changed_paths=('forge/app.py',),
+                verification=evidence,
+            )
+        )
+
+    rendered = output.getvalue()
+    assert 'task completed' in rendered
+    assert 'forge/app.py' in rendered
+    assert 'pytest -q' in rendered
+    assert 'exit 0' in rendered

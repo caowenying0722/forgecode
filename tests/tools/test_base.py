@@ -21,6 +21,7 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'grep',
         'apply_patch',
         'run_command',
+        'verify',
         'git_status',
         'git_diff',
     )

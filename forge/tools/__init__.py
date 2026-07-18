@@ -8,10 +8,13 @@ from forge.tools.git import GitDiffTool, GitStatusTool
 from forge.tools.patch import ApplyPatchTool
 from forge.tools.search import FindFilesTool, GrepTool
 from forge.tools.shell import RunCommandTool
+from forge.tools.verify import VerifyTool
+from forge.runtime.workspace import WorkspaceTracker
 
 
 def create_default_registry(root: Path) -> ToolRegistry:
-    '''Create the deterministic M1.3 built-in tool set.'''
+    '''Create built-in tools sharing one task-local workspace tracker.'''
+    tracker = WorkspaceTracker(root)
     return ToolRegistry(
         [
             ListDirectoryTool(root),
@@ -20,9 +23,11 @@ def create_default_registry(root: Path) -> ToolRegistry:
             GrepTool(root),
             ApplyPatchTool(root),
             RunCommandTool(root),
+            VerifyTool(root, tracker),
             GitStatusTool(root),
             GitDiffTool(root),
-        ]
+        ],
+        workspace_tracker=tracker,
     )
 
 
@@ -35,6 +40,7 @@ __all__ = [
     'ListDirectoryTool',
     'ReadFileTool',
     'RunCommandTool',
+    'VerifyTool',
     'ToolRegistry',
     'create_default_registry',
 ]

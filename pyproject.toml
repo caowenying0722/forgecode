@@ -21,7 +21,7 @@ dependencies = [
 forge = 'forge.cli:app'
 
 [tool.setuptools.packages.find]
-include = ['forge*']
+include = ['forge*', 'evals*']
 
 [tool.setuptools.package-data]
 forge = ['prompts/*.md']
@@ -31,5 +31,6 @@ testpaths = ['tests']
 
 [dependency-groups]
 dev = [
+    'pyyaml>=6,<7',
     "pytest>=9.1.1",
 ]

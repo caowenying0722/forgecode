@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from forge.tools.base import ToolResult
 
@@ -43,12 +43,35 @@ class TokenUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class VerificationEvidence:
+    '''One verify result tied to an exact workspace revision.'''
+
+    command: str
+    cwd: str
+    exit_code: int
+    duration_seconds: float
+    timed_out: bool
+    workspace_revision: int
+
+    @property
+    def success(self) -> bool:
+        return not self.timed_out and self.exit_code == 0
+
+
+TaskStatus = Literal['completed', 'blocked', 'failed']
+
+
+@dataclass(frozen=True, slots=True)
 class TurnResult:
-    '''Displayable response and usage for one conversation turn.'''
+    '''Displayable response, evidence, and usage for one conversation turn.'''
 
     text: str
     usage: TokenUsage
     tool_calls: tuple[ToolCall, ...] = ()
+    status: TaskStatus = 'completed'
+    changed_paths: tuple[str, ...] = ()
+    verification: VerificationEvidence | None = None
+    completion_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +179,29 @@ class ToolExecutionCompleted:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceChanged:
+    '''A tool changed repository content during the current turn.'''
+
+    revision: int
+    paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationCompleted:
+    '''A verify tool produced evidence for one workspace revision.'''
+
+    evidence: VerificationEvidence
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionBlocked:
+    '''The runtime rejected a premature model completion.'''
+
+    attempt: int
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class TurnCompleted:
     '''Final validated result for one streamed conversation turn.'''
 
@@ -177,5 +223,8 @@ type ConversationEvent = (
     | ModelCallFailed
     | ToolExecutionStarted
     | ToolExecutionCompleted
+    | WorkspaceChanged
+    | VerificationCompleted
+    | CompletionBlocked
     | TurnCompleted
 )

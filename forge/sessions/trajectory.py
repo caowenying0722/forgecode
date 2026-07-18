@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from forge.runtime.state import (
+    CompletionBlocked,
     ConversationEvent,
     ModelCallCompleted,
     ModelCallFailed,
@@ -24,6 +25,8 @@ from forge.runtime.state import (
     ToolExecutionCompleted,
     ToolExecutionStarted,
     TurnCompleted,
+    VerificationCompleted,
+    WorkspaceChanged,
 )
 
 
@@ -147,6 +150,15 @@ class TrajectoryRecorder:
                 },
             )
             return
+        if isinstance(event, WorkspaceChanged):
+            self._write('workspace_changed', asdict(event))
+            return
+        if isinstance(event, VerificationCompleted):
+            self._write('verification_completed', asdict(event.evidence))
+            return
+        if isinstance(event, CompletionBlocked):
+            self._write('completion_blocked', asdict(event))
+            return
         if isinstance(event, TurnCompleted):
             result = event.result
             self._write(
@@ -155,6 +167,14 @@ class TrajectoryRecorder:
                     'text': redact_text(result.text),
                     'usage': asdict(result.usage),
                     'tool_calls': len(result.tool_calls),
+                    'status': result.status,
+                    'changed_paths': result.changed_paths,
+                    'verification': (
+                        asdict(result.verification)
+                        if result.verification is not None
+                        else None
+                    ),
+                    'completion_reasons': result.completion_reasons,
                 },
             )
 

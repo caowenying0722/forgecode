@@ -10,6 +10,7 @@ from forge import __version__
 from forge.config import ConfigurationError, ForgeConfig
 from forge.runtime.agent_loop import Conversation
 from forge.runtime.state import (
+    CompletionBlocked,
     ModelTextDelta,
     ModelUsageUpdate,
     ToolExecutionCompleted,
@@ -144,6 +145,8 @@ async def render_streamed_turn(
                 response_view.start_tool(event.tool_call)
             elif isinstance(event, ToolExecutionCompleted):
                 response_view.complete_tool(event.tool_call, event.result)
+            elif isinstance(event, CompletionBlocked):
+                response_view.block_completion(event.reasons)
             elif isinstance(event, TurnCompleted):
                 response_view.complete(event.result)
     except Exception as error:

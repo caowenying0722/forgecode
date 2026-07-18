@@ -119,6 +119,7 @@ class StreamingResponseView:
         self.timeline: list[_TimelineBlock] = []
         self.usage: TokenUsage | None = None
         self.completed = False
+        self.result: TurnResult | None = None
         self.live = Live(
             self._render(),
             console=console,
@@ -199,18 +200,33 @@ class StreamingResponseView:
         if result.text and not final_text_is_present:
             self.timeline.append(_TextTimelineBlock(text=result.text))
         self.usage = result.usage
+        self.result = result
         self.completed = True
+        self.live.update(self._render(), refresh=True)
+
+    def block_completion(self, reasons: tuple[str, ...]) -> None:
+        '''Show why a tentative final answer was rejected by the runtime.'''
+        details = '\n'.join(f'- {reason}' for reason in reasons)
+        self.timeline.append(
+            _TextTimelineBlock(
+                text=f'Completion check: continuing work.\n\n{details}'
+            )
+        )
         self.live.update(self._render(), refresh=True)
 
     def _render(self) -> Group:
         content = self._render_timeline()
-        return Group(
-            content,
-            token_usage_summary(
-                self.usage,
-                streaming=not self.completed,
-            ),
+        renderables: list[object] = [content]
+        if self.result is not None and (
+            self.result.changed_paths
+            or self.result.verification is not None
+            or self.result.status != 'completed'
+        ):
+            renderables.append(completion_evidence_summary(self.result))
+        renderables.append(
+            token_usage_summary(self.usage, streaming=not self.completed)
         )
+        return Group(*renderables)
 
     def _render_timeline(self) -> Group | Spinner:
         if not self.timeline:
@@ -408,3 +424,25 @@ def token_usage_summary(
             style='bright_cyan',
         )
     return summary
+
+
+def completion_evidence_summary(result: TurnResult) -> Text:
+    '''Render the objective completion state below the final answer.'''
+    rendered = Text()
+    status_style = 'green' if result.status == 'completed' else 'red'
+    rendered.append('↳ task ', style='dim')
+    rendered.append(result.status, style=f'bold {status_style}')
+    if result.changed_paths:
+        rendered.append('  changed ', style='dim')
+        rendered.append(', '.join(result.changed_paths), style='bright_white')
+    if result.verification is not None:
+        evidence = result.verification
+        rendered.append('\n  verify ', style='dim')
+        rendered.append(evidence.command, style='bright_white')
+        rendered.append(
+            f'  exit {evidence.exit_code}  {evidence.duration_seconds:.3f}s',
+            style='dim',
+        )
+    for reason in result.completion_reasons:
+        rendered.append(f'\n  × {reason}', style='red')
+    return rendered

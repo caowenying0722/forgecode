@@ -10,3 +10,4 @@ node_modules/
 dist/
 target/
 **/.forge/trajectories/
+**/.forge/evals/

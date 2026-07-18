@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from forge.runtime.state import (
+    CompletionBlocked,
     ModelCallCompleted,
     ModelCallStarted,
     ModelRetryScheduled,
@@ -15,6 +16,9 @@ from forge.runtime.state import (
     ToolExecutionStarted,
     TurnCompleted,
     TurnResult,
+    VerificationCompleted,
+    VerificationEvidence,
+    WorkspaceChanged,
 )
 from forge.sessions.trajectory import TrajectoryRecorder
 from forge.tools.base import ToolResult
@@ -56,12 +60,27 @@ def test_trajectory_records_lifecycle_without_large_tool_content(
         )
     )
     recorder.record_event(ModelCallCompleted(iteration=1))
+    evidence = VerificationEvidence(
+        command='pytest',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.25,
+        timed_out=False,
+        workspace_revision=1,
+    )
+    recorder.record_event(WorkspaceChanged(revision=1, paths=('a.py',)))
+    recorder.record_event(VerificationCompleted(evidence=evidence))
+    recorder.record_event(
+        CompletionBlocked(attempt=1, reasons=('verification missing',))
+    )
     recorder.record_event(
         TurnCompleted(
             result=TurnResult(
                 text='Finished',
                 usage=TokenUsage(input_tokens=10, output_tokens=2),
                 tool_calls=(call,),
+                changed_paths=('a.py',),
+                verification=evidence,
             )
         )
     )
@@ -80,6 +99,9 @@ def test_trajectory_records_lifecycle_without_large_tool_content(
         'tool_execution_started',
         'tool_execution_completed',
         'model_call_completed',
+        'workspace_changed',
+        'verification_completed',
+        'completion_blocked',
         'turn_completed',
     ]
     serialized = json.dumps(records, ensure_ascii=False)
@@ -94,3 +116,7 @@ def test_trajectory_records_lifecycle_without_large_tool_content(
     assert completed['turn_usage']['input_tokens'] == 10
     assert completed['turn_usage']['output_tokens'] == 2
     assert completed['duration_seconds'] is not None
+    turn = records[-1]
+    assert turn['status'] == 'completed'
+    assert turn['changed_paths'] == ['a.py']
+    assert turn['verification']['workspace_revision'] == 1

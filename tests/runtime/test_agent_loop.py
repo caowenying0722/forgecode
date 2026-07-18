@@ -187,10 +187,11 @@ def test_system_prompt_defines_forgecode_identity() -> None:
 
     assert 'Your product identity is ForgeCode.' in prompt
     assert 'Do not claim to be Anthropic' in prompt
-    assert 'The M1.4 runtime can use built-in file' in prompt
+    assert 'The M2 runtime can use built-in file' in prompt
     assert 'only when its schema is included' in prompt
     assert 'call another tool instead of giving a premature' in prompt
     assert 'Do not run destructive commands' in prompt
+    assert 'use the `verify` tool' in prompt
 
 
 def test_conversation_accepts_an_explicit_system_prompt() -> None:

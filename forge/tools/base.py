@@ -160,8 +160,14 @@ class Tool(ABC, Generic[InputT]):
 class ToolRegistry:
     '''Resolve tool names and expose schemas in deterministic order.'''
 
-    def __init__(self, tools: Iterable[Tool[Any]] = ()) -> None:
+    def __init__(
+        self,
+        tools: Iterable[Tool[Any]] = (),
+        *,
+        workspace_tracker: Any | None = None,
+    ) -> None:
         self._tools: dict[str, Tool[Any]] = {}
+        self.workspace_tracker = workspace_tracker
         for tool in tools:
             self.register(tool)
 
