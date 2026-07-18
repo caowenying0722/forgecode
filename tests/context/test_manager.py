@@ -1,5 +1,6 @@
 '''Tests for provider-neutral context accounting.'''
 
+from forge.context.compactor import CompactionConfig
 from forge.context.manager import ContextManager, ContextStats, context_stats
 
 
@@ -52,8 +53,9 @@ def test_context_stats_calculate_categories_and_remaining_window() -> None:
     assert stats.repository_tokens == 50
     assert stats.tool_schema_tokens == 25
     assert stats.estimated_tokens == 275
+    assert stats.projected_tokens == 375
     assert stats.remaining_tokens == 625
-    assert stats.utilization == 0.275
+    assert stats.utilization == 0.375
 
 
 def test_remaining_window_is_unavailable_without_configuration() -> None:
@@ -61,3 +63,33 @@ def test_remaining_window_is_unavailable_without_configuration() -> None:
 
     assert stats.remaining_tokens is None
     assert stats.utilization is None
+
+
+def test_request_stats_use_cheap_compaction_and_keep_stored_totals() -> None:
+    messages = [
+        {'role': 'user', 'content': f'message {index} ' + 'x' * 100}
+        for index in range(10)
+    ]
+    manager = ContextManager(
+        messages,
+        config=CompactionConfig(
+            message_limit=4,
+            keep_first_messages=1,
+            keep_recent_messages=2,
+        ),
+    )
+
+    stats = manager.stats_for_request(
+        system_prompt='system',
+        repository_context='',
+        tools=None,
+        context_window_tokens=1_000,
+        reserved_output_tokens=100,
+    )
+
+    assert stats.stored_messages == 10
+    assert stats.message_count == 4
+    assert stats.stored_characters > stats.estimated_characters
+    assert stats.projected_tokens == (
+        stats.estimated_tokens + stats.reserved_output_tokens
+    )

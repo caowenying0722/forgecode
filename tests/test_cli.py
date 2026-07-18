@@ -71,6 +71,9 @@ class FakeConversation:
             tool_schema_characters=20,
             context_window_tokens=1_000,
             reserved_output_tokens=100,
+            stored_message_count=284,
+            stored_estimated_characters=537_342,
+            stored_tool_result_characters=457_675,
         )
 
     async def stream(
@@ -249,16 +252,20 @@ def test_context_command_does_not_call_model(
     result = runner.invoke(app, input='/context\n')
 
     assert result.exit_code == 0
-    assert 'messages' in result.output
+    assert 'stored messages' in result.output
+    assert '284' in result.output
+    assert 'request messages' in result.output
     assert '2' in result.output
     assert 'estimated input' in result.output
     assert '~50 tokens' in result.output
-    assert 'tool results' in result.output
+    assert 'request tool results' in result.output
     assert '40 chars' in result.output
+    assert 'projected total' in result.output
+    assert '~150 tokens' in result.output
     assert 'remaining' in result.output
     assert '~850 tokens' in result.output
-    assert 'input utilization' in result.output
-    assert '5.0%' in result.output
+    assert 'projected utilization' in result.output
+    assert '15.0%' in result.output
     assert conversation.prompts == []
 
 

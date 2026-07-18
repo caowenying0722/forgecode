@@ -30,6 +30,9 @@ class ContextStats:
     tool_schema_characters: int = 0
     context_window_tokens: int | None = None
     reserved_output_tokens: int = 0
+    stored_message_count: int | None = None
+    stored_estimated_characters: int | None = None
+    stored_tool_result_characters: int | None = None
 
     @property
     def estimated_tokens(self) -> int:
@@ -64,20 +67,52 @@ class ContextStats:
         return max(
             0,
             self.context_window_tokens
-            - self.estimated_tokens
-            - self.reserved_output_tokens,
+            - self.projected_tokens,
         )
+
+    @property
+    def projected_tokens(self) -> int:
+        return self.estimated_tokens + self.reserved_output_tokens
 
     @property
     def utilization(self) -> float | None:
         if not self.context_window_tokens:
             return None
-        return self.estimated_tokens / self.context_window_tokens
+        return self.projected_tokens / self.context_window_tokens
+
+    @property
+    def stored_messages(self) -> int:
+        return (
+            self.message_count
+            if self.stored_message_count is None
+            else self.stored_message_count
+        )
+
+    @property
+    def stored_characters(self) -> int:
+        return (
+            self.estimated_characters
+            if self.stored_estimated_characters is None
+            else self.stored_estimated_characters
+        )
+
+    @property
+    def stored_tool_characters(self) -> int:
+        return (
+            self.tool_result_characters
+            if self.stored_tool_result_characters is None
+            else self.stored_tool_result_characters
+        )
+
+    @property
+    def stored_tokens(self) -> int:
+        return estimate_tokens(self.stored_characters)
 
 
 def context_stats(
     messages: list[dict[str, Any]],
     *,
+    stored_messages: list[dict[str, Any]] | None = None,
     system_prompt: str = '',
     repository_context: str = '',
     tools: list[dict[str, Any]] | None = None,
@@ -85,19 +120,10 @@ def context_stats(
     reserved_output_tokens: int = 0,
 ) -> ContextStats:
     '''Measure serialized history and tool-result payloads deterministically.'''
-    total = 0
-    tool_results = 0
-    for message in messages:
-        total += len(json.dumps(message, ensure_ascii=False, default=str))
-        content = message.get('content')
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get('type') != 'tool_result':
-                continue
-            tool_results += len(str(block.get('content', '')))
+    total, tool_results = measure_messages(messages)
+    stored_total, stored_tool_results = measure_messages(
+        messages if stored_messages is None else stored_messages
+    )
     return ContextStats(
         message_count=len(messages),
         estimated_characters=total,
@@ -111,7 +137,32 @@ def context_stats(
         ),
         context_window_tokens=context_window_tokens,
         reserved_output_tokens=reserved_output_tokens,
+        stored_message_count=(
+            len(messages) if stored_messages is None else len(stored_messages)
+        ),
+        stored_estimated_characters=stored_total,
+        stored_tool_result_characters=stored_tool_results,
     )
+
+
+def measure_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[int, int]:
+    '''Return serialized characters and raw tool-result characters.'''
+    total = 0
+    tool_results = 0
+    for message in messages:
+        total += len(json.dumps(message, ensure_ascii=False, default=str))
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get('type') != 'tool_result':
+                continue
+            tool_results += len(str(block.get('content', '')))
+    return total, tool_results
 
 
 def estimate_tokens(characters: int) -> int:
@@ -150,8 +201,10 @@ class ContextManager:
         context_window_tokens: int | None,
         reserved_output_tokens: int,
     ) -> ContextStats:
+        prepared = self.prepare(self._messages)
         return context_stats(
-            self._messages,
+            prepared,
+            stored_messages=self._messages,
             system_prompt=system_prompt,
             repository_context=repository_context,
             tools=tools,

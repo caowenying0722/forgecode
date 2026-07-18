@@ -191,23 +191,37 @@ class TerminalUI:
         table = Table.grid(padding=(0, 2))
         table.add_column(style='dim', no_wrap=True)
         table.add_column(style='bright_white', justify='right')
-        table.add_row('messages', f'{stats.message_count:,}')
+        table.add_row('stored messages', f'{stats.stored_messages:,}')
+        table.add_row(
+            'stored history',
+            f'~{stats.stored_tokens:,} tokens '
+            f'({stats.stored_characters:,} characters)',
+        )
+        table.add_row(
+            'stored tool results',
+            f'{stats.stored_tool_characters:,} chars',
+        )
+        table.add_row('request messages', f'{stats.message_count:,}')
         table.add_row('system', f'~{stats.system_tokens:,} tokens')
         table.add_row('repository', f'~{stats.repository_tokens:,} tokens')
         table.add_row('tools', f'~{stats.tool_schema_tokens:,} tokens')
         table.add_row(
-            'history',
+            'request history',
             f'~{stats.history_tokens:,} tokens '
             f'({stats.estimated_characters:,} characters)',
         )
         table.add_row(
-            'tool results',
+            'request tool results',
             f'{stats.tool_result_characters:,} chars',
         )
         table.add_row('estimated input', f'~{stats.estimated_tokens:,} tokens')
         table.add_row(
             'reserved output',
             f'{stats.reserved_output_tokens:,} tokens',
+        )
+        table.add_row(
+            'projected total',
+            f'~{stats.projected_tokens:,} tokens',
         )
         if stats.context_window_tokens is None:
             table.add_row('context window', 'not configured')
@@ -222,14 +236,15 @@ class TerminalUI:
                 f'~{stats.remaining_tokens or 0:,} tokens',
             )
             table.add_row(
-                'input utilization',
+                'projected utilization',
                 f'{(stats.utilization or 0) * 100:.1f}%',
             )
         self.console.print('[bold bright_cyan]Context[/]')
         self.console.print(table)
         self.console.print(
-            '[dim]Estimated from the latest request snapshot; the next user '
-            'prompt is not included.[/]'
+            '[dim]Request values include cheap compaction and match the '
+            'automatic compaction threshold. Stored history remains available '
+            'locally. The next user prompt is not included.[/]'
         )
 
     def show_compaction(self, report: CompactionReport) -> None:
