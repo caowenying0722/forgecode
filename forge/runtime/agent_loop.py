@@ -16,6 +16,7 @@ from forge.runtime.model_client import (
     AnthropicModelClient,
     ModelCallError,
     ModelClient,
+    ModelProtocolError,
 )
 from forge.runtime.completion import CompletionGate, TaskPolicy
 from forge.runtime.state import (
@@ -73,6 +74,7 @@ class Conversation:
         max_completion_blocks: int = 3,
         context_config: CompactionConfig | None = None,
         context_root: Path | None = None,
+        max_protocol_recoveries: int = 2,
     ) -> None:
         if tools is not None and registry is not None:
             raise ValueError('Pass tools or registry, not both.')
@@ -80,6 +82,8 @@ class Conversation:
             raise ValueError('max_iterations must be positive')
         if max_completion_blocks < 1:
             raise ValueError('max_completion_blocks must be positive')
+        if max_protocol_recoveries < 0:
+            raise ValueError('max_protocol_recoveries must not be negative')
         self.client = (
             client if client is not None else AnthropicModelClient.from_config()
         )
@@ -116,6 +120,7 @@ class Conversation:
             else None
         )
         self.max_completion_blocks = max_completion_blocks
+        self.max_protocol_recoveries = max_protocol_recoveries
 
     @property
     def context_stats(self) -> ContextStats:
@@ -142,6 +147,7 @@ class Conversation:
             self.client,
         )
         reactive_compaction_attempted = False
+        protocol_recoveries = 0
 
         for iteration in range(1, self.max_iterations + 1):
             text_parts: list[str] = []
@@ -188,11 +194,37 @@ class Conversation:
                     )
                     if report is not None and report.success:
                         continue
+                if (
+                    isinstance(error, ModelProtocolError)
+                    and protocol_recoveries < self.max_protocol_recoveries
+                ):
+                    protocol_recoveries += 1
+                    if request_usage is not None:
+                        completed_usage = add_token_usage(
+                            completed_usage,
+                            request_usage,
+                        )
+                    yield ModelCallFailed(
+                        iteration=iteration,
+                        reason=error.reason,
+                        retryable=True,
+                    )
+                    request_messages.extend(
+                        build_protocol_recovery_feedback(
+                            error,
+                            attempt=protocol_recoveries,
+                            maximum=self.max_protocol_recoveries,
+                        )
+                    )
+                    continue
                 yield ModelCallFailed(
                     iteration=iteration,
                     reason=(
                         error.reason
-                        if isinstance(error, ModelCallError)
+                        if isinstance(
+                            error,
+                            (ModelCallError, ModelProtocolError),
+                        )
                         else type(error).__name__
                     ),
                     retryable=(
@@ -471,6 +503,39 @@ def build_completion_feedback(reasons: tuple[str, ...]) -> dict[str, Any]:
             'answer after every condition is satisfied.'
         ),
     }
+
+
+def build_protocol_recovery_feedback(
+    error: ModelProtocolError,
+    *,
+    attempt: int,
+    maximum: int,
+) -> list[dict[str, Any]]:
+    '''Represent a rejected response and request one smaller valid retry.'''
+    tool = f' for tool {error.tool_name!r}' if error.tool_name else ''
+    if error.reason == 'output_truncated':
+        problem = 'The previous response reached the max_tokens limit.'
+    else:
+        problem = f'The previous tool call{tool} had invalid arguments.'
+    return [
+        {
+            'role': 'assistant',
+            'content': '[ForgeCode rejected an invalid model response.]',
+        },
+        {
+            'role': 'user',
+            'content': (
+                f'{problem}\nError: {error}\n'
+                'No tool was executed and no file was changed by that '
+                'response. Retry with the available tools. For file creation '
+                'or editing, use apply_patch with one focused patch below '
+                '8000 characters, and split large HTML, CSS, or JavaScript '
+                'across multiple calls. Do not invent a write_file tool and '
+                'do not repeat the same invalid arguments.\n'
+                f'Recovery attempt {attempt} of {maximum}.'
+            ),
+        },
+    ]
 
 
 def add_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:

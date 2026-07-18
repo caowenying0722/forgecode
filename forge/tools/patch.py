@@ -19,8 +19,11 @@ class ApplyPatchInput(ToolInput):
 class ApplyPatchTool(Tool[ApplyPatchInput]):
     name = 'apply_patch'
     description = (
-        'Apply a unified diff to repository files after validating it with '
-        'git apply --check.'
+        'Create or modify repository text files with one focused unified diff '
+        'after validating it with git apply --check. Keep the patch below '
+        '8000 characters; split large HTML, CSS, JavaScript, or source files '
+        'across multiple calls and verify each step. This is the available '
+        'file-writing tool; do not invent or request a write_file tool.'
     )
     input_model = ApplyPatchInput
 

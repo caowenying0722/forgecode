@@ -583,20 +583,34 @@ Working Layer
 - [x] 无关记忆不会注入当前请求，敏感内容不会落盘；
 - [x] 全部功能使用 FakeModelClient 和临时仓库测试，不依赖真实 API。
 
-### 本地命令
+### Slash Command
 
-在交互终端输入 `/` 会显示命令、用法和说明；继续输入可以过滤候选，使用方向键选择并通过 Tab 或 Enter 补全。
+ForgeCode 在交互终端中提供 Slash Command，用于执行不需要交给模型处理的本地操作。
+
+输入 `/` 后，终端会显示可用命令、参数格式和中文说明。继续输入命令前缀可以过滤候选，例如输入 `/mem` 只显示 Memory 相关命令。使用上下方向键选择候选，通过 Tab 或 Enter 完成补全。普通自然语言输入不会触发命令菜单，也不会受到补全功能影响。
+
+| 命令 | 作用 | 是否调用模型 |
+| --- | --- | --- |
+| `/context` | 查看当前会话的消息数、字符数、工具结果大小和近似 Token | 否 |
+| `/compact` | 立即把当前会话压缩为结构化任务摘要 | 是 |
+| `/remember name \| content` | 将一条知识写入当前仓库的持久化记忆 | 否 |
+| `/memory list` | 列出当前仓库中的全部记忆 | 否 |
+| `/memory show name` | 查看指定记忆的描述和完整内容 | 否 |
+| `/memory forget name` | 删除指定记忆并更新索引 | 否 |
+| `/memory rebuild` | 根据记忆文件重新生成 `MEMORY.md` 索引 | 否 |
+| `/memory consolidate` | 删除内容完全相同的重复记忆并重建索引 | 否 |
+
+使用示例：
 
 ```text
 /context
 /compact
 /remember testing | 项目测试命令是 uv run pytest
-/memory list
 /memory show testing
 /memory forget testing
-/memory rebuild
-/memory consolidate
 ```
+
+`/remember` 使用竖线分隔记忆名称和内容。记忆保存在当前仓库的 `.forge/memory/` 下，可以直接通过 Markdown 文件检查和编辑。疑似包含 API Key、Token、密码或私钥的内容会被拒绝写入。
 
 ## M6：Hooks、MCP 与子 Agent 扩展
 

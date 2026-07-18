@@ -13,6 +13,7 @@ import forge.runtime.model_client as model_client_module
 from forge.runtime.model_client import (
     AnthropicModelClient,
     ModelClient,
+    ModelOutputTruncatedError,
     ModelProtocolError,
 )
 from forge.runtime.state import (
@@ -417,6 +418,79 @@ def test_stream_rejects_invalid_tool_argument_json() -> None:
             client,
             messages=[{'role': 'user', 'content': 'Read a file.'}],
         )
+
+
+def test_stream_reports_unterminated_tool_json_with_tool_details() -> None:
+    sdk = FakeAnthropic()
+    sdk.messages.events = [
+        SimpleNamespace(
+            type='content_block_start',
+            index=2,
+            content_block=SimpleNamespace(
+                type='tool_use',
+                id='toolu_bad',
+                name='write_file',
+                input={},
+            ),
+        ),
+        SimpleNamespace(
+            type='content_block_delta',
+            index=2,
+            delta=SimpleNamespace(
+                type='input_json_delta',
+                partial_json='{"path":"index.html","content":"<html>',
+            ),
+        ),
+        SimpleNamespace(type='content_block_stop', index=2),
+    ]
+    sdk.messages.final_message = SimpleNamespace(
+        usage=usage(input_tokens=20, output_tokens=10),
+        stop_reason='end_turn',
+    )
+    client = AnthropicModelClient(model='test', client=sdk)
+
+    with pytest.raises(ModelProtocolError) as captured:
+        collect_stream(client, messages=[{'role': 'user', 'content': 'build'}])
+
+    assert captured.value.reason == 'invalid_tool_arguments'
+    assert captured.value.tool_name == 'write_file'
+    assert 'Unterminated string' in str(captured.value)
+
+
+def test_stream_classifies_pending_tool_call_at_max_tokens() -> None:
+    sdk = FakeAnthropic()
+    sdk.messages.events = [
+        SimpleNamespace(
+            type='content_block_start',
+            index=0,
+            content_block=SimpleNamespace(
+                type='tool_use',
+                id='toolu_patch',
+                name='apply_patch',
+                input={},
+            ),
+        ),
+        SimpleNamespace(
+            type='content_block_delta',
+            index=0,
+            delta=SimpleNamespace(
+                type='input_json_delta',
+                partial_json='{"patch":"*** Begin Patch',
+            ),
+        ),
+    ]
+    sdk.messages.final_message = SimpleNamespace(
+        usage=usage(input_tokens=30, output_tokens=4096),
+        stop_reason='max_tokens',
+    )
+    client = AnthropicModelClient(model='test', client=sdk)
+
+    with pytest.raises(ModelOutputTruncatedError) as captured:
+        collect_stream(client, messages=[{'role': 'user', 'content': 'build'}])
+
+    assert captured.value.reason == 'output_truncated'
+    assert captured.value.tool_name == 'apply_patch'
+    assert 'max_tokens' in str(captured.value)
 
 
 def test_stream_omits_unused_optional_parameters() -> None:

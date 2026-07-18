@@ -38,6 +38,34 @@ DEFAULT_MODEL_PROVIDER = 'anthropic'
 class ModelProtocolError(RuntimeError):
     '''Raised when a provider emits an invalid model stream.'''
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = 'invalid_model_protocol',
+        tool_name: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.tool_name = tool_name
+
+
+class ModelOutputTruncatedError(ModelProtocolError):
+    '''Raised when the provider stops because max_tokens was reached.'''
+
+    def __init__(self, tool_names: tuple[str, ...] = ()) -> None:
+        detail = (
+            f' while generating tool arguments for {", ".join(tool_names)}'
+            if tool_names
+            else ''
+        )
+        super().__init__(
+            'Model output was truncated at the max_tokens limit'
+            f'{detail}.',
+            reason='output_truncated',
+            tool_name=tool_names[0] if len(tool_names) == 1 else None,
+        )
+
 
 class ModelCallError(RuntimeError):
     '''Provider-neutral model request failure exposed to the runtime.'''
@@ -192,6 +220,7 @@ class AnthropicModelClient:
         '''Perform one provider request without retry policy.'''
         current_usage: TokenUsage | None = None
         pending_tool_calls: dict[int, _PendingToolCall] = {}
+        protocol_error: ModelProtocolError | None = None
         async with self._client.messages.stream(**sdk_arguments) as stream:
             async for event in stream:
                 if (
@@ -237,18 +266,22 @@ class AnthropicModelClient:
                     and event.index in pending_tool_calls
                 ):
                     pending = pending_tool_calls.pop(event.index)
-                    arguments = parse_tool_arguments(
-                        pending,
-                        index=event.index,
-                    )
-                    yield ModelToolCallCompleted(
-                        tool_call=ToolCall(
+                    try:
+                        arguments = parse_tool_arguments(
+                            pending,
                             index=event.index,
-                            id=pending.id,
-                            name=pending.name,
-                            arguments=arguments,
                         )
-                    )
+                    except ModelProtocolError as error:
+                        protocol_error = protocol_error or error
+                    else:
+                        yield ModelToolCallCompleted(
+                            tool_call=ToolCall(
+                                index=event.index,
+                                id=pending.id,
+                                name=pending.name,
+                                arguments=arguments,
+                            )
+                        )
                 elif event.type == 'message_start':
                     current_usage = merge_usage(
                         event.message.usage,
@@ -264,15 +297,30 @@ class AnthropicModelClient:
 
             final_message = await stream.get_final_message()
 
-        if pending_tool_calls:
-            indexes = ', '.join(str(index) for index in pending_tool_calls)
-            raise ModelProtocolError(
-                f'Tool calls did not finish at content blocks: {indexes}.'
-            )
-
         final_usage = merge_usage(final_message.usage, current_usage)
         if final_usage != current_usage:
             yield ModelUsageUpdate(usage=final_usage)
+
+        stop_reason = getattr(final_message, 'stop_reason', None)
+        if stop_reason == 'max_tokens':
+            names = tuple(
+                pending.name for pending in pending_tool_calls.values()
+            )
+            if not names and protocol_error is not None:
+                names = tuple(
+                    name
+                    for name in (protocol_error.tool_name,)
+                    if name is not None
+                )
+            raise ModelOutputTruncatedError(names)
+        if protocol_error is not None:
+            raise protocol_error
+        if pending_tool_calls:
+            indexes = ', '.join(str(index) for index in pending_tool_calls)
+            raise ModelProtocolError(
+                f'Tool calls did not finish at content blocks: {indexes}.',
+                reason='incomplete_tool_call',
+            )
 
 
 def classify_provider_error(error: Exception) -> tuple[str, bool]:
@@ -334,12 +382,16 @@ def parse_tool_arguments(
     except json.JSONDecodeError as error:
         raise ModelProtocolError(
             f'Invalid JSON arguments for tool {pending.name!r} '
-            f'at content block {index}: {error.msg}.'
+            f'at content block {index}: {error.msg}.',
+            reason='invalid_tool_arguments',
+            tool_name=pending.name,
         ) from error
     if not isinstance(arguments, dict):
         raise ModelProtocolError(
             f'Arguments for tool {pending.name!r} at content block '
-            f'{index} must be a JSON object.'
+            f'{index} must be a JSON object.',
+            reason='invalid_tool_arguments',
+            tool_name=pending.name,
         )
     return arguments
 

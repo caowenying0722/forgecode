@@ -15,6 +15,10 @@ from forge.runtime.agent_loop import (
     ModelResponseError,
     load_system_prompt,
 )
+from forge.runtime.model_client import (
+    ModelOutputTruncatedError,
+    ModelProtocolError,
+)
 from forge.runtime.state import (
     ConversationEvent,
     ModelCallCompleted,
@@ -54,6 +58,8 @@ class FakeModelClient:
             {'messages': messages, 'tools': tools, 'system': system}
         )
         for event in self.responses.pop(0):
+            if isinstance(event, Exception):
+                raise event
             yield event
 
 
@@ -380,6 +386,80 @@ def test_agent_loop_stops_at_model_call_limit(tmp_path: Path) -> None:
 
     with pytest.raises(AgentLoopLimitError, match='exceeded 2'):
         collect_turn(conversation, 'Never finish')
+
+    assert len(client.calls) == 2
+
+
+def test_invalid_tool_json_is_retried_without_executing_partial_calls(
+    tmp_path: Path,
+) -> None:
+    partial_call = ToolCall(
+        index=0,
+        id='toolu_partial',
+        name='read_file',
+        arguments={'path': 'should-not-run.py'},
+    )
+    tool = RecordingReadFileTool(tmp_path)
+    client = FakeModelClient(
+        [
+            ModelUsageUpdate(usage=TokenUsage(10, 4)),
+            ModelToolCallCompleted(tool_call=partial_call),
+            ModelProtocolError(
+                'Invalid JSON arguments for tool write_file.',
+                reason='invalid_tool_arguments',
+                tool_name='write_file',
+            ),
+        ],
+        streamed_response('Recovered safely.', input_tokens=12),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry([tool]),
+    )
+
+    events = collect_turn(conversation, 'Build a page')
+
+    assert tool.calls == []
+    assert events[-1].result.text == 'Recovered safely.'
+    assert events[-1].result.usage.input_tokens == 22
+    feedback = client.calls[1]['messages'][-1]['content']
+    assert 'No tool was executed' in feedback
+    assert 'do not invent a write_file tool' in feedback.casefold()
+    assert 'Recovery attempt 1 of 2' in feedback
+
+
+def test_max_tokens_truncation_retries_with_small_patch_feedback() -> None:
+    client = FakeModelClient(
+        [
+            ModelUsageUpdate(usage=TokenUsage(10, 4096)),
+            ModelOutputTruncatedError(('apply_patch',)),
+        ],
+        streamed_response('Retried in smaller steps.', input_tokens=15),
+    )
+    conversation = Conversation(client=client)
+
+    events = collect_turn(conversation, 'Build a game')
+
+    assert events[-1].result.text == 'Retried in smaller steps.'
+    feedback = client.calls[1]['messages'][-1]['content']
+    assert 'reached the max_tokens limit' in feedback
+    assert 'below 8000 characters' in feedback
+
+
+def test_protocol_recovery_stops_after_configured_limit() -> None:
+    error = ModelProtocolError(
+        'invalid arguments',
+        reason='invalid_tool_arguments',
+        tool_name='write_file',
+    )
+    client = FakeModelClient([error], [error])
+    conversation = Conversation(
+        client=client,
+        max_protocol_recoveries=1,
+    )
+
+    with pytest.raises(ModelProtocolError, match='invalid arguments'):
+        collect_turn(conversation, 'Build a page')
 
     assert len(client.calls) == 2
 

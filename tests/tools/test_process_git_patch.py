@@ -169,3 +169,13 @@ def test_apply_patch_rejection_does_not_modify_files(tmp_path: Path) -> None:
     assert result.error is not None
     assert result.error.code == 'patch_rejected'
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'old\n'
+
+
+def test_apply_patch_description_requires_small_focused_writes(
+    tmp_path: Path,
+) -> None:
+    description = ApplyPatchTool(tmp_path).definition['description']
+
+    assert 'below 8000 characters' in description
+    assert 'split large HTML' in description
+    assert 'do not invent or request a write_file tool' in description
