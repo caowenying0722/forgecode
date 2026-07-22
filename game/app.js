@@ -1,526 +1,986 @@
-(()=>{
+(() => {
   const canvas = document.getElementById('gameCanvas');
   const ctx = canvas.getContext('2d');
+
   const W = canvas.width;
   const H = canvas.height;
 
-  const grid = { x: 120, y: 80, cols: 9, rows: 5, cw: 80, ch: 80 };
-  const gx = (c) => grid.x + c * grid.cw + grid.cw / 2;
-  const gy = (r) => grid.y + r * grid.ch + grid.ch / 2;
-  const gardenWidth = grid.cols * grid.cw;
-
-  // 游戏难度参数
-  const ZOMBIE_SPEED_BASE = 8;
-  const ZOMBIE_SPEED_PER_WAVE = 0.06;
-  const ZOMBIE_HP_BASE = 120;
-  const ZOMBIE_HP_PER_WAVE = 6;
-  const WAVE_SPAWN_BASE = 2;
-  const WAVE_SPAWN_GROWTH = 0.22;
-  const WAVE_INTERVAL_BASE = 2.6;
-  const WAVE_INTERVAL_DROP = 0.03;
-  const WAVE_INTERVAL_MIN = 1.7;
-
-  const plantCfg = {
-    sunflower:  { key: 'sunflower',  name: '向日葵',   cost: 50,  color: '#f4bf1e', icon: '🌻', hp: 70,  cooldown: 8,  produce: 25, shootCd: 0 },
-    peashooter: { key: 'peashooter', name: '豌豆射手', cost: 100, color: '#4caf50', icon: '🌱', hp: 90,  cooldown: 0.7, speed: 360, dmg: 25 },
-    frost:      { key: 'frost',      name: '寒冰射手', cost: 150, color: '#4fc3f7', icon: '❄️', hp: 85,  cooldown: 1.0, speed: 330, dmg: 18, slow: 0.55, slowTime: 1.5 },
-    cherry:     { key: 'cherry',     name: '樱桃炸弹', cost: 175, color: '#ff7043', icon: '🍒', hp: 40,  fuse: 0.8, damage: 230, radius: 130 },
-    wallnut:    { key: 'wallnut',    name: '坚果',     cost: 50,  color: '#8b5a2b', icon: '🪵', hp: 300, cooldown: 0 },
+  const grid = {
+    x: 120,
+    y: 80,
+    cols: 9,
+    rows: 5,
+    cw: 80,
+    ch: 80,
   };
+  const gardenW = grid.cols * grid.cw;
 
   const ui = {
+    plants: [...document.querySelectorAll('[data-plant]')],
+    shovel: document.getElementById('btnShovel'),
+    start: document.getElementById('btnStart'),
+    pause: document.getElementById('btnPause'),
+    reset: document.getElementById('btnReset'),
+    diffs: [...document.querySelectorAll('[data-diff]')],
+    hint: document.getElementById('hint'),
     sun: document.getElementById('sun'),
     lives: document.getElementById('lives'),
     wave: document.getElementById('wave'),
     score: document.getElementById('score'),
-    hint: document.getElementById('hint'),
-    start: document.getElementById('btnStart'),
-    pause: document.getElementById('btnPause'),
-    reset: document.getElementById('btnReset'),
-    shovel: document.getElementById('btnShovel'),
-    plants: [...document.querySelectorAll('[data-plant]')],
+    difficulty: document.getElementById('difficulty'),
+    weather: document.getElementById('weather'),
+    combo: document.getElementById('combo'),
+    nextWave: document.getElementById('nextWave'),
   };
 
-  let plants = [];      // {type,c,r,x,y,hp,cd,dead,fuse}
-  let zombies = [];     // {x,y,row,hp,speed,baseSpeed,atk,dead,slow,slowLeft}
-  let bullets = [];     // {x,y,row,speed,dmg,slow,slowTime,dead}
-  let suns = [];        // {x,y,vy,r,v,life,dead}
+  const DIFFS = {
+    easy: {label: '简单', sunMul: 1.25, hpMul: 0.85, speedMul: 0.9, waveScale: 0.78, rewardMul: 0.9, startSun: 180},
+    normal: {label: '普通', sunMul: 1.0, hpMul: 1.0, speedMul: 1.0, waveScale: 1.0, rewardMul: 1.0, startSun: 150},
+    hard: {label: '困难', sunMul: 0.85, hpMul: 1.15, speedMul: 1.15, waveScale: 1.18, rewardMul: 1.15, startSun: 120},
+  };
+
+  const WEATHER_CATALOG = [
+    { key: 'sunBurst', label: '阳光暴雨', duration: 9, weather: { zombieSpeed: 1.0, sunDrop: 1.6, cooldown: 0.92 } },
+    { key: 'mist', label: '阴霾', duration: 9, weather: { zombieSpeed: 1.25, sunDrop: 0.75, cooldown: 1.15 } },
+    { key: 'freeze', label: '寒潮', duration: 9, weather: { zombieSpeed: 0.8, sunDrop: 1.0, cooldown: 1.1 } },
+  ];
+
+  const plantCfg = {
+    sunflower: {
+      name: '向日葵', cost: 50, hp: 80, sunInterval: 6, sunValue: 25, levelCostMul: 1, maxLevel: 4, cooldown: 0,
+    },
+    peashooter: {
+      name: '豌豆射手', cost: 100, hp: 95, fire: 1.0, dmg: 22, maxLevel: 4,
+    },
+    frost: {
+      name: '寒冰射手', cost: 150, hp: 90, fire: 1.05, dmg: 18, slow: 0.45, slowTime: 3.0, maxLevel: 4,
+    },
+    cherry: {
+      name: '樱桃炸弹', cost: 190, hp: 60, fire: 5.5, dmg: 120, radius: 72, maxLevel: 1,
+    },
+    wallnut: {
+      name: '坚果', cost: 60, hp: 450, fire: 0, maxLevel: 2,
+    },
+    cannon: {
+      name: '火炮', cost: 230, hp: 130, fire: 2.2, dmg: 80, splash: 62, maxLevel: 3,
+    },
+    twin: {
+      name: '双发射手', cost: 280, hp: 110, fire: 0.7, dmg: 16, maxLevel: 3,
+    },
+  };
+
+  const zombieTypes = [
+    { key: 'walker', name: '普通僵尸', hp: 120, speed: 34, armor: 0, dmg: 1, reward: 6, spawn: 57, color: '#5bc27d' },
+    { key: 'fast', name: '匆忙僵尸', hp: 96, speed: 50, armor: 0, dmg: 1, reward: 5, spawn: 18, color: '#8dcf57' },
+    { key: 'cone', name: '路障僵尸', hp: 190, speed: 28, armor: 55, dmg: 1, reward: 9, spawn: 13, color: '#f8c35a' },
+    { key: 'bucket', name: '铁桶僵尸', hp: 235, speed: 24, armor: 110, dmg: 1, reward: 13, spawn: 8, color: '#d9b07e' },
+    { key: 'garg', name: '巨人僵尸', hp: 520, speed: 18, armor: 220, dmg: 2, reward: 28, isBoss: true, spawn: 4, color: '#8c6a5a' },
+  ];
+
+  const CELL_CENTER_X = (c) => grid.x + c * grid.cw + grid.cw / 2;
+  const CELL_CENTER_Y = (r) => grid.y + r * grid.ch + grid.ch / 2;
+
+  let plants = [];      // {type,c,r,row,x,y,hp,maxHp,cd,level,sunTimer,dead}
+  let zombies = [];     // {type,x,y,row,hp,maxHp,armor,maxArmor,speed,baseSpeed,atk,atkCd,dead,slowLeft}
+  let bullets = [];     // {x,y,row,speed,dmg,slow,slowTime,dead,splash,radius,pierce,color,life}
+  let suns = [];        // {x,y,vy,ttl,dead,r,v}
+  let lawnMowers = [];  // {row,x,y,active,dead}
   let explosions = [];  // {x,y,radius,maxRadius,life,dead}
+  let pickups = [];     // random power cards, same format as suns
+
+  let selected = null;
+  let shovelMode = false;
 
   let running = false;
   let gameOver = false;
-  let selected = null;     // data-plant key
-  let shovelMode = false;
-
-  let sun = 150;
+  let sun = DIFFS.normal.startSun;
   let lives = 5;
   let wave = 0;
   let score = 0;
+  let combo = 0;
+  let comboRemain = 0;
+  let gameClock = 0;
+
+  let spawnRemain = 0;
+  let spawnInterval = 1.2;
+  let spawnTimer = 0;
+  let nextWaveTimer = 1.5;
+  let bossQueue = 0;
+
+  let skySunTimer = 0;
+  let weather = {key: 'normal', label: '平静', remain: 0, zombieSpeed: 1, sunDrop: 1, cooldown: 1};
+  let weatherWait = 12 + Math.random() * 16;
 
   let lastTs = 0;
-  let spawnCD = 0;
-  let spawnRemain = 0;
-  let waveDelay = 2.2;
-  let waveInterval = 0;
-  let skySunTimer = 0;
-  let skySunGap = 8;
 
-  const setHint = (txt) => { ui.hint.textContent = txt; };
+  const setHint = (txt) => {
+    ui.hint.textContent = txt;
+  };
+
+  const setText = (el, txt) => {
+    if (el) el.textContent = txt;
+  };
+
+  const setActiveClass = (el, active) => {
+    if (el) el.classList.toggle('active', active);
+  };
+
   const sync = () => {
-    ui.sun.textContent = Math.floor(sun);
-    ui.lives.textContent = lives;
-    ui.wave.textContent = wave;
-    ui.score.textContent = score;
+    setText(ui.sun, Math.floor(sun));
+    setText(ui.lives, lives);
+    setText(ui.wave, wave);
+    setText(ui.score, score);
+    setText(ui.difficulty, DIFFS[currentDiff].label);
+    setText(ui.weather, weather.label);
+    setText(ui.combo, combo > 1 ? combo : '1');
+    setText(
+      ui.nextWave,
+      spawnRemain > 0
+        ? `剩余僵尸 ${spawnRemain}`
+        : `下一波 ${Math.max(0, nextWaveTimer).toFixed(1)}秒`
+    );
   };
 
   const setActive = () => {
-    ui.plants.forEach((btn) => btn.classList.toggle('active', !shovelMode && btn.dataset.plant === selected));
-    ui.shovel.classList.toggle('active', shovelMode);
+    ui.plants.forEach((btn) =>
+      setActiveClass(btn, selected === btn.dataset.plant && !shovelMode)
+    );
+    setActiveClass(ui.shovel, shovelMode);
+    ui.diffs.forEach((btn) => setActiveClass(btn, btn.dataset.diff === currentDiff));
   };
 
   const world = (e) => {
     const rect = canvas.getBoundingClientRect();
-    const sx = W / rect.width;
-    const sy = H / rect.height;
-    return { x: (e.clientX - rect.left) * sx, y: (e.clientY - rect.top) * sy };
+    return {
+      x: (e.clientX - rect.left) * (W / rect.width),
+      y: (e.clientY - rect.top) * (H / rect.height),
+    };
   };
 
-  const inGarden = (p) => p.x >= grid.x && p.x <= grid.x + gardenWidth && p.y >= grid.y && p.y <= grid.y + grid.rows * grid.ch;
-  const cellOf = (p) => ({ c: Math.floor((p.x - grid.x) / grid.cw), r: Math.floor((p.y - grid.y) / grid.ch) });
-  const occupied = (c, r) => plants.find((pl) => pl.c === c && pl.r === r && !pl.dead);
+  const inGarden = (p) => p.x >= grid.x && p.x <= grid.x + gardenW && p.y >= grid.y && p.y <= grid.y + grid.rows * grid.ch;
+
+  const cellOf = (p) => ({
+    c: Math.floor((p.x - grid.x) / grid.cw),
+    r: Math.floor((p.y - grid.y) / grid.ch),
+  });
+
+  const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+
+  const getActiveDiff = () => DIFFS[currentDiff];
+
+  const occupied = (c, r) => plants.find((p) => p.c === c && p.r === r && !p.dead);
+
+  let currentDiff = 'normal';
 
   const selectPlant = (type) => {
-    selected = type;
+    if (!plantCfg[type]) return;
     shovelMode = false;
+    selected = type;
+    setHint(`已选择：${plantCfg[type].name}（${plantCfg[type].cost}）`);
     setActive();
-    setHint(`已选择：${plantCfg[selected]?.name || ''}`);
   };
 
-  const gameReset = () => {
+  const resetLawnMowers = () => {
+    lawnMowers = [];
+    for (let r = 0; r < grid.rows; r++) {
+      lawnMowers.push({
+        row: r,
+        x: grid.x - grid.cw * 0.4,
+        y: grid.y + r * grid.ch + LAWN_Y_OFFSET,
+        active: false,
+        dead: false,
+        speed: 520,
+        startX: grid.x - grid.cw * 0.4,
+      });
+    }
+  };
+
+  const LAWN_Y_OFFSET = 24;
+
+  const reset = () => {
     plants = [];
     zombies = [];
     bullets = [];
     suns = [];
     explosions = [];
-
+    pickups = [];
     running = false;
     gameOver = false;
     selected = null;
     shovelMode = false;
-    sun = 150;
+    sun = DIFFS[currentDiff].startSun;
     lives = 5;
     wave = 0;
     score = 0;
-    spawnCD = 0;
+    combo = 0;
+    comboRemain = 0;
     spawnRemain = 0;
-    waveDelay = 2.0;
-    waveInterval = 0;
-    skySunTimer = 0;
-    skySunGap = 8;
-
-    setActive();
+    spawnTimer = 0;
+    nextWaveTimer = 1.5;
+    bossQueue = 0;
+    skySunTimer = 5;
+    weather = {key: 'normal', label: '平静', remain: 0, zombieSpeed: 1, sunDrop: 1, cooldown: 1};
+    weatherWait = 12 + Math.random() * 16;
+    resetLawnMowers();
+    setHint('点击植物按钮后在草坪种植，点击阳光拾取；再次选择同类植物可升级（最高级）。');
     sync();
-    setHint('准备开始：选择植物后点击草坪种植。点击“开始”后生效。');
+    setActive();
+    spawnSkySun();
     draw();
   };
 
   const spawnSkySun = () => {
+    const r = 18;
     suns.push({
-      x: grid.x + 50 + Math.random() * (gardenWidth - 100),
-      y: grid.y + 20 + Math.random() * 100,
-      vy: 12,
-      r: 16,
-      v: 25,
-      life: 12,
+      x: grid.x + r + Math.random() * (gardenW - 2 * r),
+      y: -r,
+      vy: 40 + Math.random() * 45,
+      ttl: 11 + Math.random() * 4,
+      life: 0,
       dead: false,
+      r,
+      v: 12,
+      value: 25,
     });
   };
 
+  const randomPlantValue = () => Math.floor(15 + Math.random() * 20);
+
+  const spawnPickup = () => {
+    if (Math.random() > 0.003) return;
+    const rows = Math.floor(Math.random() * grid.rows);
+    pickups.push({
+      x: grid.x + Math.random() * gardenW,
+      y: CELL_CENTER_Y(rows) - 20,
+      w: 52,
+      h: 28,
+      dead: false,
+      ttl: 12,
+      life: 0,
+      type: Math.random() > 0.5 ? 'reward' : 'damage',
+    });
+  };
+
+  const isBossWave = (w) => w > 0 && w % 8 === 0;
+
+  const pickZombieType = () => {
+    let pool = zombieTypes;
+    if (bossQueue <= 0) {
+      pool = zombieTypes.filter((t) => !t.isBoss);
+    }
+    const total = pool.reduce((sum, t) => sum + t.spawn, 0);
+    let p = Math.random() * total;
+    for (const t of pool) {
+      p -= t.spawn;
+      if (p <= 0) return t;
+    }
+    return pool[0];
+  };
+
   const spawnZombie = () => {
-    const r = (Math.random() * grid.rows) | 0;
-    const hp = ZOMBIE_HP_BASE + wave * ZOMBIE_HP_PER_WAVE;
-    const speed = ZOMBIE_SPEED_BASE + wave * ZOMBIE_SPEED_PER_WAVE;
+    const row = (Math.random() * grid.rows) | 0;
+    const isBoss = bossQueue > 0;
+    const type = isBoss ? zombieTypes.find((z) => z.isBoss) : pickZombieType();
+    if (isBoss && bossQueue > 0) bossQueue -= 1;
+
+    const diff = getActiveDiff();
+    const hp = (type.hp * (1 + wave * 0.055 * diff.hpMul) * (isBoss ? 1.4 : 1));
+    const speed = type.speed * diff.speedMul * weather.zombieSpeed;
+    const x = grid.x + gardenW + 20 + Math.random() * 50;
+    const y = CELL_CENTER_Y(row);
+
     zombies.push({
-      x: W - 30,
-      y: gy(r) - 2,
-      row: r,
+      type: type.key,
+      x,
+      y,
+      row,
       hp,
+      maxHp: hp,
+      armor: type.armor,
+      maxArmor: type.armor,
+      speed: speed,
       baseSpeed: speed,
-      speed,
-      atk: 0,
+      atk: type.dmg,
+      attackCD: 0,
+      atkInterval: 1.0,
+      dead: false,
       slowLeft: 0,
+      reward: type.reward,
+      color: type.color,
+      isBoss: !!type.isBoss,
+      w: type.isBoss ? 70 : 56,
+    });
+  };
+
+  const beginNextWave = () => {
+    wave += 1;
+    const diff = getActiveDiff();
+    spawnRemain = Math.max(5, Math.floor((7 + wave * 1.8) * diff.waveScale));
+    spawnInterval = clamp(1.4 - wave * 0.06, 0.55, 1.4) / diff.speedMul;
+    spawnTimer = 1.1;
+    nextWaveTimer = 0;
+    bossQueue = isBossWave(wave) ? 1 : 0;
+    setHint(`第 ${wave} 波开始，目标僵尸 ${spawnRemain} 只`);
+  };
+
+  const applyDamageZombie = (z, dmg) => {
+    if (z.armor > 0) {
+      const hitArmor = Math.min(z.armor, dmg);
+      z.armor -= hitArmor;
+      dmg -= hitArmor;
+    }
+    if (dmg <= 0) return;
+    z.hp = clamp(z.hp - dmg, 0, z.maxHp);
+    if (z.hp <= 0) {
+      z.dead = true;
+      const rewardBase = (z.isBoss ? 2 : 1) * z.reward * getActiveDiff().rewardMul;
+      const reward = Math.floor(rewardBase + combo * 2);
+      score += reward;
+      combo = Math.min(combo + 1, 14);
+      comboRemain = 2.5;
+      explosions.push({
+        x: z.x,
+        y: z.y,
+        radius: 0,
+        maxRadius: 38,
+        life: 0.35,
+        dead: false,
+      });
+      sun += 8 + (z.isBoss ? 20 : 0);
+    }
+  };
+
+  const explodeCherry = (p) => {
+    const cfg = plantCfg.cherry;
+    explosions.push({
+      x: p.x,
+      y: p.y,
+      radius: 0,
+      maxRadius: cfg.radius,
+      life: 0.55,
       dead: false,
     });
+
+    const base = cfg.dmg;
+    zombies.forEach((z) => {
+      if (z.dead) return;
+      const d = Math.hypot(z.x - p.x, z.y - p.y);
+      if (d <= cfg.radius) {
+        const rate = (1 - d / cfg.radius) ** 1.2;
+        applyDamageZombie(z, Math.floor(base * rate));
+      }
+    });
+    setHint('樱桃炸弹引爆！');
+  };
+
+  const findFrontZombie = (plant) => {
+    let target = null;
+    let minX = 1e9;
+    for (const z of zombies) {
+      if (z.dead || z.row !== plant.row) continue;
+      if (z.x < plant.x) continue;
+      if (z.x < minX) {
+        minX = z.x;
+        target = z;
+      }
+    }
+    return target;
   };
 
   const frontPlant = (z) => {
     let target = null;
-    let min = 1e9;
+    let maxX = -1;
     for (const p of plants) {
-      if ((p.row ?? p.r) !== z.row || p.dead) continue;
-      const d = z.x - p.x;
-      if (d > 0 && d < min) {
-        min = d;
+      if (p.dead || p.row !== z.row || p.x >= z.x) continue;
+      if (p.x > maxX) {
+        maxX = p.x;
         target = p;
       }
     }
     return target;
   };
 
-  const hasZombieInFront = (plant) => {
-    const row = plant.row ?? plant.r;
-    return zombies.some((z) => !z.dead && z.row === row && z.x > plant.x);
+  const pickupValue = (obj) => {
+    if (obj.type === 'reward') {
+      const add = 40 + Math.floor(Math.random() * 30);
+      sun += add;
+      explosions.push({ x: obj.x, y: obj.y, radius: 0, maxRadius: 26, life: 0.2, dead: false });
+      setHint(`拾取特殊卡牌：+${add} 阳光`);
+    } else {
+      const damage = 25 + Math.floor(Math.random() * 35);
+      explosions.push({ x: obj.x, y: obj.y, radius: 0, maxRadius: 26, life: 0.2, dead: false });
+      setHint(`拾取攻击卡牌：下路僵尸将受${damage}伤害`);
+      zombies.forEach((z) => {
+        if (!z.dead) applyDamageZombie(z, damage * 0.15);
+      });
+    }
+    obj.dead = true;
   };
 
-  const hitTestBulletZombie = (bullet, zombie) => {
-    return Math.abs(bullet.x - zombie.x) <= 20 && Math.abs(bullet.y - zombie.y) <= 20;
+  const createBullet = (plant, cfg, dmgMul = 1) => {
+    const speed = 470 * cfg.speedMul || 470;
+    const b = {
+      x: plant.x + 22,
+      y: plant.y - 2,
+      row: plant.row,
+      speed,
+      dmg: Math.round((cfg.dmg || 0) * dmgMul),
+      slow: cfg.slow || 0,
+      slowTime: cfg.slowTime || 0,
+      radius: 7,
+      dead: false,
+      splash: cfg.splash || 0,
+      pierce: false,
+      color: '#fff2b1',
+      life: 0,
+      maxLife: 4,
+    };
+    bullets.push(b);
   };
 
-  const explodeCherry = (plant) => {
-    const cfg = plantCfg.cherry;
-    const hit = [];
-    explosions.push({ x: plant.x, y: plant.y, radius: 0, maxRadius: cfg.radius, life: 0.32, dead: false });
-
-    for (const z of zombies) {
-      if (z.dead) continue;
-      const dx = z.x - plant.x;
-      const dy = z.y - plant.y;
-      if (Math.hypot(dx, dy) <= cfg.radius) {
-        z.hp -= cfg.damage;
-        hit.push(z);
-      }
-    }
-    for (const z of hit) {
-      score += 12;
-      if (z.hp <= 0) {
-        z.dead = true;
-        score += 16;
-      }
-    }
-    if (hit.length) setHint(`樱桃炸弹爆炸，击中 ${hit.length} 只僵尸！`);
-  };
-
-  function update(dt) {
-    if (!running || gameOver) return;
-
-    // 天空阳光
-    skySunTimer += dt;
-    if (skySunTimer >= skySunGap) {
-      spawnSkySun();
-      skySunTimer = 0;
-      skySunGap = 6 + Math.random() * 5;
-    }
-
-    // 波次生成
-    if (waveDelay > 0) {
-      waveDelay -= dt;
-    } else if (spawnRemain <= 0 && zombies.length === 0) {
-      wave++;
-      spawnRemain = 2 + wave;
-      waveInterval = Math.max(1.0, 1.7 - wave * 0.07);
-      spawnCD = 0;
-      setHint(`第 ${wave} 波开始了，出现 ${spawnRemain} 只僵尸`);
-      sync();
-    } else if (spawnRemain > 0) {
-      spawnCD -= dt;
-      if (spawnCD <= 0) {
-        spawnZombie();
-        spawnRemain -= 1;
-        spawnCD = waveInterval;
-      }
-    }
-
-    for (const p of plants) {
-      if (p.dead) continue;
-      const cfg = plantCfg[p.type];
-      p.cd -= dt;
-
-      if (p.type === 'sunflower' && p.cd <= 0) {
-        suns.push({ x: p.x, y: p.y, vy: 0, r: 16, v: cfg.produce, life: 999, dead: false });
-        p.cd = cfg.cooldown;
-      }
-
-      if (p.type === 'peashooter' && p.cd <= 0 && hasZombieInFront(p)) {
-        bullets.push({
-          x: p.x + 20,
-          y: p.y,
-          row: p.row ?? p.r,
-          speed: cfg.speed,
-          dmg: cfg.dmg,
-          slow: 0,
-          slowTime: 0,
-          dead: false,
-        });
-        p.cd = cfg.cooldown;
-      }
-
-      if (p.type === 'frost' && p.cd <= 0 && hasZombieInFront(p)) {
-        bullets.push({
-          x: p.x + 20,
-          y: p.y,
-          row: p.row ?? p.r,
-          speed: cfg.speed,
-          dmg: cfg.dmg,
-          slow: cfg.slow,
-          slowTime: cfg.slowTime,
-          dead: false,
-        });
-        p.cd = cfg.cooldown;
-      }
-
-      if (p.type === 'cherry') {
-        p.cd -= dt;
-        if (p.cd <= 0) {
-          explodeCherry(p);
-          p.dead = true;
+  const updateMowers = (dt) => {
+    for (const m of lawnMowers) {
+      if (!m.active) continue;
+      m.x += m.speed * dt;
+      for (const z of zombies) {
+        if (z.dead || z.row !== m.row) continue;
+        if (z.x + z.w / 2 >= m.x - 8 && z.x - z.w / 2 <= m.x + 32) {
+          z.dead = true;
+          score += 8;
+          sun += 2;
         }
       }
+      if (m.x > grid.x + gardenW + 12) {
+        m.active = false;
+        m.x = m.startX;
+      }
+    }
+  };
+
+  const triggerMower = (row) => {
+    const m = lawnMowers[row];
+    if (m && !m.active) {
+      m.active = true;
+      setHint('草坪车已启动，清理该行！');
+    }
+  };
+
+  const update = (dt) => {
+    if (!running || gameOver) {
+      sync();
+      draw();
+      return;
     }
 
+    if (combo > 0) {
+      comboRemain -= dt;
+      if (comboRemain <= 0) combo = 0;
+    }
+
+    const diff = getActiveDiff();
+
+    weatherWait -= dt;
+    if (weatherWait <= 0 && weather.remain <= 0) {
+      const evt = WEATHER_CATALOG[(Math.random() * WEATHER_CATALOG.length) | 0];
+      weather = {
+        key: evt.key,
+        label: evt.label,
+        remain: evt.duration,
+        zombieSpeed: evt.weather.zombieSpeed,
+        sunDrop: evt.weather.sunDrop,
+        cooldown: evt.weather.cooldown,
+      };
+      weatherWait = 16 + Math.random() * 16;
+      setHint(`环境事件：${evt.label} 生效中`);
+    }
+    if (weather.remain > 0) {
+      weather.remain -= dt;
+      if (weather.remain <= 0) {
+        weather = {key: 'normal', label: '平静', remain: 0, zombieSpeed: 1, sunDrop: 1, cooldown: 1};
+        setHint('环境恢复平静。');
+      }
+    }
+
+    // Waves
+    if (spawnRemain > 0) {
+      spawnTimer -= dt;
+      while (spawnRemain > 0 && spawnTimer <= 0) {
+        spawnZombie();
+        spawnRemain -= 1;
+        spawnTimer += spawnInterval;
+      }
+    } else if (zombies.length === 0) {
+      if (nextWaveTimer <= 0) {
+        beginNextWave();
+      } else {
+        nextWaveTimer -= dt;
+      }
+    }
+
+    // Sunny rain
+    const sunDrop = (3.1 / (diff.sunMul * weather.sunDrop));
+    skySunTimer -= dt;
+    if (skySunTimer <= 0) {
+      spawnSkySun();
+      skySunTimer = sunDrop;
+    }
+
+    // power pickups spawn
+    spawnPickup();
+
+    // update plants
+    for (const p of plants) {
+      if (p.dead) continue;
+      if (p.cd > 0) p.cd -= dt * weather.cooldown;
+      if (p.type === 'sunflower') {
+        p.sunTimer -= dt;
+        if (p.sunTimer <= 0) {
+          suns.push({
+            x: p.x,
+            y: p.y,
+            vy: 18 + 10 * Math.random(),
+            ttl: 6,
+            life: 0,
+            dead: false,
+            r: 16,
+            v: 9,
+            value: plantCfg.sunflower.sunValue + p.level * 5,
+          });
+          p.sunTimer = plantCfg.sunflower.sunInterval;
+        }
+        continue;
+      }
+
+      const cfg = plantCfg[p.type];
+      if (!cfg || cfg.fire === 0) continue;
+
+      const target = findFrontZombie(p);
+      if (!target) continue;
+      if (p.cd > 0) continue;
+
+      const shootMul = 1 + (p.level - 1) * 0.22;
+
+      if (p.type === 'cherry') {
+        explodeCherry(p);
+        p.cd = cfg.fire;
+        p.dead = true;
+        continue;
+      }
+
+      if (p.type === 'cannon') {
+        createBullet(p, {...cfg, dmg: Math.round(cfg.dmg * shootMul), speedMul: 0.66, splash: cfg.splash}, 1);
+        p.cd = cfg.fire;
+        continue;
+      }
+
+      if (p.type === 'twin') {
+        createBullet(p, {...cfg, dmg: Math.round(cfg.dmg * 0.75 * shootMul)}, 0.45);
+        createBullet({ ...p, x: p.x - 2 }, {...cfg, dmg: Math.round(cfg.dmg * 0.75 * shootMul)}, 0.45);
+        p.cd = cfg.fire;
+        continue;
+      }
+
+      createBullet(p, {...cfg, dmg: Math.round((cfg.dmg || 0) * shootMul)});
+      p.cd = cfg.fire;
+    }
+
+    // update bullets
     for (const b of bullets) {
       if (b.dead) continue;
       b.x += b.speed * dt;
-      if (b.x > W + 20) {
-        b.dead = true;
-        continue;
-      }
+      b.life += dt;
+      if (b.x > W + 20 || b.life > b.maxLife) b.dead = true;
+
       for (const z of zombies) {
-        if (z.dead || b.dead || z.row !== b.row) continue;
-        if (z.x - b.x <= 18 && z.x - b.x >= -4) {
-          z.hp -= b.dmg;
-          if (b.slow > 0) {
-            z.slowLeft = Math.max(z.slowLeft, b.slowTime || 0);
-          }
-          b.dead = true;
-          score += 4;
-          if (z.hp <= 0) {
-            z.dead = true;
-            score += 12;
-          }
-          break;
+        if (z.dead || z.row !== b.row) continue;
+        if (b.x < z.x - z.w / 2 || b.x > z.x + z.w / 2) continue;
+        if (Math.abs(b.y - z.y) > z.w / 2) continue;
+
+        applyDamageZombie(z, b.dmg);
+
+        if (b.slow > 0) {
+          z.slowLeft = Math.max(z.slowLeft, b.slowTime);
         }
+
+        if (b.splash > 0) {
+          for (const aoe of zombies) {
+            if (aoe.dead || aoe.row !== z.row || aoe === z) continue;
+            const d = Math.hypot(aoe.x - b.x, aoe.y - b.y);
+            if (d <= b.splash) {
+              applyDamageZombie(aoe, Math.round(b.dmg * (1 - d / b.splash)));
+            }
+          }
+        }
+
+        if (!b.pierce) b.dead = true;
+        break;
       }
     }
 
+    // update zombies
     for (const z of zombies) {
       if (z.dead) continue;
+      if (z.slowLeft > 0) z.slowLeft = Math.max(0, z.slowLeft - dt);
 
-      if (z.slowLeft > 0) {
-        z.slowLeft = Math.max(0, z.slowLeft - dt);
-      }
       const target = frontPlant(z);
       if (target) {
-        if (z.x - target.x <= 24) {
-          z.atk -= dt;
-          if (z.atk <= 0) {
-            target.hp -= 18;
-            z.atk = 0.75;
-          }
+        z.attackCD -= dt;
+        if (z.attackCD <= 0) {
+          target.hp -= z.atk;
+          z.attackCD = z.atkInterval;
+          if (target.hp <= 0) target.dead = true;
         }
       } else {
-        z.x -= z.baseSpeed * (z.slowLeft > 0 ? 0.52 : 1) * dt;
-        if (z.x < grid.x - 10) {
-          lives -= 1;
-          z.dead = true;
-          sync();
-          if (lives <= 0) {
-            gameOver = true;
-            running = false;
-            setHint('僵尸闯入了房子，游戏结束！');
-          }
+        z.x -= z.baseSpeed * diff.speedMul * weather.zombieSpeed * (z.slowLeft > 0 ? 0.45 : 1) * dt;
+      }
+
+      if (z.x < grid.x + LAWN_TRIGGER_X) {
+        const row = z.row;
+        triggerMower(row);
+      }
+
+      if (z.x <= grid.x - 8) {
+        z.dead = true;
+        lives -= 1;
+        setHint('僵尸突破草坪，生命-1！');
+        if (lives <= 0) {
+          gameOver = true;
+          running = false;
+          setHint('游戏结束！点击【重置】后可再次挑战。');
         }
       }
     }
 
+    // update lawn mowers
+    updateMowers(dt);
+
+    // update sky/ground suns
     for (const s of suns) {
-      if (!s.vy) continue;
+      if (s.dead) continue;
+      s.life += dt;
       s.y += s.vy * dt;
-      s.life -= dt;
-      if (s.life <= 0) s.dead = true;
+      if (s.life > s.ttl) s.dead = true;
     }
 
+    // update explosions
     for (const e of explosions) {
+      if (e.dead) continue;
       e.life -= dt;
-      e.radius += 240 * dt;
       if (e.life <= 0) e.dead = true;
     }
 
-    plants = plants.filter((p) => !p.dead && p.hp > 0);
+    // update pickups
+    for (const p of pickups) {
+      if (p.dead) continue;
+      p.life += dt;
+      if (p.life > p.ttl) p.dead = true;
+    }
+
+    // cleanup
+    plants = plants.filter((p) => !p.dead);
     bullets = bullets.filter((b) => !b.dead);
     zombies = zombies.filter((z) => !z.dead);
     suns = suns.filter((s) => !s.dead);
     explosions = explosions.filter((e) => !e.dead);
+    pickups = pickups.filter((p) => !p.dead);
 
     sync();
-  }
+    draw();
+  };
 
-  function draw() {
+  const removeDeadPlants = () => {
+    for (const p of plants) {
+      if (p.hp <= 0) p.dead = true;
+    }
+  };
+
+  const drawGrid = () => {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(66, 58, 24, 0.6)';
+    ctx.lineWidth = 2;
+
+    for (let r = 0; r <= grid.rows; r++) {
+      const y = grid.y + r * grid.ch;
+      ctx.beginPath();
+      ctx.moveTo(grid.x, y);
+      ctx.lineTo(grid.x + gardenW, y);
+      ctx.stroke();
+    }
+
+    for (let c = 0; c <= grid.cols; c++) {
+      const x = grid.x + c * grid.cw;
+      ctx.beginPath();
+      ctx.moveTo(x, grid.y);
+      ctx.lineTo(x, grid.y + grid.rows * grid.ch);
+      ctx.stroke();
+    }
+    ctx.restore();
+  };
+
+  const draw = () => {
     ctx.clearRect(0, 0, W, H);
 
-    const g = ctx.createLinearGradient(0, 0, 0, H);
-    g.addColorStop(0, '#72d8ff');
-    g.addColorStop(1, '#8adf7b');
-    ctx.fillStyle = g;
+    // grass field
+    const g1 = ctx.createLinearGradient(0, 0, 0, H);
+    g1.addColorStop(0, '#5bb85a');
+    g1.addColorStop(1, '#3e9b45');
+    ctx.fillStyle = g1;
     ctx.fillRect(0, 0, W, H);
 
-    ctx.fillStyle = '#6ed45f';
-    ctx.fillRect(grid.x, grid.y, gardenWidth, grid.rows * grid.ch);
-
+    // lane background and path
     for (let r = 0; r < grid.rows; r++) {
-      for (let c = 0; c < grid.cols; c++) {
-        ctx.fillStyle = ((r + c) % 2) ? '#63c456' : '#58b64a';
-        ctx.fillRect(grid.x + c * grid.cw, grid.y + r * grid.ch, grid.cw, grid.ch);
+      const y = grid.y + r * grid.ch;
+      ctx.fillStyle = r % 2 === 0 ? 'rgba(84, 163, 86, 0.95)' : 'rgba(76, 152, 78, 0.93)';
+      ctx.fillRect(grid.x, y + 12, gardenW, grid.ch - 24);
+    }
+
+    drawGrid();
+
+    // pickups
+    for (const p of pickups) {
+      ctx.save();
+      const alpha = p.life < 0.5 ? p.life / 0.5 : 1;
+      ctx.globalAlpha = Math.min(1, alpha);
+      const cx = p.x;
+      const cy = p.y;
+      if (p.type === 'reward') {
+        ctx.fillStyle = '#ffd54f';
+      } else {
+        ctx.fillStyle = '#ff8585';
       }
-    }
-
-    ctx.strokeStyle = 'rgba(0,0,0,.25)';
-    for (let r = 0; r <= grid.rows; r++) {
-      ctx.beginPath();
-      ctx.moveTo(grid.x, grid.y + r * grid.ch);
-      ctx.lineTo(grid.x + gardenWidth, grid.y + r * grid.ch);
-      ctx.stroke();
-    }
-    for (let c = 0; c <= grid.cols; c++) {
-      ctx.beginPath();
-      ctx.moveTo(grid.x + c * grid.cw, grid.y);
-      ctx.lineTo(grid.x + c * grid.cw, grid.y + grid.rows * grid.ch);
-      ctx.stroke();
-    }
-
-    for (const s of suns) {
-      ctx.fillStyle = '#f4e65d';
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#8a5d10';
-      ctx.font = '14px Arial';
+      ctx.fillRect(cx - 18, cy - 10, p.w, p.h);
+      ctx.fillStyle = '#2d1703';
+      ctx.font = '12px sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText('+' + s.v, s.x, s.y + 4);
+      ctx.fillText(p.type === 'reward' ? '阳' : '攻', cx + 8, cy + 8);
+      ctx.restore();
     }
 
+    // suns
+    for (const s of suns) {
+      ctx.beginPath();
+      ctx.fillStyle = '#f4e542';
+      ctx.ellipse(s.x, s.y, s.r, s.r * 0.64, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#d4b82b';
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // explosions
+    for (const e of explosions) {
+      const p = 1 - e.life / 0.55;
+      const r = e.maxRadius * p;
+      ctx.strokeStyle = `rgba(255, 180, 35, ${1 - p})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // bullets
+    for (const b of bullets) {
+      ctx.fillStyle = b.color;
+      ctx.beginPath();
+      ctx.ellipse(b.x, b.y, b.radius, b.radius * 0.6, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // plants
     for (const p of plants) {
       const cfg = plantCfg[p.type];
-      const hpRate = Math.max(0, p.hp / cfg.hp);
-      ctx.fillStyle = cfg.color;
-      ctx.fillRect(p.x - 28, p.y - 28, 56, 56);
-      ctx.fillStyle = '#fff';
-      ctx.font = '24px Arial';
-      ctx.textAlign = 'center';
-      ctx.fillText(cfg.icon, p.x, p.y + 8);
-      ctx.fillStyle = 'rgba(255,255,255,.82)';
-      ctx.fillRect(p.x - 28, p.y + 29, 56 * hpRate, 4);
-      ctx.strokeStyle = 'rgba(0,0,0,.35)';
-      ctx.strokeRect(p.x - 28, p.y + 29, 56, 4);
-      if (p.type === 'cherry') {
-        ctx.fillStyle = '#ffeb3b';
-        ctx.font = '12px Arial';
-        ctx.fillText(Math.max(0, p.cd.toFixed(1)) + 's', p.x, p.y - 36);
+      const w = grid.cw * 0.58;
+      const h = grid.ch * 0.58;
+      const x = p.x - w / 2;
+      const y = p.y - h / 2;
+
+      if (p.type === 'sunflower') ctx.fillStyle = '#ffef8a';
+      else if (p.type === 'peashooter' || p.type === 'twin') ctx.fillStyle = '#80d8ff';
+      else if (p.type === 'frost') ctx.fillStyle = '#92ddff';
+      else if (p.type === 'cherry') ctx.fillStyle = '#ff8b8b';
+      else if (p.type === 'cannon') ctx.fillStyle = '#ffb347';
+      else if (p.type === 'wallnut') ctx.fillStyle = '#c49c64';
+      else ctx.fillStyle = '#ffffff';
+
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#3a2a14';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x, y, w, h);
+
+      if (p.type === 'sunflower') {
+        ctx.fillStyle = '#f7c94d';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 14, 0, Math.PI * 2);
+        ctx.fill();
       }
+
+      if (cfg.maxLevel > 1) {
+        const txt = `${p.level}/${cfg.maxLevel}`;
+        ctx.fillStyle = '#222';
+        ctx.font = 'bold 12px sans-serif';
+        ctx.textAlign = 'right';
+        ctx.fillText(txt, x + w - 4, y + 14);
+      }
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillStyle = '#202020';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(cfg.name?.slice(0, 3) || p.type, p.x, y + h + 13);
+
+      const hpRate = p.hp / p.maxHp;
+      ctx.fillStyle = '#111';
+      ctx.fillRect(x, y + h + 2, w, 4);
+      ctx.fillStyle = hpRate > 0.6 ? '#5fd35f' : hpRate > 0.3 ? '#f5d14f' : '#f26c6c';
+      ctx.fillRect(x, y + h + 2, w * hpRate, 4);
     }
 
-    for (const b of bullets) {
-      ctx.fillStyle = b.slow > 0 ? '#9ce6ff' : '#ffd65c';
-      ctx.beginPath();
-      ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
+    // zombies
     for (const z of zombies) {
-      ctx.fillStyle = '#5f6368';
-      ctx.fillRect(z.x - 16, z.y - 34, 32, 60);
-      ctx.fillStyle = '#fff';
-      ctx.font = '20px Arial';
-      ctx.textAlign = 'center';
-      ctx.fillText('🧟', z.x, z.y + 5);
-      const maxHp = 130 + wave * 18;
-      const hpRate = Math.max(0, z.hp / maxHp);
-      ctx.fillStyle = 'red';
-      ctx.fillRect(z.x - 18, z.y - 40, 36, 4);
-      ctx.fillStyle = '#9f0';
-      ctx.fillRect(z.x - 18, z.y - 40, 36 * hpRate, 4);
-      if (z.slowLeft > 0) {
-        ctx.fillStyle = '#8ff';
-        ctx.fillText('I', z.x + 14, z.y - 44);
+      const w = z.w;
+      const h = 42;
+      ctx.fillStyle = z.color || '#a5c56c';
+      ctx.fillRect(z.x - w / 2, z.y - h / 2, w, h);
+      ctx.fillStyle = '#7a4c2a';
+      ctx.fillRect(z.x - 4, z.y - h / 2 - 8, 8, 8);
+
+      const hpRate = z.hp / z.maxHp;
+      const arRate = z.armor > 0 ? z.armor / z.maxArmor : 0;
+      ctx.fillStyle = '#111';
+      ctx.fillRect(z.x - w / 2, z.y - h / 2 - 12, w, 4);
+      ctx.fillStyle = hpRate > 0.55 ? '#4ec14e' : hpRate > 0.25 ? '#dab13d' : '#d65d54';
+      ctx.fillRect(z.x - w / 2, z.y - h / 2 - 12, w * hpRate, 4);
+
+      if (arRate > 0) {
+        ctx.fillStyle = '#7f7f7f';
+        ctx.fillRect(z.x - w / 2, z.y - h / 2 - 18, w * arRate, 3);
+      }
+
+      if (z.isBoss) {
+        ctx.strokeStyle = '#ffe66f';
+        ctx.strokeRect(z.x - w / 2 - 3, z.y - h / 2 - 3, w + 6, h + 6);
       }
     }
 
-    for (const e of explosions) {
-      ctx.fillStyle = 'rgba(255,153,0,' + (Math.max(0, e.life / 0.32) * 0.55) + ')';
-      ctx.beginPath();
-      ctx.arc(e.x, e.y, Math.min(e.radius, e.maxRadius), 0, Math.PI * 2);
-      ctx.fill();
+    // lawn mowers
+    for (const m of lawnMowers) {
+      if (!m.active) {
+        ctx.strokeStyle = '#6b4019';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(m.startX, m.y + 8);
+        ctx.lineTo(m.startX + 4, m.y + 8);
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = '#fff5b9';
+        ctx.fillRect(m.x - 2, m.y - 8, 42, 16);
+        ctx.fillStyle = '#9b6420';
+        ctx.fillRect(m.x + 10, m.y - 10, 10, 20);
+      }
     }
 
-    if (!running && !gameOver) {
-      ctx.fillStyle = 'rgba(0,0,0,.34)';
-      ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = '#fff';
-      ctx.font = '36px Arial';
-      ctx.textAlign = 'center';
-      ctx.fillText('暂停中 / 点击开始', W / 2, H / 2 - 12);
+    // combo and weather hints
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(16, 8, 320, 64);
+    ctx.fillStyle = '#f7fcf2';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`模式: ${DIFFS[currentDiff].label}`, 24, 24);
+    ctx.fillText(`环境: ${weather.label}`, 24, 44);
+    if (combo > 1) {
+      ctx.fillStyle = '#ffef7d';
+      ctx.fillText(`连击 x${combo}`, 24, 64);
     }
+  };
 
-    if (gameOver) {
-      ctx.fillStyle = 'rgba(0,0,0,.58)';
-      ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = '#ff8080';
-      ctx.font = '64px Arial';
-      ctx.textAlign = 'center';
-      ctx.fillText('游戏结束', W / 2, H / 2 - 14);
-      ctx.font = '28px Arial';
-      ctx.fillText('得分 ' + score + '，点击“重置”后重玩', W / 2, H / 2 + 30);
-    }
-  }
-
-  canvas.addEventListener('click', (e) => {
+  const handleClick = (e) => {
     const p = world(e);
 
-    // 先尝试拾取阳光，任何状态都允许
-    for (let i = suns.length - 1; i >= 0; i--) {
-      if (Math.hypot(suns[i].x - p.x, suns[i].y - p.y) <= suns[i].r + 3) {
-        sun += suns[i].v;
-        suns.splice(i, 1);
+    for (const s of suns) {
+      if (s.dead) continue;
+      const d = Math.hypot(s.x - p.x, s.y - p.y);
+      if (d <= s.r) {
+        sun += s.value;
+        s.dead = true;
+        setHint(`拾取阳光 +${s.value}`);
         sync();
-        setHint('拾取阳光 +' + suns[i]?.v);
+        draw();
         return;
       }
     }
 
-    if (!running || gameOver || !inGarden(p)) return;
+    for (const pku of pickups) {
+      if (pku.dead) continue;
+      if (Math.abs(pku.x - p.x) <= pku.w / 2 && Math.abs(pku.y - p.y) <= pku.h / 2) {
+        pickupValue(pku);
+        sync();
+        draw();
+        return;
+      }
+    }
+
+    if (!inGarden(p)) return;
+
     const { c, r } = cellOf(p);
     if (c < 0 || c >= grid.cols || r < 0 || r >= grid.rows) return;
 
-    const idxPlant = occupied(c, r);
+    const cellPlant = occupied(c, r);
+    const cx = CELL_CENTER_X(c);
+    const cy = CELL_CENTER_Y(r);
 
     if (shovelMode) {
-      if (!idxPlant) {
-        setHint('该格子没有植物可移除');
-        return;
+      if (cellPlant) {
+        cellPlant.dead = true;
+        setHint('已清除植物。');
+      } else {
+        setHint('这里什么都没有。');
       }
-      idxPlant.dead = true;
-      setHint('已铲除该植物');
-      sync();
+      shovelMode = false;
+      selected = null;
+      setActive();
       return;
     }
 
     if (!selected) {
-      setHint('请先选择植物或铲子');
-      return;
-    }
-
-    if (idxPlant) {
-      setHint('该格已有植物');
+      setHint('请先选择一种植物。');
       return;
     }
 
     const cfg = plantCfg[selected];
-    if (!cfg) {
-      setHint('无效植物');
+    if (!cfg) return;
+
+    if (cellPlant) {
+      if (cellPlant.type !== selected) {
+        setHint('该格已被其他植物占据，无法放置。');
+        return;
+      }
+
+      const nextLevel = Math.min(cellPlant.level + 1, cfg.maxLevel);
+      if (nextLevel <= cellPlant.level) {
+        setHint('该植物已满级。');
+        return;
+      }
+      const cost = Math.floor(cfg.cost * (0.65 + nextLevel * 0.45));
+      if (sun < cost) {
+        setHint(`阳光不足，升级需要 ${cost}`);
+        return;
+      }
+
+      sun -= cost;
+      cellPlant.level = nextLevel;
+      const oldHP = cellPlant.maxHp;
+      cellPlant.maxHp = Math.floor(oldHP * 1.35);
+      cellPlant.hp = cellPlant.maxHp;
+      cellPlant.cd = Math.max(0, cellPlant.cd * 0.92);
+      setHint(`升级成功：${cfg.name} -> Lv.${cellPlant.level}`);
+      sync();
+      draw();
       return;
     }
 
     if (sun < cfg.cost) {
-      setHint('阳光不足');
+      setHint(`阳光不足，${cfg.name} 需要 ${cfg.cost}`);
       return;
     }
 
@@ -529,52 +989,84 @@
       type: selected,
       c,
       r,
-      x: gx(c),
-      y: gy(r),
+      row: r,
+      x: cx,
+      y: cy,
       hp: cfg.hp,
-      cd: cfg.cooldown || 0,
+      maxHp: cfg.hp,
+      cd: 0,
+      level: 1,
       dead: false,
-      ...(selected === 'cherry' ? { cd: cfg.fuse } : {}),
+      sunTimer: cfg.sunInterval || 0,
+    });
+    setHint(`已种植 ${cfg.name}（剩余阳光 ${Math.floor(sun)}）`);
+    sync();
+    draw();
+  };
+
+  const bindUI = () => {
+    ui.plants.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const type = btn.dataset.plant;
+        if (type) selectPlant(type);
+      });
     });
 
-    sync();
-    setHint(`放置 ${cfg.name}`);
-  });
+    ui.shovel.addEventListener('click', () => {
+      shovelMode = !shovelMode;
+      selected = null;
+      setHint(shovelMode ? '铲子模式：点击植物直接移除' : '已退出铲子模式');
+      setActive();
+    });
 
-  ui.plants.forEach((btn) => {
-    btn.addEventListener('click', () => selectPlant(btn.dataset.plant));
-  });
+    ui.start.addEventListener('click', () => {
+      if (gameOver) return;
+      if (!running) {
+        if (wave === 0) beginNextWave();
+        running = true;
+        setHint('游戏开始！');
+        requestAnimationFrame(tick);
+      }
+    });
 
-  ui.shovel.addEventListener('click', () => {
-    selected = null;
-    shovelMode = true;
-    setActive();
-    setHint('铲子模式：点击草坪可移除植物');
-  });
+    ui.pause.addEventListener('click', () => {
+      if (!running) {
+        running = true;
+        requestAnimationFrame(tick);
+        setHint('游戏恢复');
+      } else {
+        running = false;
+        setHint('游戏已暂停');
+      }
+    });
 
-  ui.start.addEventListener('click', () => {
-    if (gameOver) gameReset();
-    running = true;
-    setHint('游戏开始');
-  });
+    ui.reset.addEventListener('click', reset);
 
-  ui.pause.addEventListener('click', () => {
-    if (gameOver) return;
-    running = false;
-    setHint('已暂停');
-  });
+    ui.diffs.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        currentDiff = btn.dataset.diff;
+        reset();
+      });
+    });
 
-  ui.reset.addEventListener('click', gameReset);
+    canvas.addEventListener('click', handleClick);
+  };
 
-  function tick(ts) {
+  const CA = new Set();
+
+  const tick = (ts) => {
+    if (!lastTs) lastTs = ts;
     const dt = Math.min((ts - lastTs) / 1000, 0.05);
     lastTs = ts;
-    update(dt);
-    draw();
-    requestAnimationFrame(tick);
-  }
+    gameClock += dt;
 
-  gameReset();
-  lastTs = performance.now();
+    update(dt);
+    if (running && !gameOver) requestAnimationFrame(tick);
+  };
+
+  const LAWN_TRIGGER_X = 24 + grid.x;
+
+  reset();
+  bindUI();
   requestAnimationFrame(tick);
 })();

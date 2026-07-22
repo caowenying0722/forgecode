@@ -95,6 +95,7 @@ class Conversation:
         mutation_recovery_limit: int = 5,
         pre_mutation_limit: int = 8,
         action_recovery_limit: int = 3,
+        max_turn_input_tokens: int | None = 500_000,
     ) -> None:
         if tools is not None and registry is not None:
             raise ValueError('Pass tools or registry, not both.')
@@ -126,6 +127,8 @@ class Conversation:
             raise ValueError('pre_mutation_limit must be positive')
         if action_recovery_limit < 1:
             raise ValueError('action_recovery_limit must be positive')
+        if max_turn_input_tokens is not None and max_turn_input_tokens < 1:
+            raise ValueError('max_turn_input_tokens must be positive')
         self.client = (
             client if client is not None else AnthropicModelClient.from_config()
         )
@@ -188,6 +191,7 @@ class Conversation:
         self.mutation_recovery_limit = mutation_recovery_limit
         self.pre_mutation_limit = pre_mutation_limit
         self.action_recovery_limit = action_recovery_limit
+        self.max_turn_input_tokens = max_turn_input_tokens
         self._last_repository_context = self.context.repository.system_suffix('')
         self._last_task_context = ''
 
@@ -239,6 +243,7 @@ class Conversation:
         action_block_events = 0
         mutation_failure_count = 0
         mutation_failures: list[dict[str, Any]] = []
+        mutation_recovery_read_used = False
         mutation_recovery_context = ''
         force_synthesis = False
         tool_protocol_failures = 0
@@ -271,11 +276,47 @@ class Conversation:
             tool_calls: list[ToolCall] = []
             request_usage: TokenUsage | None = None
 
+            if (
+                self.max_turn_input_tokens is not None
+                and completed_usage.total_input_tokens
+                >= self.max_turn_input_tokens
+            ):
+                reason = (
+                    'Stopped after the turn consumed '
+                    f'{completed_usage.total_input_tokens} input tokens, '
+                    'reaching the configured cumulative input-token limit '
+                    f'of {self.max_turn_input_tokens}.'
+                )
+                self.task_manager.stuck((reason,))
+                self.messages[:] = request_messages
+                yield TurnCompleted(
+                    result=TurnResult(
+                        text=reason,
+                        usage=completed_usage,
+                        model_calls=iteration - 1,
+                        tool_calls=tuple(all_tool_calls),
+                        status='stuck',
+                        changed_paths=(
+                            self.workspace_tracker.changed_paths
+                            if self.workspace_tracker is not None
+                            else ()
+                        ),
+                        verification=latest_verification,
+                        completion_reasons=(reason,),
+                    )
+                )
+                return
+
             if finalization_recovery:
                 request_tools = None
             elif action_recovery:
                 request_tools = self._action_recovery_tools(
                     read_available=not action_read_used
+                )
+            elif mutation_failures:
+                request_tools = self._action_recovery_tools(
+                    read_available=not mutation_recovery_read_used,
+                    include_finish=False,
                 )
             else:
                 request_tools = self.tools
@@ -865,6 +906,15 @@ class Conversation:
                 )
                 if action_read_call and not action_read_used:
                     action_read_used = True
+                mutation_read_call = (
+                    bool(mutation_failures)
+                    and tool_call.name in ACTION_RECOVERY_READ_TOOLS
+                )
+                if (
+                    mutation_read_call
+                    and not mutation_recovery_read_used
+                ):
+                    mutation_recovery_read_used = True
                 yield ToolExecutionStarted(tool_call=tool_call)
                 revision = (
                     self.workspace_tracker.revision
@@ -906,6 +956,20 @@ class Conversation:
                         'tool_not_available_in_phase',
                         f'{tool_call.name} is not available during Action '
                         'Recovery. Use one of the tools included with this '
+                        'request.',
+                        details={
+                            'available_tools': sorted(request_tool_names),
+                        },
+                    )
+                elif (
+                    mutation_failures
+                    and tool_call.name not in request_tool_names
+                ):
+                    result = ToolResult.fail(
+                        'tool_not_available_in_phase',
+                        f'{tool_call.name} is not available after the single '
+                        'Edit Recovery read has been used. Apply one corrected '
+                        'workspace edit using a tool included with this '
                         'request.',
                         details={
                             'available_tools': sorted(request_tool_names),
@@ -1121,6 +1185,7 @@ class Conversation:
             if workspace_progressed:
                 mutation_failure_count = 0
                 mutation_failures.clear()
+                mutation_recovery_read_used = False
                 mutation_recovery_context = ''
                 pre_mutation_calls = 0
                 action_recovery = False
@@ -1146,6 +1211,7 @@ class Conversation:
                 _, last_call, last_result, _ = workspace_write_results[-1]
                 pending_write_results = [(last_call, last_result)]
             if pending_write_results:
+                mutation_recovery_read_used = False
                 mutation_failure_count += len(pending_write_results)
                 for failed_call, failed_result in pending_write_results:
                     mutation_failures.append(
@@ -1505,6 +1571,7 @@ class Conversation:
         self,
         *,
         read_available: bool,
+        include_finish: bool = True,
     ) -> list[dict[str, Any]] | None:
         if self.registry is None or self.tools is None:
             return self.tools
@@ -1513,7 +1580,7 @@ class Conversation:
             name = str(definition.get('name', ''))
             if (
                 (read_available and name in ACTION_RECOVERY_READ_TOOLS)
-                or name == 'finish_task'
+                or (include_finish and name == 'finish_task')
                 or self.registry.effect(name) == 'workspace_write'
             ):
                 selected.append(definition)

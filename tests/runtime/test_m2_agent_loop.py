@@ -522,7 +522,7 @@ def test_later_write_failure_in_same_response_remains_in_recovery(
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
 
 
-def test_pending_write_failure_blocks_verified_finish(
+def test_pending_write_failure_hides_finish_and_bounds_invalid_attempts(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -556,16 +556,18 @@ def test_pending_write_failure_blocks_verified_finish(
         response_with_tool(edit),
         response_with_tool(verify),
         response_with_tool(failed_edit),
-        finish_response(
-            'premature-finish',
-            task_kind='change',
-            summary='Finished despite the unresolved edit.',
+        *(
+            finish_response(
+                f'premature-finish-{index}',
+                task_kind='change',
+                summary='Finished despite the unresolved edit.',
+            )
+            for index in range(1, 4)
         ),
     )
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
-        max_completion_blocks=1,
     )
 
     events = collect_turn(conversation, 'Apply and verify all required edits')
@@ -574,21 +576,20 @@ def test_pending_write_failure_blocks_verified_finish(
         event.result
         for event in events
         if isinstance(event, ToolExecutionCompleted)
-        and event.tool_call.id == 'premature-finish'
+        and event.tool_call.id == 'premature-finish-1'
     )
     assert finish_result.error is not None
-    assert finish_result.error.code == 'finish_rejected'
-    reasons = finish_result.error.details['reasons']
-    assert any(
-        'workspace-write failure is still unresolved' in reason
-        for reason in reasons
-    )
+    assert finish_result.error.code == 'tool_not_available_in_phase'
+    assert 'finish_task' not in {
+        definition['name'] for definition in client.calls[3]['tools'] or ()
+    }
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'stuck'
-    assert completed.result.model_calls == 4
+    assert completed.result.model_calls == 6
     assert completed.result.verification is not None
     assert completed.result.verification.success is True
+    assert 'malformed or schema-invalid tool requests' in completed.result.text
     assert 'Finished despite the unresolved edit.' not in completed.result.text
 
 
@@ -824,9 +825,16 @@ def test_action_recovery_failed_edit_transfers_to_mutation_recovery(
         str(definition['name'])
         for definition in client.calls[2]['tools'] or ()
     }
-    assert 'verify' in mutation_tool_names
-    assert 'run_command' in mutation_tool_names
-    assert 'finish_task' in mutation_tool_names
+    assert {'read_file', 'grep', 'replace_text', 'apply_patch'} <= (
+        mutation_tool_names
+    )
+    assert 'verify' not in mutation_tool_names
+    assert 'run_command' not in mutation_tool_names
+    assert 'finish_task' not in mutation_tool_names
+    assert 'verify' in {
+        str(definition['name'])
+        for definition in client.calls[3]['tools'] or ()
+    }
 
 
 def test_process_modify_then_revert_does_not_reset_pre_mutation_budget(

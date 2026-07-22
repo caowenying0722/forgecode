@@ -843,14 +843,15 @@ def test_recovery_reads_do_not_consume_failed_edit_limit(
     assert '[Failed Mutation Recovery]' in client.calls[1]['system']
     assert 'patch_rejected' in client.calls[1]['system']
     assert 'target context did not match' in client.calls[1]['system']
-    assert all(
-        {'failing_write', 'read_file'}
-        <= {tool['name'] for tool in call['tools']}
-        for call in client.calls
-    )
+    assert {'failing_write', 'read_file'} <= {
+        tool['name'] for tool in client.calls[1]['tools']
+    }
+    assert {tool['name'] for tool in client.calls[2]['tools']} == {
+        'failing_write'
+    }
 
 
-def test_edit_recovery_suspends_global_stagnation(
+def test_edit_recovery_allows_one_read_then_blocks_repeated_reads(
     tmp_path: Path,
 ) -> None:
     write = FailingWriteTool(tmp_path)
@@ -873,23 +874,11 @@ def test_edit_recovery_suspends_global_stagnation(
                 arguments={'path': 'already-read.js'},
             )
         )
-        for index in range(6)
-    ]
-    remaining_failures = [
-        tool_response(
-            ToolCall(
-                index=0,
-                id=f'failed-write-{index}',
-                name='failing_write',
-                arguments={'path': f'world-{index}.js'},
-            )
-        )
-        for index in range(2, 6)
+        for index in range(4)
     ]
     client = FakeModelClient(
         first_failure,
         *replayed_reads,
-        *remaining_failures,
     )
     conversation = Conversation(
         client=client,
@@ -908,9 +897,49 @@ def test_edit_recovery_suspends_global_stagnation(
         event.result for event in events if isinstance(event, TurnCompleted)
     )
     assert result.status == 'stuck'
-    assert '5 workspace-write attempt(s)' in result.text
-    assert 'model calls without new workspace' not in result.text
-    assert len(client.calls) == 11
+    assert 'malformed or schema-invalid tool requests' in result.text
+    assert len(client.calls) == 5
+    assert {'failing_write', 'read_file'} <= {
+        tool['name'] for tool in client.calls[1]['tools']
+    }
+    assert all(
+        {tool['name'] for tool in call['tools']} == {'failing_write'}
+        for call in client.calls[2:]
+    )
+
+
+def test_turn_stops_at_cumulative_input_token_limit(
+    tmp_path: Path,
+) -> None:
+    tool = RecordingReadFileTool(tmp_path)
+    client = FakeModelClient(
+        tool_response(
+            ToolCall(0, 'read-one', 'read_file', {'path': 'one.js'}),
+            input_tokens=60,
+        ),
+        tool_response(
+            ToolCall(0, 'read-two', 'read_file', {'path': 'two.js'}),
+            input_tokens=60,
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry([tool]),
+        max_turn_input_tokens=100,
+        stagnation_warning=10,
+        stagnation_limit=20,
+    )
+
+    events = collect_turn(conversation, 'Inspect two files')
+
+    result = next(
+        event.result for event in events if isinstance(event, TurnCompleted)
+    )
+    assert result.status == 'stuck'
+    assert result.model_calls == 2
+    assert result.usage.input_tokens == 120
+    assert 'cumulative input-token limit of 100' in result.text
+    assert len(client.calls) == 2
 
 
 def test_failed_mutation_without_tracker_rejects_text_completion(
