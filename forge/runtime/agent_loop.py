@@ -92,8 +92,7 @@ class Conversation:
         stagnation_warning: int = 4,
         stagnation_limit: int = 8,
         completion_decision_limit: int = 8,
-        mutation_recovery_warning: int = 3,
-        mutation_recovery_limit: int = 8,
+        mutation_recovery_limit: int = 5,
         pre_mutation_limit: int = 8,
         action_recovery_limit: int = 3,
     ) -> None:
@@ -121,15 +120,8 @@ class Conversation:
             )
         if completion_decision_limit < 1:
             raise ValueError('completion_decision_limit must be positive')
-        if mutation_recovery_warning < 1:
-            raise ValueError(
-                'mutation_recovery_warning must be positive'
-            )
-        if mutation_recovery_limit <= mutation_recovery_warning:
-            raise ValueError(
-                'mutation_recovery_limit must be greater than '
-                'mutation_recovery_warning'
-            )
+        if mutation_recovery_limit < 1:
+            raise ValueError('mutation_recovery_limit must be positive')
         if pre_mutation_limit < 1:
             raise ValueError('pre_mutation_limit must be positive')
         if action_recovery_limit < 1:
@@ -193,7 +185,6 @@ class Conversation:
         self.stagnation_warning = stagnation_warning
         self.stagnation_limit = stagnation_limit
         self.completion_decision_limit = completion_decision_limit
-        self.mutation_recovery_warning = mutation_recovery_warning
         self.mutation_recovery_limit = mutation_recovery_limit
         self.pre_mutation_limit = pre_mutation_limit
         self.action_recovery_limit = action_recovery_limit
@@ -246,7 +237,6 @@ class Conversation:
         action_recovery_calls = 0
         action_read_used = False
         action_block_events = 0
-        mutation_recovery_calls = 0
         mutation_failure_count = 0
         mutation_failures: list[dict[str, Any]] = []
         mutation_recovery_context = ''
@@ -616,52 +606,32 @@ class Conversation:
 
             if not tool_calls:
                 if mutation_failures:
-                    mutation_recovery_calls += 1
-                    mutation_recovery_context = (
-                        render_mutation_recovery_context(
-                            mutation_failures,
-                            mutation_recovery_calls,
-                            mutation_failure_count,
+                    reason = (
+                        f'Stopped after {mutation_failure_count} failed '
+                        'workspace-write attempt(s) because the model '
+                        'returned text without correcting the latest edit '
+                        'failure.'
+                    )
+                    self.task_manager.stuck((reason,))
+                    self.messages[:] = request_messages
+                    yield TurnCompleted(
+                        result=TurnResult(
+                            text=reason,
+                            usage=completed_usage,
+                            last_request_usage=request_usage,
+                            model_calls=iteration,
+                            tool_calls=tuple(all_tool_calls),
+                            status='stuck',
+                            changed_paths=(
+                                self.workspace_tracker.changed_paths
+                                if self.workspace_tracker is not None
+                                else ()
+                            ),
+                            verification=latest_verification,
+                            completion_reasons=(reason,),
                         )
                     )
-                    if (
-                        mutation_recovery_calls
-                        >= self.mutation_recovery_limit
-                    ):
-                        reason = mutation_recovery_stuck_reason(
-                            mutation_failures,
-                            mutation_recovery_calls,
-                            mutation_failure_count,
-                        )
-                        self.task_manager.stuck((reason,))
-                        self.messages[:] = request_messages
-                        yield TurnCompleted(
-                            result=TurnResult(
-                                text=reason,
-                                usage=completed_usage,
-                                last_request_usage=request_usage,
-                                model_calls=iteration,
-                                tool_calls=tuple(all_tool_calls),
-                                status='stuck',
-                                changed_paths=(
-                                    self.workspace_tracker.changed_paths
-                                    if self.workspace_tracker is not None
-                                    else ()
-                                ),
-                                verification=latest_verification,
-                                completion_reasons=(reason,),
-                            )
-                        )
-                        return
-                    request_messages.append(
-                        build_mutation_recovery_feedback(
-                            mutation_failures,
-                            mutation_recovery_calls,
-                            mutation_failure_count,
-                            self.task_manager.system_suffix(),
-                        )
-                    )
-                    continue
+                    return
                 if self._pending_required_change(change_required):
                     if action_recovery:
                         action_recovery_calls += 1
@@ -879,6 +849,13 @@ class Conversation:
                     and tool_call.arguments.get('task_kind') == 'change'
                 ):
                     change_required = True
+                if (
+                    tool_effect == 'workspace_write'
+                    and self.workspace_tracker is not None
+                ):
+                    self.workspace_tracker.watch_paths(
+                        mutation_target_paths(tool_call)
+                    )
                 action_read_call = (
                     action_recovery
                     and tool_call.name in ACTION_RECOVERY_READ_TOOLS
@@ -1142,7 +1119,6 @@ class Conversation:
             if batch_reverted_to_baseline:
                 workspace_progressed = False
             if workspace_progressed:
-                mutation_recovery_calls = 0
                 mutation_failure_count = 0
                 mutation_failures.clear()
                 mutation_recovery_context = ''
@@ -1160,7 +1136,11 @@ class Conversation:
                 (call, result)
                 for position, call, result, changed
                 in workspace_write_results
-                if position > last_workspace_change_position and not changed
+                if (
+                    position > last_workspace_change_position
+                    and not changed
+                    and not is_tool_protocol_failure(result)
+                )
             ]
             if batch_reverted_to_baseline and workspace_write_results:
                 _, last_call, last_result, _ = workspace_write_results[-1]
@@ -1179,11 +1159,9 @@ class Conversation:
                 action_recovery = False
                 action_recovery_calls = 0
                 action_read_used = False
-                mutation_recovery_calls += 1
                 mutation_recovery_context = (
                     render_mutation_recovery_context(
                         mutation_failures,
-                        mutation_recovery_calls,
                         mutation_failure_count,
                     )
                 )
@@ -1191,30 +1169,16 @@ class Conversation:
                     request_messages.append(
                         build_mutation_recovery_feedback(
                             mutation_failures,
-                            mutation_recovery_calls,
-                            mutation_failure_count,
-                            self.task_manager.system_suffix(),
-                        )
-                    )
-                elif (
-                    mutation_recovery_calls
-                    == self.mutation_recovery_warning
-                ):
-                    request_messages.append(
-                        build_mutation_recovery_feedback(
-                            mutation_failures,
-                            mutation_recovery_calls,
                             mutation_failure_count,
                             self.task_manager.system_suffix(),
                         )
                     )
                 if (
-                    mutation_recovery_calls
+                    mutation_failure_count
                     >= self.mutation_recovery_limit
                 ):
                     reason = mutation_recovery_stuck_reason(
                         mutation_failures,
-                        mutation_recovery_calls,
                         mutation_failure_count,
                     )
                     self.task_manager.stuck((reason,))
@@ -1381,6 +1345,7 @@ class Conversation:
                     build_tool_protocol_feedback(
                         tool_protocol_failures,
                         self.task_manager.system_suffix(),
+                        tool_results,
                     )
                 )
                 if (
@@ -1412,6 +1377,12 @@ class Conversation:
                         )
                     )
                     return
+            elif mutation_failures:
+                # Edit Recovery exclusively owns progress limits while a
+                # workspace-write failure remains unresolved. Reads and
+                # searches may guide the corrected edit without also
+                # consuming the global Stagnation budget.
+                calls_without_progress = 0
             else:
                 calls_without_progress += 1
             if calls_without_progress == self.stagnation_warning:
@@ -1692,9 +1663,6 @@ class Conversation:
             or gate is None
             or not tracker.changed_paths
             or mutation_failures
-            or verification is None
-            or not verification.success
-            or verification.workspace_revision != tracker.revision
         ):
             return False
         task = self.task_manager.active
@@ -2064,17 +2032,16 @@ def render_completion_ready_context(
     '''Persist the mechanically complete revision and decision budget.'''
     changed = ', '.join(changed_paths)
     reviewed = ', '.join(sorted(reviewed_paths)) or 'none'
-    command = verification.command if verification is not None else 'unknown'
-    revision = (
-        verification.workspace_revision
+    verification_status = (
+        f'{verification.command} @ revision {verification.workspace_revision}'
         if verification is not None
-        else 'unknown'
+        else 'not required / not run'
     )
     remaining = max(decision_limit - decision_calls, 0)
     return (
         '[ForgeCode Completion Ready]\n'
         f'changed paths: {changed}\n'
-        f'current verification: {command} @ revision {revision}\n'
+        f'current verification: {verification_status}\n'
         f'reviewed Diff paths: {reviewed}\n'
         f'decision calls remaining: {remaining}\n'
         'Deterministic completion checks pass for the current revision. '
@@ -2094,11 +2061,10 @@ def build_finalization_recovery_feedback(
     verification: VerificationEvidence | None,
 ) -> dict[str, Any]:
     '''Request one bounded, tool-free synthesis after a ready-state loop.'''
-    command = verification.command if verification is not None else 'unknown'
-    revision = (
-        verification.workspace_revision
+    verification_status = (
+        f'{verification.command} @ revision {verification.workspace_revision}'
         if verification is not None
-        else 'unknown'
+        else 'not required / not run'
     )
     changed = ', '.join(changed_paths)
     return {
@@ -2112,7 +2078,7 @@ def build_finalization_recovery_feedback(
             'synthesis with no tools. Return a concise final answer in the '
             'user\'s language. Summarize the actual changed paths '
             f'({changed}) and verification '
-            f'({command} @ revision {revision}). State any semantic or visual '
+            f'({verification_status}). State any semantic or visual '
             'limitation honestly. Do not request another tool call.'
         ),
     }
@@ -2188,13 +2154,12 @@ def mutation_target_paths(tool_call: ToolCall) -> tuple[str, ...]:
 
 def render_mutation_recovery_context(
     failures: list[dict[str, Any]],
-    recovery_calls: int,
     failure_count: int,
 ) -> str:
     '''Render durable failure state outside compactable chat history.'''
     lines = [
         '[Failed Mutation Recovery]',
-        f'failed writes: {failure_count}; recovery calls: {recovery_calls}',
+        f'failed workspace writes: {failure_count}',
     ]
     for failure in failures:
         targets = ', '.join(failure['targets']) or 'unknown target'
@@ -2206,9 +2171,11 @@ def render_mutation_recovery_context(
         if diagnostic:
             lines.append(f'  diagnostic: {diagnostic}')
     lines.append(
-        'The goal and all tools remain active. Do not restart broad '
-        'discovery or re-read covered files. Inspect only missing target '
-        'lines, then retry one smaller corrected edit.'
+        'All normal tools remain available. Do not restart broad discovery. '
+        'If the latest diagnostic includes Closest current text, copy it '
+        'verbatim as the next old_text and do not re-read that region. Only '
+        'when no exact candidate is supplied, make one targeted read before '
+        'retrying a smaller corrected edit.'
     )
     lines.append(
         'apply_patch accepts unified diff and Begin Patch; use replace_text '
@@ -2219,14 +2186,12 @@ def render_mutation_recovery_context(
 
 def build_mutation_recovery_feedback(
     failures: list[dict[str, Any]],
-    recovery_calls: int,
     failure_count: int,
     task_context: str,
 ) -> dict[str, Any]:
     '''Put the recovery checkpoint after a failed write result.'''
     context = render_mutation_recovery_context(
         failures,
-        recovery_calls,
         failure_count,
     )
     return {
@@ -2237,7 +2202,6 @@ def build_mutation_recovery_feedback(
 
 def mutation_recovery_stuck_reason(
     failures: list[dict[str, Any]],
-    recovery_calls: int,
     failure_count: int,
 ) -> str:
     latest = failures[-1] if failures else {}
@@ -2245,8 +2209,8 @@ def mutation_recovery_stuck_reason(
     code = str(latest.get('code', 'no_workspace_change'))
     return (
         f'Stopped after {failure_count} workspace-write attempt(s) failed '
-        f'to change the task workspace and {recovery_calls} model calls '
-        f'passed in edit recovery. Latest failure: {tool} [{code}].'
+        'to change the task workspace; the Edit Recovery failure limit was '
+        f'reached. Latest failure: {tool} [{code}].'
     )
 
 
@@ -2261,6 +2225,7 @@ def is_tool_protocol_failure(result: ToolResult) -> bool:
             'finish_must_be_alone',
             'unsupported_shell_syntax',
             'invalid_pattern',
+            'patch_contains_read_line_numbers',
             'git_diff_path_is_directory',
             'tool_not_available_in_phase',
             'action_read_limit_reached',
@@ -2271,15 +2236,31 @@ def is_tool_protocol_failure(result: ToolResult) -> bool:
 def build_tool_protocol_feedback(
     failures: int,
     task_context: str,
+    tool_results: list[tuple[ToolCall, ToolResult]] | None = None,
 ) -> dict[str, Any]:
+    diagnostics: list[str] = []
+    for tool_call, result in tool_results or ():
+        if result.error is None:
+            continue
+        message = result.error.message
+        if len(message) > 1_500:
+            message = f'{message[:1_497]}...'
+        diagnostics.append(f'- {tool_call.name}: {message}')
+    rendered_diagnostics = (
+        '\nExact rejection(s):\n' + '\n'.join(diagnostics) + '\n'
+        if diagnostics
+        else ''
+    )
     return {
         'role': 'user',
         'content': (
             f'{task_context}\n\n'
             'The previous tool request was rejected at the argument/schema '
             'boundary. This does not mean the repository task is blocked. '
-            'Read the structured error, use only the allowed fields, and '
-            'retry with valid JSON or choose another tool. '
+            f'{rendered_diagnostics}'
+            'Follow the exact recovery instruction above, change the '
+            'arguments materially, and retry with valid JSON or choose '
+            'another tool. Do not repeat the rejected payload. '
             f'Protocol recovery count: {failures}.'
         ),
     }

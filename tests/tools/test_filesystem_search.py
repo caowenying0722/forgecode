@@ -1,12 +1,14 @@
 '''Tests for repository filesystem and search tools.'''
 
 import asyncio
+import hashlib
 from pathlib import Path
 
 from forge.tools.filesystem import (
     ListDirectoryTool,
     ReadFileTool,
     ReplaceTextTool,
+    WriteFileChunkTool,
     WriteFileTool,
 )
 from forge.tools.search import FindFilesTool, GrepTool
@@ -219,12 +221,12 @@ def test_write_file_creates_and_atomically_replaces_small_text(
     assert not list(tmp_path.glob('*.forge-tmp'))
 
 
-def test_write_file_rejects_content_over_8000_characters(
+def test_write_file_rejects_content_over_30000_characters(
     tmp_path: Path,
 ) -> None:
     result = run(
         WriteFileTool(tmp_path).run(
-            {'path': 'large.html', 'content': 'x' * 8_001}
+            {'path': 'large.html', 'content': 'x' * 30_001}
         )
     )
 
@@ -232,6 +234,79 @@ def test_write_file_rejects_content_over_8000_characters(
     assert result.error is not None
     assert result.error.code == 'invalid_arguments'
     assert not (tmp_path / 'large.html').exists()
+
+
+def test_write_file_chunk_assembles_ordered_chunks_atomically(
+    tmp_path: Path,
+) -> None:
+    tool = WriteFileChunkTool(tmp_path)
+    first_content = 'a' * 20_000
+    second_content = '世界' * 6_000
+    complete = first_content + second_content
+    digest = hashlib.sha256(complete.encode('utf-8')).hexdigest()
+
+    first = run(
+        tool.run(
+            {
+                'path': 'large.js',
+                'content': first_content,
+                'offset': 0,
+                'truncate': True,
+            }
+        )
+    )
+    second = run(
+        tool.run(
+            {
+                'path': 'large.js',
+                'content': second_content,
+                'offset': first.metadata['next_offset'],
+                'final': True,
+                'expected_sha256': digest,
+            }
+        )
+    )
+
+    assert first.success is True
+    assert first.metadata['next_offset'] == 20_000
+    assert second.success is True
+    assert second.metadata['next_offset'] == 32_000
+    assert second.metadata['sha256'] == digest
+    assert (tmp_path / 'large.js').read_text(encoding='utf-8') == complete
+    assert not list(tmp_path.glob('*.forge-tmp'))
+
+
+def test_write_file_chunk_rejects_offset_and_hash_without_writing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / 'large.js'
+    path.write_text('original', encoding='utf-8')
+    tool = WriteFileChunkTool(tmp_path)
+
+    wrong_offset = run(
+        tool.run({'path': 'large.js', 'content': 'x', 'offset': 3})
+    )
+    wrong_hash = run(
+        tool.run(
+            {
+                'path': 'new.js',
+                'content': 'payload',
+                'offset': 0,
+                'truncate': True,
+                'final': True,
+                'expected_sha256': '0' * 64,
+            }
+        )
+    )
+
+    assert wrong_offset.success is False
+    assert wrong_offset.error is not None
+    assert wrong_offset.error.code == 'chunk_offset_mismatch'
+    assert path.read_text(encoding='utf-8') == 'original'
+    assert wrong_hash.success is False
+    assert wrong_hash.error is not None
+    assert wrong_hash.error.code == 'chunk_hash_mismatch'
+    assert not (tmp_path / 'new.js').exists()
 
 
 def test_replace_text_requires_one_exact_occurrence(tmp_path: Path) -> None:
@@ -262,7 +337,36 @@ def test_replace_text_requires_one_exact_occurrence(tmp_path: Path) -> None:
     assert 'gravity = 0.08' in path.read_text(encoding='utf-8')
     assert missing.success is False
     assert missing.error is not None
-    assert missing.error.code == 'text_not_unique'
+    assert missing.error.code == 'text_not_found'
+    assert missing.error.details['occurrences'] == 0
+
+
+def test_replace_text_reports_whitespace_only_near_miss(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / 'game.js'
+    path.write_text('  const hp = 130 + wave * 18;\n', encoding='utf-8')
+
+    result = run(
+        ReplaceTextTool(tmp_path).run(
+            {
+                'path': 'game.js',
+                'old_text': 'const hp = 130 +wave * 18;',
+                'new_text': 'const hp = 150 + wave * 18;',
+            }
+        )
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'text_not_found'
+    assert result.error.details['whitespace_only_mismatch'] is True
+    assert result.error.details['closest_start_line'] == 1
+    assert result.error.details['closest_text'] == (
+        '  const hp = 130 + wave * 18;'
+    )
+    assert 'copy exactly as the next old_text' in result.error.message
+    assert '  const hp = 130 + wave * 18;' in result.error.message
 
 
 def test_replace_text_preserves_crlf_and_normalizes_replacement_lines(

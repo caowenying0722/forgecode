@@ -103,7 +103,38 @@ def test_workspace_tracker_detects_untracked_files_and_reverts(
     assert tracker.changed_paths == ()
 
 
-def test_completion_gate_requires_current_successful_verification(
+def test_workspace_tracker_watches_ignored_write_targets(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    (tmp_path / '.gitignore').write_text('ignored/\n', encoding='utf-8')
+    subprocess.run(['git', 'add', '.gitignore'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'ignore generated files'],
+        cwd=tmp_path,
+        check=True,
+    )
+    ignored = tmp_path / 'ignored'
+    ignored.mkdir()
+    existing = ignored / 'app.js'
+    existing.write_text('old\n', encoding='utf-8')
+    tracker = WorkspaceTracker(tmp_path)
+
+    run(tracker.begin_turn())
+    tracker.watch_paths(('ignored/app.js', 'ignored/new.js'))
+    existing.write_text('changed\n', encoding='utf-8')
+    (ignored / 'new.js').write_text('created\n', encoding='utf-8')
+    change = run(tracker.refresh())
+    unchanged = run(tracker.refresh())
+
+    assert change is not None
+    assert change.revision == 1
+    assert change.paths == ('ignored/app.js', 'ignored/new.js')
+    assert tracker.changed_paths == ('ignored/app.js', 'ignored/new.js')
+    assert unchanged is None
+
+
+def test_completion_gate_requires_verification_only_when_policy_requests_it(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -111,7 +142,10 @@ def test_completion_gate_requires_current_successful_verification(
     run(tracker.begin_turn())
     (tmp_path / 'sample.txt').write_text('changed\n', encoding='utf-8')
     run(tracker.refresh())
-    gate = CompletionGate(tmp_path)
+    gate = CompletionGate(
+        tmp_path,
+        TaskPolicy(require_verification=True),
+    )
 
     missing = run(gate.evaluate(tracker, None, mutation_attempted=False))
     current = VerificationEvidence(
@@ -134,6 +168,55 @@ def test_completion_gate_requires_current_successful_verification(
     assert accepted.allowed is True
     assert stale.allowed is False
     assert any('changed after verification' in item for item in stale.reasons)
+
+
+def test_completion_gate_allows_unverified_diff_by_default(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    (tmp_path / 'sample.txt').write_text('changed\n', encoding='utf-8')
+    run(tracker.refresh())
+
+    decision = run(
+        CompletionGate(tmp_path).evaluate(
+            tracker,
+            None,
+            mutation_attempted=False,
+        )
+    )
+
+    assert decision.allowed is True
+
+
+def test_completion_gate_blocks_current_optional_verification_failure(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    (tmp_path / 'sample.txt').write_text('changed\n', encoding='utf-8')
+    run(tracker.refresh())
+    failed = VerificationEvidence(
+        command='pytest',
+        cwd='.',
+        exit_code=1,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=1,
+    )
+
+    decision = run(
+        CompletionGate(tmp_path).evaluate(
+            tracker,
+            failed,
+            mutation_attempted=False,
+        )
+    )
+
+    assert decision.allowed is False
+    assert 'latest verification failed' in decision.reasons[0]
 
 
 def test_completion_gate_ignores_unrelated_preexisting_whitespace_errors(

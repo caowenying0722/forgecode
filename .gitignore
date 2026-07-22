@@ -14,5 +14,5 @@ target/
 **/.forge/context/
 **/.forge/tasks/
 fixtures/
-game/
+# game/
 play/

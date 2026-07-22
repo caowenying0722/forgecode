@@ -221,6 +221,7 @@ def test_terminal_renders_tool_arguments_and_result_status() -> None:
             ToolResult.fail(
                 'command_failed',
                 'Command exited with code 1.',
+                content='pytest: assertion failed at test_game.py:42',
             ),
         )
 
@@ -231,6 +232,7 @@ def test_terminal_renders_tool_arguments_and_result_status() -> None:
     assert 'run_command {"command": "pytest"}' in rendered
     assert '×' in rendered
     assert 'Command exited with code 1.' in rendered
+    assert 'pytest: assertion failed at test_game.py:42' in rendered
 
 
 def test_terminal_places_tool_group_between_model_text_blocks() -> None:

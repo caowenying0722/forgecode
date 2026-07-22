@@ -31,7 +31,7 @@ class CompletionDecision:
 
 
 class CompletionGate:
-    '''Reject final answers that lack current, successful evidence.'''
+    '''Reject final answers that violate the active task policy.'''
 
     def __init__(
         self,
@@ -74,10 +74,7 @@ class CompletionGate:
 
         reasons.extend(self._path_violations(changed_paths))
 
-        verification_required = self.policy.require_verification or bool(
-            changed_paths
-        )
-        if verification_required:
+        if self.policy.require_verification:
             if verification is None:
                 reasons.append(
                     'The current code has not been verified with the verify tool.'
@@ -92,6 +89,15 @@ class CompletionGate:
                     'The code changed after verification; run verify again for '
                     f'workspace revision {tracker.revision}.'
                 )
+        elif (
+            verification is not None
+            and verification.workspace_revision == tracker.revision
+            and not verification.success
+        ):
+            reasons.append(
+                f'The latest verification failed with exit code '
+                f'{verification.exit_code}.'
+            )
 
         if changed_paths and tracker.available:
             reasons.extend(

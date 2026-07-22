@@ -99,6 +99,89 @@ class ToolExecutionError(RuntimeError):
 InputT = TypeVar('InputT', bound=ToolInput)
 
 
+def _validation_location(error: dict[str, Any]) -> str:
+    '''Render one Pydantic error location for a model-facing diagnostic.'''
+    location = error.get('loc', ())
+    return '.'.join(str(part) for part in location) or 'arguments'
+
+
+def _argument_at_location(
+    arguments: Mapping[str, Any],
+    location: tuple[Any, ...],
+) -> Any:
+    '''Return the original value named by a Pydantic error location.'''
+    value: Any = arguments
+    for part in location:
+        if isinstance(value, Mapping) and part in value:
+            value = value[part]
+        elif (
+            isinstance(value, (list, tuple))
+            and isinstance(part, int)
+            and 0 <= part < len(value)
+        ):
+            value = value[part]
+        else:
+            return None
+    return value
+
+
+def _validation_problem(
+    error: dict[str, Any],
+    arguments: Mapping[str, Any],
+) -> str:
+    '''Turn one Pydantic error into a concise actionable explanation.'''
+    location = _validation_location(error)
+    error_type = error.get('type')
+    context = error.get('ctx') or {}
+    value = _argument_at_location(
+        arguments,
+        tuple(error.get('loc', ())),
+    )
+    if error_type == 'missing':
+        return f'`{location}` is required but missing'
+    if error_type == 'extra_forbidden':
+        return f'`{location}` is not an allowed argument'
+    if error_type == 'string_too_long':
+        maximum = context.get('max_length', 'the configured limit')
+        actual = len(value) if isinstance(value, str) else 'unknown'
+        return (
+            f'`{location}` has {actual} characters; maximum is {maximum}'
+        )
+    if error_type == 'string_too_short':
+        minimum = context.get('min_length', 'the configured minimum')
+        actual = len(value) if isinstance(value, str) else 'unknown'
+        return (
+            f'`{location}` has {actual} characters; minimum is {minimum}'
+        )
+    message = error.get('msg', 'invalid value')
+    return f'`{location}`: {message}'
+
+
+def _validation_recovery_hint(
+    tool_name: str,
+    errors: list[dict[str, Any]],
+) -> str:
+    '''Give the model a concrete next action for common schema failures.'''
+    error_types = {str(error.get('type')) for error in errors}
+    if 'string_too_long' in error_types:
+        if tool_name == 'write_file':
+            return (
+                'Use write_file_chunk with content within the per-call limit. '
+                'Start with offset=0 and truncate=true, then use each '
+                'returned next_offset for the following chunk.'
+            )
+        if tool_name == 'apply_patch':
+            return 'Split the change into multiple focused patches.'
+        if tool_name == 'replace_text':
+            return 'Split the replacement into multiple smaller edits.'
+        return 'Split the value across multiple supported tool calls.'
+    if 'extra_forbidden' in error_types:
+        return 'Remove arguments that are not in the allowed field list.'
+    if 'missing' in error_types:
+        return 'Add every required argument before retrying.'
+    return 'Correct the listed values before retrying.'
+
+
 class Tool(ABC, Generic[InputT]):
     '''Validate model input and convert all failures to ToolResult.'''
 
@@ -132,6 +215,22 @@ class Tool(ABC, Generic[InputT]):
             allowed = sorted(properties)
             required = sorted(schema.get('required', []))
             unknown = sorted(set(arguments) - set(properties))
+            validation_errors = error.errors(
+                include_url=False,
+                include_input=False,
+            )
+            problems = '; '.join(
+                _validation_problem(item, arguments)
+                for item in validation_errors[:5]
+            )
+            if len(validation_errors) > 5:
+                problems += (
+                    f'; and {len(validation_errors) - 5} more problem(s)'
+                )
+            recovery_hint = _validation_recovery_hint(
+                self.name,
+                validation_errors,
+            )
             separator = ', '
             empty = 'none'
             return ToolResult.fail(
@@ -140,16 +239,15 @@ class Tool(ABC, Generic[InputT]):
                     f'Invalid arguments for tool {self.name}. '
                     f'Allowed arguments: {separator.join(allowed) or empty}. '
                     f'Required arguments: '
-                    f'{separator.join(required) or empty}.'
+                    f'{separator.join(required) or empty}. '
+                    f'Problems: {problems}. Recovery: {recovery_hint}'
                 ),
                 details={
                     'allowed_arguments': allowed,
                     'required_arguments': required,
                     'unknown_arguments': unknown,
-                    'validation_errors': error.errors(
-                        include_url=False,
-                        include_input=False,
-                    )
+                    'validation_errors': validation_errors,
+                    'recovery_hint': recovery_hint,
                 },
             )
 

@@ -201,6 +201,7 @@ def test_agent_loop_rejects_early_answer_then_accepts_verify_evidence(
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
     )
     events = collect_turn(conversation, 'Change and verify sample.txt')
     completed = events[-1]
@@ -214,6 +215,43 @@ def test_agent_loop_rejects_early_answer_then_accepts_verify_evidence(
     assert completed.result.verification.success is True
     feedback = str(client.calls[2]['messages'][-1]['content'])
     assert 'has not been verified' in feedback
+
+
+def test_default_policy_can_finish_a_valid_diff_without_verify(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'toolu_default_edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        finish_response(
+            'finish_without_verify',
+            task_kind='change',
+            summary='Implemented the requested change.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(conversation, 'Change sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.changed_paths == ('sample.txt',)
+    assert completed.result.verification is None
+    assert not any(isinstance(item, CompletionBlocked) for item in events)
 
 
 def test_replayed_game_evidence_can_progress_to_edit_and_verification(
@@ -378,7 +416,7 @@ def test_failed_patch_recovers_to_valid_begin_patch_and_completion(
     assert completed.result.changed_paths == ('sample.txt',)
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
     assert '[Failed Mutation Recovery]' in client.calls[1]['system']
-    assert 'patch_rejected' in client.calls[1]['system']
+    assert 'patch_context_not_found' in client.calls[1]['system']
     assert '[Failed Mutation Recovery]' not in client.calls[3]['system']
 
 
@@ -415,7 +453,6 @@ def test_write_then_revert_to_baseline_enters_edit_recovery(
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
-        mutation_recovery_warning=1,
         mutation_recovery_limit=2,
     )
 
@@ -462,7 +499,6 @@ def test_later_write_failure_in_same_response_remains_in_recovery(
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
-        mutation_recovery_warning=1,
         mutation_recovery_limit=2,
     )
 
@@ -475,14 +511,14 @@ def test_later_write_failure_in_same_response_remains_in_recovery(
         and event.tool_call.id == 'later-failed-edit'
     )
     assert failed_result.error is not None
-    assert failed_result.error.code == 'text_not_unique'
+    assert failed_result.error.code == 'text_not_found'
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'stuck'
     assert completed.result.model_calls == 2
     assert completed.result.changed_paths == ('sample.txt',)
     assert '[Failed Mutation Recovery]' in client.calls[1]['system']
-    assert 'text_not_unique' in client.calls[1]['system']
+    assert 'text_not_found' in client.calls[1]['system']
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
 
 
@@ -790,6 +826,7 @@ def test_action_recovery_failed_edit_transfers_to_mutation_recovery(
     }
     assert 'verify' in mutation_tool_names
     assert 'run_command' in mutation_tool_names
+    assert 'finish_task' in mutation_tool_names
 
 
 def test_process_modify_then_revert_does_not_reset_pre_mutation_budget(
@@ -1156,6 +1193,7 @@ def test_verified_change_stagnation_allows_final_summary_recovery(
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
     )
 
     events = collect_turn(conversation, 'Change and verify sample.txt')
@@ -1178,6 +1216,54 @@ def test_verified_change_stagnation_allows_final_summary_recovery(
     assert 'Runtime Tool Availability' not in (
         client.calls[-1]['system'] or ''
     )
+
+
+def test_unverified_change_stagnation_allows_final_summary_recovery(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'unverified-convergence-edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    initial_diff = ToolCall(0, 'unverified-initial-diff', 'git_diff', {})
+    redundant_diffs = [
+        ToolCall(0, f'unverified-redundant-diff-{index}', 'git_diff', {})
+        for index in range(1, 9)
+    ]
+    summary = 'Updated sample.txt; no verification was required or run.'
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(initial_diff),
+        *(response_with_tool(call) for call in redundant_diffs),
+        text_response(summary),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(conversation, 'Change sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert completed.result.changed_paths == ('sample.txt',)
+    assert completed.result.verification is None
+    assert client.calls[-1]['tools'] is None
+    final_request = (
+        (client.calls[-1]['system'] or '')
+        + str(client.calls[-1]['messages'])
+    )
+    assert '[ForgeCode Finalization Recovery]' in final_request
+    assert 'not required / not run' in final_request
 
 
 def test_novel_repository_evidence_cannot_extend_completion_ready_loop(
@@ -1228,6 +1314,7 @@ def test_novel_repository_evidence_cannot_extend_completion_ready_loop(
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
     )
 
     events = collect_turn(conversation, 'Change and verify sample.txt')
@@ -1277,6 +1364,7 @@ def test_finalization_recovery_stops_after_one_more_redundant_diff(
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
     )
 
     events = collect_turn(conversation, 'Change and verify sample.txt')
@@ -1587,6 +1675,7 @@ def test_agent_loop_stops_after_three_completion_rejections(
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
     )
     events = collect_turn(conversation, 'Change sample.txt')
 
@@ -1715,6 +1804,7 @@ def test_empty_response_after_completion_rejection_is_stuck(
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
     )
 
     events = collect_turn(conversation, 'Change and verify sample.txt')

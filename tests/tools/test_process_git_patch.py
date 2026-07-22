@@ -442,6 +442,70 @@ def test_apply_patch_codex_envelope_preserves_crlf(
     )
 
 
+def test_apply_patch_classifies_missing_codex_context(tmp_path: Path) -> None:
+    initialize_git_repository(tmp_path)
+    envelope = (
+        '*** Begin ' 'Patch\n'
+        '*** Update File: sample.txt\n'
+        '@@\n'
+        '-not current\n'
+        '+new\n'
+        '*** End ' 'Patch'
+    )
+
+    result = run(ApplyPatchTool(tmp_path).run({'patch': envelope}))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'patch_context_not_found'
+    assert result.error.details['recommended_tool'] == 'read_file'
+
+
+def test_apply_patch_detects_copied_read_file_line_numbers(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    envelope = (
+        '*** Begin ' 'Patch\n'
+        '*** Update File: sample.txt\n'
+        '@@\n'
+        '-    99 | old\n'
+        '+    99 | new\n'
+        '*** End ' 'Patch'
+    )
+
+    result = run(ApplyPatchTool(tmp_path).run({'patch': envelope}))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'patch_contains_read_line_numbers'
+    assert result.error.details['prefixed_lines'] == 1
+    assert 'Remove the line number' in result.content
+
+
+def test_apply_patch_classifies_ambiguous_codex_context(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    repeated = tmp_path / 'repeated.txt'
+    repeated.write_text('same\nsame\n', encoding='utf-8')
+    envelope = (
+        '*** Begin ' 'Patch\n'
+        '*** Update File: repeated.txt\n'
+        '@@\n'
+        '-same\n'
+        '+changed\n'
+        '*** End ' 'Patch'
+    )
+
+    result = run(ApplyPatchTool(tmp_path).run({'patch': envelope}))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'patch_context_ambiguous'
+    assert result.error.details['occurrences'] == 2
+
+
 def test_apply_patch_codex_envelope_supports_add_and_delete(
     tmp_path: Path,
 ) -> None:
@@ -584,16 +648,16 @@ def test_apply_patch_description_requires_small_focused_writes(
 ) -> None:
     description = ApplyPatchTool(tmp_path).definition['description']
 
-    assert 'limited to 8000 characters' in description
+    assert 'limited to 30000 characters' in description
     assert 'split large HTML' in description
     assert 'Codex envelope' in description
     assert 'Use write_file only for small full-file content' in description
 
 
-def test_apply_patch_rejects_payload_over_8000_characters(
+def test_apply_patch_rejects_payload_over_30000_characters(
     tmp_path: Path,
 ) -> None:
-    result = run(ApplyPatchTool(tmp_path).run({'patch': 'x' * 8_001}))
+    result = run(ApplyPatchTool(tmp_path).run({'patch': 'x' * 30_001}))
 
     assert result.success is False
     assert result.error is not None

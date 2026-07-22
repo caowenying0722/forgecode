@@ -31,15 +31,40 @@ class WorkspaceTracker:
         self.current = WorkspaceSnapshot()
         self.revision = 0
         self.available = False
+        self._watched_paths: set[str] = set()
 
     async def begin_turn(self) -> None:
         '''Use the current working tree as the immutable baseline for one turn.'''
+        self._watched_paths.clear()
         snapshot = await self._capture()
         self.available = snapshot is not None
         resolved = snapshot or WorkspaceSnapshot()
         self.baseline = resolved
         self.current = resolved
         self.revision = 0
+
+    def watch_paths(self, paths: tuple[str, ...]) -> None:
+        '''Capture task baselines for tool targets, including ignored files.'''
+        for raw_path in paths:
+            candidate = Path(raw_path)
+            if candidate.is_absolute():
+                continue
+            resolved = (self.root / candidate).resolve(strict=False)
+            try:
+                relative = resolved.relative_to(self.root)
+            except ValueError:
+                continue
+            normalized = normalize_path(str(relative))
+            if normalized in self._watched_paths:
+                continue
+            fingerprint = fingerprint_path(self.root, normalized)
+            self._watched_paths.add(normalized)
+            self.baseline = WorkspaceSnapshot(
+                files={**self.baseline.files, normalized: fingerprint}
+            )
+            self.current = WorkspaceSnapshot(
+                files={**self.current.files, normalized: fingerprint}
+            )
 
     async def refresh(self) -> WorkspaceChange | None:
         '''Capture tool-caused changes and advance the revision when needed.'''
@@ -84,6 +109,8 @@ class WorkspaceTracker:
             path: fingerprint_path(self.root, path)
             for path in parse_porcelain_paths(result.stdout)
         }
+        for path in self._watched_paths:
+            files[path] = fingerprint_path(self.root, path)
         return WorkspaceSnapshot(files=files)
 
 

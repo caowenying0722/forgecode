@@ -20,6 +20,7 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'read_file',
         'grep',
         'write_file',
+        'write_file_chunk',
         'replace_text',
         'apply_patch',
         'run_command',
@@ -37,6 +38,7 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
     )
     assert registry.effect('read_file') == 'read_only'
     assert registry.effect('write_file') == 'workspace_write'
+    assert registry.effect('write_file_chunk') == 'workspace_write'
     assert registry.effect('replace_text') == 'workspace_write'
     assert registry.effect('apply_patch') == 'workspace_write'
     assert registry.effect('run_command') == 'process'
@@ -82,6 +84,32 @@ def test_tool_validation_failure_does_not_raise(tmp_path: Path) -> None:
     assert result.error.details['unknown_arguments'] == ['unexpected']
     assert result.error.details['validation_errors'][0]['type'] == (
         'extra_forbidden'
+    )
+
+
+def test_tool_validation_failure_explains_oversized_content(
+    tmp_path: Path,
+) -> None:
+    registry = create_default_registry(tmp_path)
+
+    result = run(
+        registry.execute(
+            'write_file',
+            {'path': 'large.js', 'content': 'x' * 30_001},
+        )
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'invalid_arguments'
+    assert '`content` has 30001 characters; maximum is 30000' in (
+        result.error.message
+    )
+    assert 'Use write_file_chunk' in (
+        result.error.message
+    )
+    assert result.error.details['recovery_hint'].startswith(
+        'Use write_file_chunk'
     )
 
 

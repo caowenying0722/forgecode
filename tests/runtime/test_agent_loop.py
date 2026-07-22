@@ -133,6 +133,21 @@ class NoOpWriteTool(RecordingReadFileTool):
     effect = 'workspace_write'
 
 
+class TinyWriteInput(ToolInput):
+    path: str = Field(min_length=1)
+    content: str = Field(max_length=3)
+
+
+class TinyWriteTool(Tool[TinyWriteInput]):
+    name = 'tiny_write'
+    description = 'Test-only size-limited write tool.'
+    input_model = TinyWriteInput
+    effect = 'workspace_write'
+
+    async def execute(self, arguments: TinyWriteInput) -> ToolResult:
+        return ToolResult.ok('Wrote test content.')
+
+
 class FailingWriteTool(NoOpWriteTool):
     name = 'failing_write'
     description = 'Reject a test write with an actionable diagnostic.'
@@ -154,6 +169,9 @@ class NoChangeWorkspaceTracker:
 
     async def begin_turn(self) -> None:
         self.revision = 0
+
+    def watch_paths(self, paths: tuple[str, ...]) -> None:
+        pass
 
     async def refresh(self):
         return None
@@ -726,7 +744,7 @@ def test_exact_tool_repeat_is_skipped_after_limit(tmp_path: Path) -> None:
     assert completed[-1].result.metadata['cache_hit'] is True
 
 
-def test_stagnation_stops_mutating_turn_without_total_call_limit(
+def test_edit_recovery_stops_noop_writes_without_total_call_limit(
     tmp_path: Path,
 ) -> None:
     tool = NoOpWriteTool(tmp_path)
@@ -740,7 +758,7 @@ def test_stagnation_stops_mutating_turn_without_total_call_limit(
                 arguments={'path': f'file-{index}.txt'},
             )
         )
-        for index in range(1, 4)
+        for index in range(1, 6)
     ]
     conversation = Conversation(
         client=FakeModelClient(*responses),
@@ -755,12 +773,13 @@ def test_stagnation_stops_mutating_turn_without_total_call_limit(
         event.result for event in events if isinstance(event, TurnCompleted)
     )
     assert result.status == 'stuck'
-    assert '3 model calls without new workspace' in result.text
+    assert '5 workspace-write attempt(s)' in result.text
+    assert 'model calls without new workspace' not in result.text
     assert conversation.task_manager.active is not None
     assert conversation.task_manager.active.status == 'stuck'
 
 
-def test_novel_reads_cannot_reset_failed_mutation_recovery(
+def test_recovery_reads_do_not_consume_failed_edit_limit(
     tmp_path: Path,
 ) -> None:
     write = FailingWriteTool(tmp_path)
@@ -774,7 +793,7 @@ def test_novel_reads_cannot_reset_failed_mutation_recovery(
             arguments={'path': 'world.js'},
         )
     )
-    novel_reads = [
+    recovery_reads = [
         tool_response(
             ToolCall(
                 index=0,
@@ -783,9 +802,24 @@ def test_novel_reads_cannot_reset_failed_mutation_recovery(
                 arguments={'path': f'file-{index}.js'},
             )
         )
-        for index in range(1, 11)
+        for index in range(1, 3)
     ]
-    client = FakeModelClient(failed_write, *novel_reads)
+    later_failed_writes = [
+        tool_response(
+            ToolCall(
+                index=0,
+                id=f'failed-write-{index}',
+                name='failing_write',
+                arguments={'path': f'world-{index}.js'},
+            )
+        )
+        for index in range(2, 5)
+    ]
+    client = FakeModelClient(
+        failed_write,
+        *recovery_reads,
+        *later_failed_writes,
+    )
     conversation = Conversation(
         client=client,
         registry=ToolRegistry(
@@ -794,7 +828,6 @@ def test_novel_reads_cannot_reset_failed_mutation_recovery(
         ),
         stagnation_warning=20,
         stagnation_limit=30,
-        mutation_recovery_warning=2,
         mutation_recovery_limit=4,
     )
 
@@ -804,10 +837,9 @@ def test_novel_reads_cannot_reset_failed_mutation_recovery(
         event.result for event in events if isinstance(event, TurnCompleted)
     )
     assert result.status == 'stuck'
-    assert '1 workspace-write attempt(s)' in result.text
-    assert '4 model calls passed in edit recovery' in result.text
-    assert len(client.calls) == 4
-    assert len(client.responses) == 7
+    assert '4 workspace-write attempt(s)' in result.text
+    assert len(client.calls) == 6
+    assert len(client.responses) == 0
     assert '[Failed Mutation Recovery]' in client.calls[1]['system']
     assert 'patch_rejected' in client.calls[1]['system']
     assert 'target context did not match' in client.calls[1]['system']
@@ -816,6 +848,69 @@ def test_novel_reads_cannot_reset_failed_mutation_recovery(
         <= {tool['name'] for tool in call['tools']}
         for call in client.calls
     )
+
+
+def test_edit_recovery_suspends_global_stagnation(
+    tmp_path: Path,
+) -> None:
+    write = FailingWriteTool(tmp_path)
+    read = RecordingReadFileTool(tmp_path)
+    tracker = NoChangeWorkspaceTracker(tmp_path)
+    first_failure = tool_response(
+        ToolCall(
+            index=0,
+            id='initial-failed-write',
+            name='failing_write',
+            arguments={'path': 'world-1.js'},
+        )
+    )
+    replayed_reads = [
+        tool_response(
+            ToolCall(
+                index=0,
+                id=f'replayed-read-{index}',
+                name='read_file',
+                arguments={'path': 'already-read.js'},
+            )
+        )
+        for index in range(6)
+    ]
+    remaining_failures = [
+        tool_response(
+            ToolCall(
+                index=0,
+                id=f'failed-write-{index}',
+                name='failing_write',
+                arguments={'path': f'world-{index}.js'},
+            )
+        )
+        for index in range(2, 6)
+    ]
+    client = FakeModelClient(
+        first_failure,
+        *replayed_reads,
+        *remaining_failures,
+    )
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry(
+            [write, read],
+            workspace_tracker=tracker,
+        ),
+        stagnation_warning=1,
+        stagnation_limit=2,
+        mutation_recovery_limit=5,
+    )
+
+    events = collect_turn(conversation, 'Fix the rendering bug')
+
+    result = next(
+        event.result for event in events if isinstance(event, TurnCompleted)
+    )
+    assert result.status == 'stuck'
+    assert '5 workspace-write attempt(s)' in result.text
+    assert 'model calls without new workspace' not in result.text
+    assert len(client.calls) == 11
 
 
 def test_failed_mutation_without_tracker_rejects_text_completion(
@@ -836,7 +931,6 @@ def test_failed_mutation_without_tracker_rejects_text_completion(
     conversation = Conversation(
         client=client,
         registry=ToolRegistry([write]),
-        mutation_recovery_warning=1,
         mutation_recovery_limit=2,
     )
 
@@ -863,8 +957,9 @@ def test_repeated_invalid_tool_arguments_end_as_stuck() -> None:
         )
         for index in range(1, 4)
     ]
+    client = FakeModelClient(*(tool_response(call) for call in calls))
     conversation = Conversation(
-        client=FakeModelClient(*(tool_response(call) for call in calls)),
+        client=client,
         registry=ToolRegistry([RecordingReadFileTool(Path.cwd())]),
     )
 
@@ -875,12 +970,66 @@ def test_repeated_invalid_tool_arguments_end_as_stuck() -> None:
     )
     assert result.status == 'stuck'
     assert 'schema-invalid tool requests' in result.text
+    first_recovery = client.calls[1]['messages'][-1]
+    assert first_recovery['role'] == 'user'
+    assert 'Exact rejection(s):' in first_recovery['content']
+    assert '`unexpected` is not an allowed argument' in (
+        first_recovery['content']
+    )
+    assert 'Do not repeat the rejected payload.' in (
+        first_recovery['content']
+    )
+
+
+def test_invalid_write_arguments_do_not_enter_mutation_recovery(
+    tmp_path: Path,
+) -> None:
+    calls = [
+        ToolCall(
+            index=0,
+            id=f'toolu_oversized_{index}',
+            name='tiny_write',
+            arguments={'path': f'file-{index}.txt', 'content': 'too long'},
+        )
+        for index in range(1, 4)
+    ]
+    client = FakeModelClient(*(tool_response(call) for call in calls))
+    tracker = NoChangeWorkspaceTracker(tmp_path)
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry(
+            [TinyWriteTool(tmp_path)],
+            workspace_tracker=tracker,
+        ),
+    )
+
+    events = collect_turn(conversation, 'Write a generated file')
+
+    result = next(
+        event.result for event in events if isinstance(event, TurnCompleted)
+    )
+    assert result.status == 'stuck'
+    assert 'schema-invalid tool requests' in result.text
+    assert 'workspace-write attempt(s)' not in result.text
+    assert all(
+        '[Failed Mutation Recovery]' not in call['system']
+        for call in client.calls
+    )
 
 
 def test_unsupported_shell_syntax_is_a_protocol_recovery_failure() -> None:
     result = ToolResult.fail(
         'unsupported_shell_syntax',
         'Use stdin instead of a POSIX heredoc on Windows.',
+    )
+
+    assert is_tool_protocol_failure(result) is True
+
+
+def test_copied_patch_line_numbers_are_a_protocol_recovery_failure() -> None:
+    result = ToolResult.fail(
+        'patch_contains_read_line_numbers',
+        'Remove read_file line-number prefixes.',
     )
 
     assert is_tool_protocol_failure(result) is True

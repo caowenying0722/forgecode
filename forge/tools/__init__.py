@@ -7,6 +7,7 @@ from forge.tools.filesystem import (
     ListDirectoryTool,
     ReadFileTool,
     ReplaceTextTool,
+    WriteFileChunkTool,
     WriteFileTool,
 )
 from forge.tools.finish import FinishTaskTool
@@ -28,6 +29,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
             ReadFileTool(root),
             GrepTool(root),
             WriteFileTool(root),
+            WriteFileChunkTool(root),
             ReplaceTextTool(root),
             ApplyPatchTool(root),
             RunCommandTool(root),
@@ -52,6 +54,7 @@ __all__ = [
     'ReplaceTextTool',
     'RunCommandTool',
     'VerifyTool',
+    'WriteFileChunkTool',
     'WriteFileTool',
     'ToolRegistry',
     'create_default_registry',

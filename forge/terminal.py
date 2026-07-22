@@ -557,6 +557,18 @@ class StreamingResponseView:
             rendered.append(f' {arguments}', style='dim')
             if result is not None:
                 rendered.append(f' — {result.summary}', style='dim')
+                diagnostic = result.content.strip()
+                if not result.success and diagnostic:
+                    if len(diagnostic) > 800:
+                        diagnostic = (
+                            diagnostic[:800]
+                            + '\n...[diagnostic shortened]...'
+                        )
+                    diagnostic = diagnostic.replace('\n', '\n       ')
+                    rendered.append(
+                        f'\n       {diagnostic}',
+                        style='dim red',
+                    )
             if not is_last:
                 rendered.append('\n')
         return rendered

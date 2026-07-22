@@ -19,6 +19,7 @@ from forge.tools.base import (
     resolve_repository_path,
 )
 from forge.tools.filesystem import (
+    MAX_EDIT_CHARACTERS,
     dominant_newline,
     read_text_preserving_newlines,
 )
@@ -30,7 +31,7 @@ from forge.tools.shell import (
 
 
 class ApplyPatchInput(ToolInput):
-    patch: str = Field(min_length=1, max_length=8_000)
+    patch: str = Field(min_length=1, max_length=MAX_EDIT_CHARACTERS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,17 @@ class _EnvelopeOperation:
 class _EnvelopeError(ValueError):
     '''A deterministic validation failure in a Codex patch envelope.'''
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = 'patch_rejected',
+        details: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
 
 class ApplyPatchTool(Tool[ApplyPatchInput]):
     name = 'apply_patch'
@@ -52,7 +64,7 @@ class ApplyPatchTool(Tool[ApplyPatchInput]):
         'unified diff (--- a/path, +++ b/path, and numbered @@ hunks) or a '
         'Codex envelope (*** Begin Patch with *** Update File, *** Add File, '
         'or *** Delete File sections; Update sections may use bare @@ hunks). '
-        'The patch is limited to 8000 characters; split large HTML, CSS, '
+        'The patch is limited to 30000 characters; split large HTML, CSS, '
         'JavaScript, or source files across multiple calls. Use '
         'repository-relative paths. On patch_rejected, inspect the error and '
         'relevant current lines instead of retrying the same patch. Prefer '
@@ -71,11 +83,19 @@ class ApplyPatchTool(Tool[ApplyPatchInput]):
                 operations = parse_codex_envelope(arguments.patch)
                 normalized_patch = build_unified_patch(self.root, operations)
             except (_EnvelopeError, ToolExecutionError) as error:
+                code = (
+                    error.code
+                    if isinstance(error, _EnvelopeError)
+                    else 'patch_rejected'
+                )
+                details = {'format': patch_format}
+                if isinstance(error, _EnvelopeError):
+                    details.update(error.details)
                 return ToolResult.fail(
-                    'patch_rejected',
+                    code,
                     'Patch validation failed.',
                     content=str(error),
-                    details={'format': patch_format},
+                    details=details,
                     metadata={'format': patch_format},
                 )
         try:
@@ -84,11 +104,19 @@ class ApplyPatchTool(Tool[ApplyPatchInput]):
                 normalized_patch,
             )
         except (_EnvelopeError, ToolExecutionError) as error:
+            code = (
+                error.code
+                if isinstance(error, _EnvelopeError)
+                else 'patch_rejected'
+            )
+            details = {'format': patch_format}
+            if isinstance(error, _EnvelopeError):
+                details.update(error.details)
             return ToolResult.fail(
-                'patch_rejected',
+                code,
                 'Patch validation failed.',
                 content=str(error),
-                details={'format': patch_format},
+                details=details,
                 metadata={'format': patch_format},
             )
 
@@ -450,14 +478,46 @@ def find_unique_sequence(
         if lines[index:index + len(needle)] == needle
     ]
     if not candidates:
+        numbered_lines = [
+            line
+            for line in needle
+            if re.match(r'^\s*\d{1,7}\s*\|\s', line)
+        ]
+        if numbered_lines:
+            raise _EnvelopeError(
+                f'Update hunk {hunk_number} for {path!r} appears to contain '
+                'read_file display prefixes such as a line number followed '
+                'by |. Remove the line number and | prefix from every '
+                'patch line, then retry.',
+                code='patch_contains_read_line_numbers',
+                details={
+                    'path': path,
+                    'hunk_number': hunk_number,
+                    'prefixed_lines': len(numbered_lines),
+                    'examples': numbered_lines[:3],
+                },
+            )
         raise _EnvelopeError(
             f'Update hunk {hunk_number} does not match current content in '
-            f'{path!r}.'
+            f'{path!r}. Read the smallest relevant line range and copy its '
+            'exact current whitespace before retrying.',
+            code='patch_context_not_found',
+            details={
+                'path': path,
+                'hunk_number': hunk_number,
+                'recommended_tool': 'read_file',
+            },
         )
     if len(candidates) > 1:
         raise _EnvelopeError(
             f'Update hunk {hunk_number} is ambiguous in {path!r}; include '
-            'more unchanged context lines.'
+            'more unchanged context lines.',
+            code='patch_context_ambiguous',
+            details={
+                'path': path,
+                'hunk_number': hunk_number,
+                'occurrences': len(candidates),
+            },
         )
     return candidates[0]
 
