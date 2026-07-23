@@ -5,7 +5,7 @@ from functools import cache
 from itertools import count
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from forge.context.compactor import CompactionConfig
 from forge.context.manager import (
@@ -52,6 +52,17 @@ from forge.tools.task import create_task_tools
 
 ACTION_RECOVERY_READ_TOOLS = frozenset(
     {'read_file', 'grep'}
+)
+InteractionMode = Literal['auto', 'plan', 'code']
+PLAN_MODE_TOOLS = frozenset(
+    {
+        'list_directory',
+        'find_files',
+        'read_file',
+        'grep',
+        'git_status',
+        'explore_subagent',
+    }
 )
 
 
@@ -163,6 +174,7 @@ class Conversation:
         self.task_manager = TaskManager(resolved_context_root)
         self.session_store = SessionStore(resolved_context_root)
         self.session_id: str | None = None
+        self.interaction_mode: InteractionMode = 'auto'
         self.working_state = WorkingState()
         if registry is not None:
             for task_tool in create_task_tools(
@@ -228,16 +240,7 @@ class Conversation:
         all_tool_calls: list[ToolCall] = []
         latest_verification: VerificationEvidence | None = None
         mutation_attempted = False
-        change_required = bool(
-            (
-                self.completion_gate is not None
-                and self.completion_gate.policy.require_changes
-            )
-            or (
-                self.workspace_tracker is not None
-                and infer_change_required(prompt)
-            )
-        )
+        change_required = self._initial_change_required(prompt)
         tool_attempts: dict[str, tuple[int, bool]] = {}
         calls_without_progress = 0
         pre_mutation_calls = 0
@@ -314,6 +317,8 @@ class Conversation:
 
             if finalization_recovery or stagnation_final_recovery:
                 request_tools = None
+            elif self.interaction_mode == 'plan':
+                request_tools = self._plan_mode_tools()
             elif action_recovery:
                 request_tools = self._action_recovery_tools(
                     read_available=not action_read_used
@@ -1592,7 +1597,33 @@ class Conversation:
                 'this request. Use tools directly whenever your chosen '
                 'approach requires repository actions.'
             )
+        parts.append(render_interaction_mode_context(self.interaction_mode))
         return '\n\n'.join(parts)
+
+    def _initial_change_required(self, prompt: str) -> bool:
+        if self.interaction_mode == 'plan':
+            return False
+        if self.interaction_mode == 'code':
+            return self.workspace_tracker is not None
+        return bool(
+            (
+                self.completion_gate is not None
+                and self.completion_gate.policy.require_changes
+            )
+            or (
+                self.workspace_tracker is not None
+                and infer_change_required(prompt)
+            )
+        )
+
+    def _plan_mode_tools(self) -> list[dict[str, Any]] | None:
+        if self.tools is None:
+            return None
+        return [
+            definition
+            for definition in self.tools
+            if str(definition.get('name', '')) in PLAN_MODE_TOOLS
+        ]
 
     def _pending_required_change(self, change_required: bool) -> bool:
         tracker = self.workspace_tracker
@@ -1861,11 +1892,20 @@ class Conversation:
         self._last_task_context = self.task_manager.system_suffix()
         return f'Resumed {task.id}: {task.goal}'
 
+    def mode_show(self) -> str:
+        return render_mode_notice(self.interaction_mode)
+
+    def mode_set(self, mode: str) -> str:
+        normalized = normalize_interaction_mode(mode)
+        self.interaction_mode = normalized
+        return render_mode_notice(normalized)
+
     def save_session(self) -> str:
         snapshot = self.session_store.save(
             self.messages,
             session_id=self.session_id,
             active_task=self.task_manager.active,
+            interaction_mode=self.interaction_mode,
         )
         self.session_id = snapshot.id
         return snapshot.id
@@ -1879,6 +1919,9 @@ class Conversation:
         self.messages[:] = snapshot.messages
         self.session_id = snapshot.id
         self.task_manager.active = snapshot.active_task
+        self.interaction_mode = normalize_interaction_mode(
+            snapshot.interaction_mode
+        )
         self._last_task_context = self.task_manager.system_suffix()
         self._last_repository_context = self.context.repository.system_suffix('')
         return (
@@ -2053,6 +2096,61 @@ def required_change_block_reason() -> str:
     return (
         'This turn requires a real task-local workspace change, but no file '
         'differs from the workspace snapshot captured when the turn began.'
+    )
+
+
+def normalize_interaction_mode(mode: str) -> InteractionMode:
+    normalized = mode.strip().casefold()
+    if normalized == 'edit':
+        normalized = 'code'
+    if normalized not in {'auto', 'plan', 'code'}:
+        raise ValueError('Mode must be one of: auto, plan, code, edit.')
+    return normalized  # type: ignore[return-value]
+
+
+def render_mode_notice(mode: InteractionMode) -> str:
+    if mode == 'auto':
+        return (
+            'Mode: auto. ForgeCode infers whether a turn needs edits; '
+            'planning, checklist, suggestion, and analysis requests do not '
+            'require a workspace Diff.'
+        )
+    if mode == 'plan':
+        return (
+            'Mode: plan. ForgeCode will only use read-only planning tools and '
+            'will not require or perform workspace edits. Switch to /code or '
+            '/edit when you want the plan implemented.'
+        )
+    return (
+        'Mode: code. ForgeCode treats user turns as authorized implementation '
+        'work and requires a real workspace Diff before completion.'
+    )
+
+
+def render_interaction_mode_context(mode: InteractionMode) -> str:
+    if mode == 'plan':
+        return (
+            '[ForgeCode Interaction Mode]\n'
+            'Mode: plan. The user wants planning, analysis, or a repair '
+            'checklist only. Do not modify files. Only read-only planning '
+            'tools are available. A final answer should present a clear plan '
+            'or prioritized checklist and mention that the user can switch to '
+            '/code or /edit to implement it. No workspace Diff is required.'
+        )
+    if mode == 'code':
+        return (
+            '[ForgeCode Interaction Mode]\n'
+            'Mode: code. The user has authorized implementation. Make the '
+            'necessary workspace edits instead of stopping at a plan. After '
+            'modifying files, run or recommend an appropriate verification; '
+            'a real workspace Diff is required before completion.'
+        )
+    return (
+        '[ForgeCode Interaction Mode]\n'
+        'Mode: auto. Infer whether the user wants an answer/plan or actual '
+        'implementation. Planning, checklist, suggestion, analysis, and '
+        'proposal requests should be answered without forcing a workspace '
+        'Diff. Only require edits for high-confidence implementation asks.'
     )
 
 

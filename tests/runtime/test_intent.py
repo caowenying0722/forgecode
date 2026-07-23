@@ -38,6 +38,8 @@ def test_explicit_change_requests_require_a_workspace_diff(
         '如何修复这个问题？',
         '帮我解释如何修改 README',
         '给出一个修复方案，我再决定是否执行',
+        '好的，帮我按“优先级P0/P1/P2”给你出一版最小改动修复清单',
+        '按 P0/P1/P2 列一个最小改动修复 checklist',
         '完成了吗？',
         '优化方案是什么？',
         '修改方案是什么？',
@@ -50,6 +52,7 @@ def test_explicit_change_requests_require_a_workspace_diff(
         'Explain how to fix the rendering bug.',
         'Update me on the current progress.',
         'Write a plan for the refactor.',
+        'Give me a P0/P1/P2 fix checklist.',
         'Plan a refactor, but do not change files.',
     ],
 )

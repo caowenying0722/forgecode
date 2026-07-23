@@ -38,6 +38,11 @@ _READ_ONLY_ZH = re.compile(
     r'(?:^\s*(?:为什么|为何|如何|怎么|(?:帮我|请你?)?'
     r'(?:解释|说明|介绍)|查看|告诉我|'
     r'列出|总结|回顾|分析)|'
+    r'(?:清单|列表|优先级|P0/P1/P2|p0/p1/p2)|'
+    r'(?:出|给|给出|制定|写|编写).{0,30}'
+    r'(?:清单|列表|方案|计划|建议|规划|roadmap)|'
+    r'(?:修复|改动|修改|优化).{0,16}'
+    r'(?:清单|列表|方案|计划|建议|规划)|'
     r'(?:完成|实现|修复|更新|修改|优化|开始|继续)(?:了)?'
     r'(?:吗|没有|了吗|没|呢)|'
     r'(?:方案|计划|建议)(?:是什么|有哪些|怎么样|呢|吗)|'
@@ -85,10 +90,13 @@ _NEGATED_CHANGE_EN = re.compile(
 _READ_ONLY_EN = re.compile(
     r'(?:^\s*(?:why|how|what|explain|describe|tell\s+me|show\s+me|'
     r'list|summarize|review|analyze|inspect)\b|'
+    r'\b(?:p0/p1/p2|priority|priorities|checklist|roadmap)\b|'
     r'\bupdate\s+me\b|'
     r'\b(?:status|progress)\b|'
     r'\b(?:write|create|draft|give|provide)\b.{0,30}'
-    r'\b(?:plan|proposal|suggestion|explanation)\b)',
+    r'\b(?:plan|proposal|suggestion|explanation|checklist|roadmap)\b|'
+    r'\b(?:fix|change|edit|implementation)\b.{0,20}'
+    r'\b(?:plan|proposal|suggestion|checklist|roadmap)\b)',
     re.IGNORECASE,
 )
 _CLAUSE_SPLIT_EN = re.compile(

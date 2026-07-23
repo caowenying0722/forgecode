@@ -12,6 +12,7 @@ def test_session_store_saves_current_and_lists_latest(tmp_path: Path) -> None:
     snapshot = store.save(
         [{'role': 'user', 'content': 'hello'}],
         active_task=task,
+        interaction_mode='plan',
     )
 
     current = store.load_current()
@@ -21,6 +22,7 @@ def test_session_store_saves_current_and_lists_latest(tmp_path: Path) -> None:
     assert current.messages == [{'role': 'user', 'content': 'hello'}]
     assert current.active_task is not None
     assert current.active_task.goal == 'Fix bug'
+    assert current.interaction_mode == 'plan'
     assert listed[0].id == snapshot.id
 
 

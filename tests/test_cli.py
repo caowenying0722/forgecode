@@ -121,6 +121,12 @@ class FakeConversation:
     def session_history(self) -> str:
         return '- session-123456789abc [2 messages]'
 
+    def mode_show(self) -> str:
+        return 'Mode: auto.'
+
+    def mode_set(self, mode: str) -> str:
+        return f'Mode: {mode}.'
+
 
 class FakeResponseView:
     '''Record live UI updates without rendering a terminal.'''
@@ -391,6 +397,28 @@ def test_session_commands_do_not_call_model(
     assert 'session-123456789abc' in result.output
     assert 'Resumed session latest' in result.output
     assert 'Resumed session session-123456789abc' in result.output
+    assert conversation.prompts == []
+
+
+def test_mode_commands_do_not_call_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(
+        app,
+        input='/mode\n/mode plan\n/plan\n/code\n/edit\n',
+    )
+
+    assert result.exit_code == 0
+    assert 'Mode: auto.' in result.output
+    assert 'Mode: plan.' in result.output
+    assert 'Mode: code.' in result.output
     assert conversation.prompts == []
 
 

@@ -43,6 +43,7 @@ from forge.runtime.state import (
     ToolCall,
 )
 from forge.tools.base import Tool, ToolInput, ToolRegistry, ToolResult
+from forge.tools import create_default_registry
 from forge.tools.filesystem import ReadFileTool
 from forge.tools.search import GrepTool
 
@@ -284,6 +285,7 @@ def test_conversation_saves_and_resumes_session(tmp_path: Path) -> None:
         tools=[],
         context_root=tmp_path,
     )
+    conversation.mode_set('plan')
     collect_turn(conversation, 'hello')
     session_id = conversation.save_session()
     resumed = Conversation(
@@ -296,6 +298,45 @@ def test_conversation_saves_and_resumes_session(tmp_path: Path) -> None:
 
     assert session_id in notice
     assert resumed.messages == conversation.messages
+    assert resumed.interaction_mode == 'plan'
+
+
+def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(
+    tmp_path: Path,
+) -> None:
+    client = FakeModelClient(streamed_response('P0/P1/P2 plan'))
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+    conversation.mode_set('plan')
+
+    events = collect_turn(conversation, '修复这个问题')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.changed_paths == ()
+    assert {tool['name'] for tool in client.calls[0]['tools']} == {
+        'list_directory',
+        'find_files',
+        'read_file',
+        'grep',
+        'git_status',
+        'explore_subagent',
+    }
+
+
+def test_code_mode_requires_diff_even_for_plan_like_prompt(
+    tmp_path: Path,
+) -> None:
+    conversation = Conversation(
+        client=FakeModelClient(streamed_response('plan')),
+        registry=create_default_registry(tmp_path),
+    )
+    conversation.mode_set('code')
+
+    assert conversation._initial_change_required('给我一个计划') is True
 
 
 def test_task_policy_requires_workspace_tracking(tmp_path: Path) -> None:

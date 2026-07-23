@@ -27,6 +27,7 @@ class SessionSnapshot:
     cwd: str
     messages: list[dict[str, Any]]
     active_task: ActiveTask | None = None
+    interaction_mode: str = 'auto'
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -40,6 +41,7 @@ class SessionSnapshot:
                 if self.active_task is not None
                 else None
             ),
+            'interaction_mode': self.interaction_mode,
         }
 
     @classmethod
@@ -65,6 +67,7 @@ class SessionSnapshot:
                 if isinstance(active_task_data, dict)
                 else None
             ),
+            interaction_mode=str(data.get('interaction_mode', 'auto')),
         )
 
 
@@ -82,6 +85,7 @@ class SessionStore:
         *,
         session_id: str | None = None,
         active_task: ActiveTask | None = None,
+        interaction_mode: str = 'auto',
     ) -> SessionSnapshot:
         resolved_id = session_id or new_session_id()
         validate_session_id(resolved_id)
@@ -94,6 +98,7 @@ class SessionStore:
             cwd=str(self.root),
             messages=json_round_trip(messages),
             active_task=active_task,
+            interaction_mode=interaction_mode,
         )
         self.directory.mkdir(parents=True, exist_ok=True)
         serialized = json.dumps(

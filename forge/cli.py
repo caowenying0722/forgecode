@@ -160,6 +160,38 @@ def run_interactive_chat(
             )
             continue
 
+        if prompt.strip() == '/mode':
+            resolved_terminal.show_notice(
+                'Mode',
+                resolved_session.mode_show(),
+            )
+            continue
+
+        if prompt.strip().startswith('/mode '):
+            mode = prompt.strip()[len('/mode '):].strip()
+            try:
+                resolved_terminal.show_notice(
+                    'Mode',
+                    resolved_session.mode_set(mode),
+                )
+            except ValueError as error:
+                resolved_terminal.show_error(error)
+            continue
+
+        if prompt.strip() == '/plan':
+            resolved_terminal.show_notice(
+                'Mode',
+                resolved_session.mode_set('plan'),
+            )
+            continue
+
+        if prompt.strip() in {'/code', '/edit'}:
+            resolved_terminal.show_notice(
+                'Mode',
+                resolved_session.mode_set('code'),
+            )
+            continue
+
         if prompt.strip() == '/task':
             resolved_terminal.show_notice('Task', resolved_session.task_show())
             continue

@@ -5,18 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
 
 from pydantic import Field
 
-from forge.runtime.model_client import AnthropicModelClient
-from forge.runtime.state import (
-    ModelTextDelta,
-    ModelToolCallCompleted,
-    ModelUsageUpdate,
-    TokenUsage,
-    ToolCall,
-)
 from forge.tools.base import Tool, ToolInput, ToolRegistry, ToolResult
 from forge.tools.filesystem import ListDirectoryTool, ReadFileTool
 from forge.tools.git import GitStatusTool
@@ -72,6 +64,8 @@ class ExploreSubagentTool(Tool[ExploreSubagentInput]):
         self.client = client
 
     async def execute(self, arguments: ExploreSubagentInput) -> ToolResult:
+        from forge.runtime.model_client import AnthropicModelClient
+
         client = self.client or AnthropicModelClient.from_config()
         subagent = ExploreSubagent(self.root, client)
         return await subagent.run(arguments)
@@ -94,6 +88,13 @@ class ExploreSubagent:
         )
 
     async def run(self, arguments: ExploreSubagentInput) -> ToolResult:
+        from forge.runtime.state import (
+            ModelTextDelta,
+            ModelToolCallCompleted,
+            ModelUsageUpdate,
+            TokenUsage,
+        )
+
         messages: list[dict[str, Any]] = [
             {
                 'role': 'user',
@@ -106,7 +107,7 @@ class ExploreSubagent:
 
         for round_index in range(1, arguments.max_rounds + 1):
             text_parts: list[str] = []
-            requested: list[ToolCall] = []
+            requested: list[Any] = []
             request_usage: TokenUsage | None = None
             async for event in self.client.stream(
                 messages,
@@ -171,7 +172,7 @@ def render_explore_task(arguments: ExploreSubagentInput) -> str:
 
 def build_assistant_message(
     text: str,
-    tool_calls: list[ToolCall],
+    tool_calls: list[Any],
 ) -> dict[str, Any]:
     content: list[dict[str, Any]] = []
     if text:
@@ -189,7 +190,7 @@ def build_assistant_message(
 
 
 def build_tool_result_message(
-    results: list[tuple[ToolCall, ToolResult]],
+    results: list[tuple[Any, ToolResult]],
 ) -> dict[str, Any]:
     return {
         'role': 'user',
@@ -223,7 +224,9 @@ def build_tool_result_message(
     }
 
 
-def add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
+def add_usage(left: Any, right: Any) -> Any:
+    from forge.runtime.state import TokenUsage
+
     return TokenUsage(
         input_tokens=left.input_tokens + right.input_tokens,
         output_tokens=left.output_tokens + right.output_tokens,
@@ -236,7 +239,7 @@ def add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
     )
 
 
-def metadata(usage: TokenUsage, tool_calls: list[str]) -> dict[str, Any]:
+def metadata(usage: Any, tool_calls: list[str]) -> dict[str, Any]:
     return {
         'subagent': 'explore',
         'input_tokens': usage.total_input_tokens,
