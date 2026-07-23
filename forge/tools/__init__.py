@@ -16,6 +16,7 @@ from forge.tools.mcp import MCPTool
 from forge.tools.patch import ApplyPatchTool
 from forge.tools.search import FindFilesTool, GrepTool
 from forge.tools.shell import RunCommandTool
+from forge.tools.subagent import ExploreSubagentTool
 from forge.tools.verify import VerifyTool
 from forge.runtime.workspace import WorkspaceTracker
 from forge.mcp import MCPClientManager
@@ -43,6 +44,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
             VerifyTool(root, tracker),
             GitStatusTool(root),
             GitDiffTool(root),
+            ExploreSubagentTool(root),
             *mcp_tools,
             FinishTaskTool(root),
         ],
@@ -59,6 +61,7 @@ __all__ = [
     'GrepTool',
     'ListDirectoryTool',
     'MCPTool',
+    'ExploreSubagentTool',
     'ReadFileTool',
     'ReplaceTextTool',
     'RunCommandTool',

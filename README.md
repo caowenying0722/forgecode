@@ -762,13 +762,13 @@ MCP stdio server 必须使用 `Content-Length` JSON-RPC 帧，支持
 
 ### 6.3 Explore Subagent
 
-首个子 Agent 只负责只读仓库探索，可使用 `list_directory`、`find_files`、`grep`、`read_file` 和 `git_log`。
+首个子 Agent 只负责只读仓库探索，可使用 `list_directory`、`find_files`、`grep`、`read_file` 和 `git_status`。主 Agent 通过 `explore_subagent` 工具委派调查任务，子 Agent 使用独立消息上下文和只读工具集，返回结构化报告供主 Agent 决策。
 
-- [ ] 使用独立上下文和独立 Token Budget；
-- [ ] 设置最大执行轮数；
-- [ ] 仅拥有只读权限，不能修改文件；
-- [ ] 只返回相关文件、调用路径、根因假设、建议修改点和不确定问题的结构化摘要；
-- [ ] 由主 Agent 决定是否采纳结论；
+- [x] 使用独立上下文和独立 Token 统计；
+- [x] 设置最大执行轮数；
+- [x] 仅拥有只读权限，不能修改文件；
+- [x] 只返回相关文件、调用路径、根因假设、建议修改点和不确定问题的结构化摘要；
+- [x] 由主 Agent 决定是否采纳结论；
 - [ ] 比较启用前后的主 Agent 上下文消耗。
 
 ### 验收条件
