@@ -53,6 +53,12 @@ SLASH_COMMANDS = (
     ),
     SlashCommandSpec('/plan', '/plan', '切换到只读计划模式'),
     SlashCommandSpec('/code', '/code', '切换到代码执行模式'),
+    SlashCommandSpec('/permission', '/permission', '查看当前权限模式'),
+    SlashCommandSpec(
+        '/permission ',
+        '/permission trusted|strict|readonly',
+        '切换工具权限模式',
+    ),
     SlashCommandSpec('/mcp', '/mcp', '查看 MCP 服务器与工具状态'),
     SlashCommandSpec('/exit', '/exit', '退出 ForgeCode'),
     SlashCommandSpec('/task', '/task', '查看当前任务与计划'),
@@ -424,6 +430,22 @@ class StreamingResponseView:
         )
         self.live.update(self._render(), refresh=True)
 
+    def request_permission(self, tool_call: ToolCall, effect: object) -> bool:
+        '''Pause live rendering and ask whether one sensitive tool may run.'''
+        self.live.stop()
+        try:
+            self.console.print('[bold yellow]Permission required[/]')
+            self.console.print(
+                f'[dim]Tool:[/] {escape(tool_call.name)}  '
+                f'[dim]effect:[/] {escape(str(effect))}'
+            )
+            answer = self.console.input(
+                'Allow this tool call? (y/N, yes/no) '
+            )
+            return permission_answer_allows(answer)
+        finally:
+            self.live.start(refresh=True)
+
     def compact_context(self, event: ContextCompacted) -> None:
         '''Show automatic context compaction while the turn continues.'''
         lines = (
@@ -645,6 +667,21 @@ def streaming_preview(
     if truncated:
         preview = f'…\n{preview.lstrip()}'
     return preview
+
+
+def permission_answer_allows(answer: str) -> bool:
+    '''Return whether an interactive permission answer approves a tool call.'''
+    return answer.strip().casefold() in {
+        'y',
+        'yes',
+        '是',
+        '同意',
+        '允许',
+        '可以',
+        '确认',
+        'approve',
+        'allow',
+    }
 
 
 def token_usage_summary(

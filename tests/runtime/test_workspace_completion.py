@@ -115,6 +115,7 @@ def test_workspace_tracker_ignores_untracked_local_caches(
     run(tracker.begin_turn())
 
     assert should_skip_workspace_path('.cache/uv/wheel.whl')
+    assert should_skip_workspace_path('.forge/logs/tools.jsonl')
     assert '.cache/uv/wheel.whl' not in tracker.current.files
 
 

@@ -130,6 +130,12 @@ class FakeConversation:
     def mcp_status(self) -> str:
         return 'Status: configured\nTools: 1\n- mcp_demo_echo'
 
+    def permission_show(self) -> str:
+        return 'Permission: trusted.'
+
+    def permission_set(self, mode: str) -> str:
+        return f'Permission: {mode}.'
+
 
 class FakeResponseView:
     '''Record live UI updates without rendering a terminal.'''
@@ -440,6 +446,28 @@ def test_mcp_command_does_not_call_model(
     assert result.exit_code == 0
     assert 'Status: configured' in result.output
     assert 'mcp_demo_echo' in result.output
+    assert conversation.prompts == []
+
+
+def test_permission_commands_do_not_call_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(
+        app,
+        input='/permission\n/permission strict\n/permission readonly\n',
+    )
+
+    assert result.exit_code == 0
+    assert 'Permission: trusted.' in result.output
+    assert 'Permission: strict.' in result.output
+    assert 'Permission: readonly.' in result.output
     assert conversation.prompts == []
 
 

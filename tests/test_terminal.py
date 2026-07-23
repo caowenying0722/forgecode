@@ -16,6 +16,7 @@ from forge.runtime.state import (
 from forge.terminal import (
     SLASH_COMMAND_COMPLETER,
     TerminalUI,
+    permission_answer_allows,
     streaming_preview,
     token_usage_summary,
 )
@@ -80,6 +81,8 @@ def test_slash_opens_command_completion_menu() -> None:
     assert '/mode auto|plan|code' in usages
     assert '/plan' in usages
     assert '/code' in usages
+    assert '/permission' in usages
+    assert '/permission trusted|strict|readonly' in usages
     assert '/mcp' in usages
     assert '/exit' in usages
     assert '/remember name | content' in usages
@@ -101,6 +104,16 @@ def test_slash_completion_filters_and_replaces_current_input() -> None:
 
 def test_normal_prompt_does_not_offer_slash_commands() -> None:
     assert completions_for('fix this bug') == []
+
+
+def test_permission_answer_accepts_common_yes_values() -> None:
+    assert permission_answer_allows('y')
+    assert permission_answer_allows('yes')
+    assert permission_answer_allows('是')
+    assert permission_answer_allows('同意')
+    assert permission_answer_allows('allow')
+    assert not permission_answer_allows('')
+    assert not permission_answer_allows('no')
 
 
 def test_terminal_renders_session_header_and_markdown_response() -> None:

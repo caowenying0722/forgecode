@@ -44,6 +44,13 @@ from forge.runtime.state import (
     VerificationEvidence,
     WorkspaceChanged,
 )
+from forge.runtime.tool_executor import (
+    PermissionMiddleware,
+    ToolExecutionLogger,
+    ToolExecutor,
+    normalize_permission_mode,
+    render_permission_notice,
+)
 from forge.runtime.workspace import WorkspaceTracker
 from forge.sessions.store import SessionStore
 from forge.tasks.manager import TaskManager
@@ -172,6 +179,7 @@ class Conversation:
             if tracker is not None
             else Path.cwd()
         )
+        self.permission = PermissionMiddleware('trusted')
         self.task_manager = TaskManager(resolved_context_root)
         self.session_store = SessionStore(resolved_context_root)
         self.session_id: str | None = None
@@ -183,6 +191,17 @@ class Conversation:
                 self.task_manager,
             ):
                 registry.register(task_tool)
+        self.tool_executor = (
+            ToolExecutor(
+                registry,
+                root=resolved_context_root,
+                workspace_tracker=tracker,
+                permission=self.permission,
+                logger=ToolExecutionLogger(resolved_context_root),
+            )
+            if registry is not None
+            else None
+        )
         self.tools = registry.definitions if registry is not None else tools
         self.finish_protocol = (
             registry is not None and 'finish_task' in registry.names
@@ -895,6 +914,10 @@ class Conversation:
                 raise ModelResponseError(
                     'Model requested tools, but no ToolRegistry is configured.'
                 )
+            if self.tool_executor is None:
+                raise ModelResponseError(
+                    'Model requested tools, but no ToolExecutor is configured.'
+                )
 
             all_tool_calls.extend(tool_calls)
             tool_results: list[tuple[ToolCall, ToolResult]] = []
@@ -909,7 +932,7 @@ class Conversation:
             terminal_finish_reasons: tuple[str, ...] = ()
             for tool_position, tool_call in enumerate(tool_calls):
                 finish_rejection: tuple[str, ...] = ()
-                tool_effect = self.registry.effect(tool_call.name)
+                tool_effect = self.tool_executor.effect(tool_call.name)
                 if tool_effect == 'workspace_write':
                     mutation_attempted = True
                     change_required = True
@@ -918,13 +941,6 @@ class Conversation:
                     and tool_call.arguments.get('task_kind') == 'change'
                 ):
                     change_required = True
-                if (
-                    tool_effect == 'workspace_write'
-                    and self.workspace_tracker is not None
-                ):
-                    self.workspace_tracker.watch_paths(
-                        mutation_target_paths(tool_call)
-                    )
                 action_read_call = (
                     action_recovery
                     and tool_call.name in ACTION_RECOVERY_READ_TOOLS
@@ -1019,10 +1035,8 @@ class Conversation:
                         previous_success=previous_success,
                     )
                 else:
-                    result = await self.registry.execute(
-                        tool_call.name,
-                        tool_call.arguments,
-                    )
+                    execution = await self.tool_executor.execute(tool_call)
+                    result = execution.result
                     if tool_call.name != 'finish_task':
                         tool_attempts[signature] = (
                             previous_count + 1,
@@ -1089,6 +1103,31 @@ class Conversation:
                     tool_call=tool_call,
                     result=result,
                 )
+                if result.metadata.get('permission_terminal'):
+                    reason = result.summary
+                    self.task_manager.block((reason,))
+                    request_messages.append(
+                        build_tool_result_message(tool_results)
+                    )
+                    self.messages[:] = request_messages
+                    yield TurnCompleted(
+                        result=TurnResult(
+                            text=reason,
+                            usage=completed_usage,
+                            last_request_usage=request_usage,
+                            model_calls=iteration,
+                            tool_calls=tuple(all_tool_calls),
+                            status='blocked',
+                            changed_paths=(
+                                self.workspace_tracker.changed_paths
+                                if self.workspace_tracker is not None
+                                else ()
+                            ),
+                            verification=latest_verification,
+                            completion_reasons=(reason,),
+                        )
+                    )
+                    return
                 if finish_rejection:
                     yield CompletionBlocked(
                         attempt=(
@@ -1649,7 +1688,10 @@ class Conversation:
             if (
                 (read_available and name in ACTION_RECOVERY_READ_TOOLS)
                 or (include_finish and name == 'finish_task')
-                or self.registry.effect(name) == 'workspace_write'
+                or (
+                    self.tool_executor is not None
+                    and self.tool_executor.effect(name) == 'workspace_write'
+                )
             ):
                 selected.append(definition)
         return selected
@@ -1915,12 +1957,24 @@ class Conversation:
         self.interaction_mode = normalized
         return render_mode_notice(normalized)
 
+    def permission_show(self) -> str:
+        return render_permission_notice(self.permission.mode)
+
+    def permission_set(self, mode: str) -> str:
+        normalized = normalize_permission_mode(mode)
+        self.permission.mode = normalized
+        return render_permission_notice(normalized)
+
+    def set_permission_approver(self, approver: Any | None) -> None:
+        self.permission.approver = approver
+
     def save_session(self) -> str:
         snapshot = self.session_store.save(
             self.messages,
             session_id=self.session_id,
             active_task=self.task_manager.active,
             interaction_mode=self.interaction_mode,
+            permission_mode=self.permission.mode,
         )
         self.session_id = snapshot.id
         return snapshot.id
@@ -1936,6 +1990,9 @@ class Conversation:
         self.task_manager.active = snapshot.active_task
         self.interaction_mode = normalize_interaction_mode(
             snapshot.interaction_mode
+        )
+        self.permission.mode = normalize_permission_mode(
+            snapshot.permission_mode
         )
         self._last_task_context = self.task_manager.system_suffix()
         self._last_repository_context = self.context.repository.system_suffix('')

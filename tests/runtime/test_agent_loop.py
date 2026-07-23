@@ -286,6 +286,7 @@ def test_conversation_saves_and_resumes_session(tmp_path: Path) -> None:
         context_root=tmp_path,
     )
     conversation.mode_set('plan')
+    conversation.permission_set('readonly')
     collect_turn(conversation, 'hello')
     session_id = conversation.save_session()
     resumed = Conversation(
@@ -299,6 +300,7 @@ def test_conversation_saves_and_resumes_session(tmp_path: Path) -> None:
     assert session_id in notice
     assert resumed.messages == conversation.messages
     assert resumed.interaction_mode == 'plan'
+    assert resumed.permission.mode == 'readonly'
 
 
 def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(
@@ -337,6 +339,41 @@ def test_code_mode_requires_diff_even_for_plan_like_prompt(
     conversation.mode_set('code')
 
     assert conversation._initial_change_required('给我一个计划') is True
+
+
+def test_strict_permission_blocks_write_tool_in_agent_loop(
+    tmp_path: Path,
+) -> None:
+    tool_call = ToolCall(
+        0,
+        'toolu_write',
+        'tiny_write',
+        {'path': 'sample.txt', 'content': 'abc'},
+    )
+    tracker = NoChangeWorkspaceTracker(tmp_path)
+    registry = ToolRegistry(
+        [TinyWriteTool(tmp_path)],
+        workspace_tracker=tracker,
+    )
+    client = FakeModelClient(
+        tool_response(tool_call),
+        streamed_response('Permission blocked the write.'),
+    )
+    conversation = Conversation(client=client, registry=registry)
+    conversation.permission_set('strict')
+
+    events = collect_turn(conversation, 'write sample')
+
+    completed = [
+        event for event in events if isinstance(event, ToolExecutionCompleted)
+    ][0]
+    assert completed.result.success is False
+    assert completed.result.error is not None
+    assert completed.result.error.code == 'permission_denied'
+    final = events[-1]
+    assert isinstance(final, TurnCompleted)
+    assert final.result.status == 'blocked'
+    assert len(client.calls) == 1
 
 
 def test_task_policy_requires_workspace_tracking(tmp_path: Path) -> None:

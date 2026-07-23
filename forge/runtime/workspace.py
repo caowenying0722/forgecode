@@ -12,6 +12,7 @@ DEFAULT_UNWATCHED_PARTS = frozenset(
         '.cache',
         '.conda',
         '.conda-pkgs',
+        '.forge',
         '.git',
         '.mypy_cache',
         '.pytest_cache',

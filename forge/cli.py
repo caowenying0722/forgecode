@@ -168,6 +168,24 @@ def run_interactive_chat(
             resolved_terminal.show_notice('MCP', resolved_session.mcp_status())
             continue
 
+        if prompt.strip() == '/permission':
+            resolved_terminal.show_notice(
+                'Permission',
+                resolved_session.permission_show(),
+            )
+            continue
+
+        if prompt.strip().startswith('/permission '):
+            mode = prompt.strip()[len('/permission '):].strip()
+            try:
+                resolved_terminal.show_notice(
+                    'Permission',
+                    resolved_session.permission_set(mode),
+                )
+            except ValueError as error:
+                resolved_terminal.show_error(error)
+            continue
+
         if prompt.strip() == '/mode':
             resolved_terminal.show_notice(
                 'Mode',
@@ -301,6 +319,13 @@ async def render_streamed_turn(
     recorder: TrajectoryRecorder | None = None,
 ) -> None:
     '''Forward conversation stream events to the live terminal view.'''
+    set_permission_approver = getattr(
+        session,
+        'set_permission_approver',
+        None,
+    )
+    if set_permission_approver is not None:
+        set_permission_approver(response_view.request_permission)
     if recorder is not None:
         recorder.record_user_message(prompt)
     try:
@@ -332,6 +357,9 @@ async def render_streamed_turn(
         if recorder is not None:
             recorder.record_error(error)
         raise
+    finally:
+        if set_permission_approver is not None:
+            set_permission_approver(None)
 
 
 def create_trajectory_recorder(root: Path) -> TrajectoryRecorder:

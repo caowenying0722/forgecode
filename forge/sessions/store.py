@@ -28,6 +28,7 @@ class SessionSnapshot:
     messages: list[dict[str, Any]]
     active_task: ActiveTask | None = None
     interaction_mode: str = 'auto'
+    permission_mode: str = 'trusted'
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +43,7 @@ class SessionSnapshot:
                 else None
             ),
             'interaction_mode': self.interaction_mode,
+            'permission_mode': self.permission_mode,
         }
 
     @classmethod
@@ -68,6 +70,7 @@ class SessionSnapshot:
                 else None
             ),
             interaction_mode=str(data.get('interaction_mode', 'auto')),
+            permission_mode=str(data.get('permission_mode', 'trusted')),
         )
 
 
@@ -86,6 +89,7 @@ class SessionStore:
         session_id: str | None = None,
         active_task: ActiveTask | None = None,
         interaction_mode: str = 'auto',
+        permission_mode: str = 'trusted',
     ) -> SessionSnapshot:
         resolved_id = session_id or new_session_id()
         validate_session_id(resolved_id)
@@ -99,6 +103,7 @@ class SessionStore:
             messages=json_round_trip(messages),
             active_task=active_task,
             interaction_mode=interaction_mode,
+            permission_mode=permission_mode,
         )
         self.directory.mkdir(parents=True, exist_ok=True)
         serialized = json.dumps(
