@@ -13,6 +13,7 @@ target/
 **/.forge/trajectories/
 **/.forge/evals/
 **/.forge/context/
+**/.forge/sessions/
 **/.forge/tasks/
 **/.forge/mcp.json
 fixtures/

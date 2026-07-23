@@ -72,6 +72,9 @@ def test_slash_opens_command_completion_menu() -> None:
     descriptions = [completion.display_meta_text for completion in completions]
 
     assert '/context' in usages
+    assert '/resume' in usages
+    assert '/resume session-id' in usages
+    assert '/sessions' in usages
     assert '/remember name | content' in usages
     assert '/memory consolidate' in usages
     assert '/task' in usages

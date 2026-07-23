@@ -126,6 +126,39 @@ def run_interactive_chat(
                 resolved_terminal.show_compaction(asyncio.run(compact()))
             continue
 
+        if prompt.strip() == '/resume':
+            try:
+                resolved_terminal.show_notice(
+                    'Session',
+                    resolved_session.resume_session(),
+                )
+            except (OSError, ValueError) as error:
+                resolved_terminal.show_error(error)
+            continue
+
+        if prompt.strip().startswith('/resume '):
+            session_id = prompt.strip()[len('/resume '):].strip()
+            if not session_id:
+                resolved_terminal.show_error(
+                    ValueError('Usage: /resume session-id')
+                )
+            else:
+                try:
+                    resolved_terminal.show_notice(
+                        'Session',
+                        resolved_session.resume_session(session_id),
+                    )
+                except (OSError, ValueError) as error:
+                    resolved_terminal.show_error(error)
+            continue
+
+        if prompt.strip() == '/sessions':
+            resolved_terminal.show_notice(
+                'Sessions',
+                resolved_session.session_history(),
+            )
+            continue
+
         if prompt.strip() == '/task':
             resolved_terminal.show_notice('Task', resolved_session.task_show())
             continue
@@ -249,6 +282,9 @@ async def render_streamed_turn(
                 response_view.block_completion(event.reasons)
             elif isinstance(event, TurnCompleted):
                 response_view.complete(event.result)
+        save_session = getattr(session, 'save_session', None)
+        if save_session is not None:
+            save_session()
     except Exception as error:
         if recorder is not None:
             recorder.record_error(error)

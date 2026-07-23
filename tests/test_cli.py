@@ -114,6 +114,12 @@ class FakeConversation:
     def task_resume(self, task_id: str) -> str:
         return f'Resumed {task_id}: Finish feature'
 
+    def resume_session(self, session_id: str | None = None) -> str:
+        return f'Resumed session {session_id or "latest"}'
+
+    def session_history(self) -> str:
+        return '- session-123456789abc [2 messages]'
+
 
 class FakeResponseView:
     '''Record live UI updates without rendering a terminal.'''
@@ -335,6 +341,28 @@ def test_task_commands_do_not_call_model(
     assert 'task-current' in result.output
     assert 'task-saved [blocked]' in result.output
     assert 'Resumed task-saved' in result.output
+    assert conversation.prompts == []
+
+
+def test_session_commands_do_not_call_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(
+        app,
+        input='/sessions\n/resume\n/resume session-123456789abc\n',
+    )
+
+    assert result.exit_code == 0
+    assert 'session-123456789abc' in result.output
+    assert 'Resumed session latest' in result.output
+    assert 'Resumed session session-123456789abc' in result.output
     assert conversation.prompts == []
 
 

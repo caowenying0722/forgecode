@@ -276,6 +276,26 @@ def test_conversation_accepts_an_explicit_system_prompt() -> None:
     assert 'Goal:\nhello' in client.calls[0]['system']
 
 
+def test_conversation_saves_and_resumes_session(tmp_path: Path) -> None:
+    conversation = Conversation(
+        client=FakeModelClient(streamed_response('hi')),
+        tools=[],
+        context_root=tmp_path,
+    )
+    collect_turn(conversation, 'hello')
+    session_id = conversation.save_session()
+    resumed = Conversation(
+        client=FakeModelClient(streamed_response('again')),
+        tools=[],
+        context_root=tmp_path,
+    )
+
+    notice = resumed.resume_session(session_id)
+
+    assert session_id in notice
+    assert resumed.messages == conversation.messages
+
+
 def test_task_policy_requires_workspace_tracking(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match='WorkspaceTracker'):
         Conversation(

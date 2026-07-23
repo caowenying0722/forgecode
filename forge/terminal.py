@@ -38,6 +38,13 @@ class SlashCommandSpec:
 SLASH_COMMANDS = (
     SlashCommandSpec('/context', '/context', '查看当前上下文统计'),
     SlashCommandSpec('/compact', '/compact', '立即压缩当前会话'),
+    SlashCommandSpec('/resume', '/resume', '恢复最近保存的会话'),
+    SlashCommandSpec(
+        '/resume ',
+        '/resume session-id',
+        '恢复指定保存会话',
+    ),
+    SlashCommandSpec('/sessions', '/sessions', '列出已保存会话'),
     SlashCommandSpec('/task', '/task', '查看当前任务与计划'),
     SlashCommandSpec('/task history', '/task history', '列出已保存的复杂任务'),
     SlashCommandSpec(

@@ -43,6 +43,7 @@ from forge.runtime.state import (
     WorkspaceChanged,
 )
 from forge.runtime.workspace import WorkspaceTracker
+from forge.sessions.store import SessionStore
 from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolRegistry, ToolResult
 from forge.tools.task import create_task_tools
@@ -159,6 +160,8 @@ class Conversation:
             else Path.cwd()
         )
         self.task_manager = TaskManager(resolved_context_root)
+        self.session_store = SessionStore(resolved_context_root)
+        self.session_id: str | None = None
         self.working_state = WorkingState()
         if registry is not None:
             for task_tool in create_task_tools(
@@ -1808,6 +1811,49 @@ class Conversation:
         task = self.task_manager.resume(task_id)
         self._last_task_context = self.task_manager.system_suffix()
         return f'Resumed {task.id}: {task.goal}'
+
+    def save_session(self) -> str:
+        snapshot = self.session_store.save(
+            self.messages,
+            session_id=self.session_id,
+            active_task=self.task_manager.active,
+        )
+        self.session_id = snapshot.id
+        return snapshot.id
+
+    def resume_session(self, session_id: str | None = None) -> str:
+        snapshot = (
+            self.session_store.load(session_id)
+            if session_id is not None
+            else self.session_store.load_current()
+        )
+        self.messages[:] = snapshot.messages
+        self.session_id = snapshot.id
+        self.task_manager.active = snapshot.active_task
+        self._last_task_context = self.task_manager.system_suffix()
+        self._last_repository_context = self.context.repository.system_suffix('')
+        return (
+            f'Resumed {snapshot.id}: '
+            f'{len(snapshot.messages)} message(s), updated {snapshot.updated_at}'
+        )
+
+    def session_history(self) -> str:
+        sessions = self.session_store.list()
+        if not sessions:
+            return 'No saved sessions.'
+        lines = []
+        for snapshot in sessions[:20]:
+            task = (
+                snapshot.active_task.goal
+                if snapshot.active_task is not None
+                else ''
+            )
+            suffix = f' — {task[:80]}' if task else ''
+            lines.append(
+                f'- {snapshot.id} [{len(snapshot.messages)} messages] '
+                f'{snapshot.updated_at}{suffix}'
+            )
+        return '\n'.join(lines)
 
 
 def build_assistant_message(
