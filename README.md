@@ -725,15 +725,37 @@ Hook 能够放行或拒绝操作、修改工具参数、注入额外上下文、
 
 ForgeCode 将作为 MCP Host 管理 MCP Client，而不是把 MCP 简化成普通 HTTP 调用。
 
-- [ ] 实现 MCP Client Manager；
-- [ ] 支持 stdio Transport 和 Streamable HTTP；
-- [ ] 支持初始化、能力协商、`tools/list` 和 `tools/call`；
+- [x] 实现 MCP Client Manager；
+- [x] 支持 stdio Transport；
+- [ ] 支持 Streamable HTTP；
+- [x] 支持初始化、能力协商、`tools/list` 和 `tools/call`；
 - [ ] 支持 Tool 变化通知、超时和断线恢复；
-- [ ] 将 MCP Tool 映射到统一 Tool Registry；
-- [ ] 让 MCP 工具经过 ForgeCode 权限系统；
-- [ ] 在日志中标记工具来源；
-- [ ] 首版只连接一个本地示例 Server；
+- [x] 将 MCP Tool 映射到统一 Tool Registry；
+- [x] 让 MCP 工具经过 ForgeCode 权限系统；
+- [x] 在工具结果 metadata 中标记工具来源；
+- [x] 首版只连接本地 stdio Server；
 - [ ] 首版不自行实现 OAuth 和完整的远程认证体系。
+
+配置文件位于 `.forge/mcp.json`，启动 ForgeCode 时会自动读取。示例：
+
+```json
+{
+  "servers": {
+    "web_fetch": {
+      "transport": "stdio",
+      "command": "python",
+      "args": ["examples/mcp_web_fetch_server.py"],
+      "cwd": ".",
+      "timeout_seconds": 30
+    }
+  }
+}
+```
+
+上面的示例 server 会注册为模型可用工具 `mcp_web_fetch_fetch_url`。
+MCP stdio server 必须使用 `Content-Length` JSON-RPC 帧，支持
+`initialize`、`tools/list` 和 `tools/call`。ForgeCode 会把远端工具名映射为
+`mcp_{server}_{tool}`，并把调用结果转换成统一的 `ToolResult`。
 
 ### 6.3 Explore Subagent
 

@@ -12,7 +12,7 @@ from forge.runtime.completion import (
     matches_any,
 )
 from forge.runtime.state import VerificationEvidence
-from forge.runtime.workspace import WorkspaceTracker
+from forge.runtime.workspace import WorkspaceTracker, should_skip_workspace_path
 
 
 def initialize_git_repository(root: Path) -> None:
@@ -103,6 +103,21 @@ def test_workspace_tracker_detects_untracked_files_and_reverts(
     assert tracker.changed_paths == ()
 
 
+def test_workspace_tracker_ignores_untracked_local_caches(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    cache_file = tmp_path / '.cache' / 'uv' / 'wheel.whl'
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_bytes(b'cached wheel')
+    tracker = WorkspaceTracker(tmp_path)
+
+    run(tracker.begin_turn())
+
+    assert should_skip_workspace_path('.cache/uv/wheel.whl')
+    assert '.cache/uv/wheel.whl' not in tracker.current.files
+
+
 def test_workspace_tracker_watches_ignored_write_targets(
     tmp_path: Path,
 ) -> None:
@@ -132,6 +147,25 @@ def test_workspace_tracker_watches_ignored_write_targets(
     assert change.paths == ('ignored/app.js', 'ignored/new.js')
     assert tracker.changed_paths == ('ignored/app.js', 'ignored/new.js')
     assert unchanged is None
+
+
+def test_workspace_tracker_watched_paths_can_include_local_caches(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    cache_file = tmp_path / '.cache' / 'generated.txt'
+    cache_file.parent.mkdir()
+    cache_file.write_text('old\n', encoding='utf-8')
+    tracker = WorkspaceTracker(tmp_path)
+
+    run(tracker.begin_turn())
+    tracker.watch_paths(('.cache/generated.txt',))
+    cache_file.write_text('new\n', encoding='utf-8')
+    change = run(tracker.refresh())
+
+    assert change is not None
+    assert change.paths == ('.cache/generated.txt',)
+    assert tracker.changed_paths == ('.cache/generated.txt',)
 
 
 def test_completion_gate_requires_verification_only_when_policy_requests_it(

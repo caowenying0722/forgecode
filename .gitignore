@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest_tmp*/
 *.egg-info/
 .venv/
 .env
@@ -13,6 +14,8 @@ target/
 **/.forge/evals/
 **/.forge/context/
 **/.forge/tasks/
+**/.forge/mcp.json
 fixtures/
 # game/
 play/
+.cache/

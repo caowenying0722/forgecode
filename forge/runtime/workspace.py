@@ -7,6 +7,22 @@ from hashlib import sha256
 import os
 from pathlib import Path, PurePosixPath
 
+DEFAULT_UNWATCHED_PARTS = frozenset(
+    {
+        '.cache',
+        '.conda',
+        '.conda-pkgs',
+        '.git',
+        '.mypy_cache',
+        '.pytest_cache',
+        '.ruff_cache',
+        '.venv',
+        '__pycache__',
+        'node_modules',
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkspaceSnapshot:
     '''Content state for paths currently changed relative to Git HEAD.'''
@@ -108,6 +124,7 @@ class WorkspaceTracker:
         files = {
             path: fingerprint_path(self.root, path)
             for path in parse_porcelain_paths(result.stdout)
+            if not should_skip_workspace_path(path)
         }
         for path in self._watched_paths:
             files[path] = fingerprint_path(self.root, path)
@@ -152,17 +169,28 @@ def normalize_path(path: str) -> str:
     return PurePosixPath(path.replace('\\', '/')).as_posix()
 
 
+def should_skip_workspace_path(path: str) -> bool:
+    '''Ignore local dependency and tool caches during broad Git snapshots.'''
+    return any(part in DEFAULT_UNWATCHED_PARTS for part in PurePosixPath(path).parts)
+
+
 def fingerprint_path(root: Path, relative_path: str) -> str:
     '''Hash file content without following a repository symlink.'''
     path = root / Path(relative_path)
-    if path.is_symlink():
-        return f'symlink:{os.readlink(path)}'
-    if not path.exists():
-        return 'missing'
-    if path.is_dir():
-        return 'directory'
+    try:
+        if path.is_symlink():
+            return f'symlink:{os.readlink(path)}'
+        if not path.exists():
+            return 'missing'
+        if path.is_dir():
+            return 'directory'
+    except OSError as error:
+        return f'unreadable:{type(error).__name__}:{error.errno}'
     digest = sha256()
-    with path.open('rb') as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b''):
-            digest.update(chunk)
+    try:
+        with path.open('rb') as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b''):
+                digest.update(chunk)
+    except OSError as error:
+        return f'unreadable:{type(error).__name__}:{error.errno}'
     return f'file:{digest.hexdigest()}'

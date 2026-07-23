@@ -12,16 +12,23 @@ from forge.tools.filesystem import (
 )
 from forge.tools.finish import FinishTaskTool
 from forge.tools.git import GitDiffTool, GitStatusTool
+from forge.tools.mcp import MCPTool
 from forge.tools.patch import ApplyPatchTool
 from forge.tools.search import FindFilesTool, GrepTool
 from forge.tools.shell import RunCommandTool
 from forge.tools.verify import VerifyTool
 from forge.runtime.workspace import WorkspaceTracker
+from forge.mcp import MCPClientManager
 
 
 def create_default_registry(root: Path) -> ToolRegistry:
     '''Create built-in tools sharing one task-local workspace tracker.'''
     tracker = WorkspaceTracker(root)
+    mcp_manager = MCPClientManager.from_config_file(root)
+    mcp_tools = [
+        MCPTool(root, remote_tool)
+        for remote_tool in mcp_manager.list_tools()
+    ]
     return ToolRegistry(
         [
             ListDirectoryTool(root),
@@ -36,6 +43,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
             VerifyTool(root, tracker),
             GitStatusTool(root),
             GitDiffTool(root),
+            *mcp_tools,
             FinishTaskTool(root),
         ],
         workspace_tracker=tracker,
@@ -50,6 +58,7 @@ __all__ = [
     'GitStatusTool',
     'GrepTool',
     'ListDirectoryTool',
+    'MCPTool',
     'ReadFileTool',
     'ReplaceTextTool',
     'RunCommandTool',
