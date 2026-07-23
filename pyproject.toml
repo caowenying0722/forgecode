@@ -28,6 +28,7 @@ forge = ['prompts/*.md']
 
 [tool.pytest.ini_options]
 testpaths = ['tests']
+addopts = ['--basetemp=.pytest_cache/tmp']
 
 [dependency-groups]
 dev = [
