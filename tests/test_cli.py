@@ -130,6 +130,12 @@ class FakeConversation:
     def mcp_status(self) -> str:
         return 'Status: configured\nTools: 1\n- mcp_demo_echo'
 
+    def hooks_status(self) -> str:
+        return 'Registered hooks:\n- permission [enabled] on pre_tool_use'
+
+    def todo_status(self) -> str:
+        return '- [in_progress] (high) plan: Plan the work'
+
     def permission_show(self) -> str:
         return 'Permission: trusted.'
 
@@ -446,6 +452,41 @@ def test_mcp_command_does_not_call_model(
     assert result.exit_code == 0
     assert 'Status: configured' in result.output
     assert 'mcp_demo_echo' in result.output
+    assert conversation.prompts == []
+
+
+def test_hooks_command_does_not_call_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(app, input='/hooks\n')
+
+    assert result.exit_code == 0
+    assert 'Registered hooks:' in result.output
+    assert 'permission [enabled]' in result.output
+    assert conversation.prompts == []
+
+
+def test_todo_command_does_not_call_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(app, input='/todo\n')
+
+    assert result.exit_code == 0
+    assert 'Plan the work' in result.output
     assert conversation.prompts == []
 
 

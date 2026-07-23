@@ -290,6 +290,11 @@ class ToolRegistry:
             raise ValueError(f'Duplicate tool name: {tool.name}')
         self._tools[tool.name] = tool
 
+    def replace(self, tool: Tool[Any]) -> None:
+        if tool.name not in self._tools:
+            raise ValueError(f'Tool not found: {tool.name}')
+        self._tools[tool.name] = tool
+
     @property
     def definitions(self) -> list[dict[str, Any]]:
         return [tool.definition for tool in self._tools.values()]

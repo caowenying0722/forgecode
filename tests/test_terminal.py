@@ -84,6 +84,8 @@ def test_slash_opens_command_completion_menu() -> None:
     assert '/permission' in usages
     assert '/permission trusted|strict|readonly' in usages
     assert '/mcp' in usages
+    assert '/hooks' in usages
+    assert '/todo' in usages
     assert '/exit' in usages
     assert '/remember name | content' in usages
     assert '/memory consolidate' in usages

@@ -12,7 +12,11 @@ from forge.runtime.tool_executor import (
     ToolExecutionLogger,
     ToolExecutor,
 )
+from forge.hooks import TodoPlanningHook
+from forge.hooks.registry import HookRegistry
+from forge.hooks.state import HookContext
 from forge.tools.base import Tool, ToolInput, ToolRegistry, ToolResult
+from forge.tools.memory import create_memory_tools
 
 
 class EmptyInput(ToolInput):
@@ -110,3 +114,71 @@ def test_strict_permission_runs_workspace_write_when_approved(
 
     assert record.result.success is True
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'changed'
+
+
+def test_todo_planning_hook_blocks_complex_write_before_todo(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry([WriteTool(tmp_path)])
+    planning = TodoPlanningHook()
+    executor = ToolExecutor(
+        registry,
+        root=tmp_path,
+        permission=PermissionMiddleware('trusted'),
+        logger=ToolExecutionLogger(tmp_path),
+        hooks=HookRegistry([planning, ToolExecutionLogger(tmp_path)]),
+    )
+    run(
+        executor.hooks.run(
+            HookContext(
+                event='user_prompt_submit',
+                root=tmp_path,
+                prompt='帮我完整实现权限 hook 系统',
+            )
+        )
+    )
+
+    record = run(
+        executor.execute(ToolCall(0, 'toolu_write', 'write_sample', {}))
+    )
+
+    assert record.result.success is False
+    assert record.result.error is not None
+    assert record.result.error.code == 'todo_required'
+    assert not (tmp_path / 'sample.txt').exists()
+
+
+def test_memory_write_goes_through_permission_and_logging(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(create_memory_tools(tmp_path))
+    executor = ToolExecutor(
+        registry,
+        root=tmp_path,
+        permission=PermissionMiddleware('readonly'),
+        logger=ToolExecutionLogger(tmp_path),
+    )
+
+    record = run(
+        executor.execute(
+            ToolCall(
+                0,
+                'toolu_memory',
+                'memory_write',
+                {'name': 'testing', 'content': 'Use pytest.'},
+            )
+        )
+    )
+
+    assert record.result.success is False
+    assert record.result.error is not None
+    assert record.result.error.code == 'permission_denied'
+    assert not (tmp_path / '.forge' / 'memory' / 'testing.md').exists()
+    log = json.loads(
+        (tmp_path / '.forge' / 'logs' / 'tools.jsonl').read_text(
+            encoding='utf-8'
+        )
+    )
+    assert log['event'] == 'permission_denied'
+    assert log['tool'] == 'memory_write'
+    assert log['permission_mode'] == 'readonly'

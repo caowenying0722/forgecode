@@ -12,11 +12,13 @@ from forge.tools.filesystem import (
 )
 from forge.tools.finish import FinishTaskTool
 from forge.tools.git import GitDiffTool, GitStatusTool
+from forge.tools.memory import create_memory_tools
 from forge.tools.mcp import MCPTool
 from forge.tools.patch import ApplyPatchTool
 from forge.tools.search import FindFilesTool, GrepTool
 from forge.tools.shell import RunCommandTool
-from forge.tools.subagent import ExploreSubagentTool
+from forge.tools.subagent import ExploreSubagentTool, TaskSubagentTool
+from forge.tools.todo import TodoList, TodoWriteTool
 from forge.tools.verify import VerifyTool
 from forge.runtime.workspace import WorkspaceTracker
 from forge.mcp import MCPClientManager
@@ -44,6 +46,8 @@ def create_default_registry(root: Path) -> ToolRegistry:
             VerifyTool(root, tracker),
             GitStatusTool(root),
             GitDiffTool(root),
+            *create_memory_tools(root),
+            TaskSubagentTool(root),
             ExploreSubagentTool(root),
             *mcp_tools,
             FinishTaskTool(root),
@@ -61,7 +65,9 @@ __all__ = [
     'GrepTool',
     'ListDirectoryTool',
     'MCPTool',
+    'create_memory_tools',
     'ExploreSubagentTool',
+    'TaskSubagentTool',
     'ReadFileTool',
     'ReplaceTextTool',
     'RunCommandTool',
@@ -69,5 +75,7 @@ __all__ = [
     'WriteFileChunkTool',
     'WriteFileTool',
     'ToolRegistry',
+    'TodoList',
+    'TodoWriteTool',
     'create_default_registry',
 ]

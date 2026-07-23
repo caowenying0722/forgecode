@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
-from time import perf_counter, time
-from typing import Callable, Literal
+from time import perf_counter
+from typing import Literal
 
+from forge.hooks.builtin import (
+    PermissionApprover,
+    PermissionHook,
+    PermissionMode,
+    ToolLoggingHook,
+    normalize_permission_mode,
+    permission_denied_result,
+    render_permission_notice,
+)
+from forge.hooks.registry import HookRegistry
+from forge.hooks.state import HookContext
 from forge.runtime.state import ToolCall
 from forge.runtime.workspace import WorkspaceTracker
 from forge.tools.base import ToolEffect, ToolRegistry, ToolResult
 
 
-PermissionMode = Literal['trusted', 'strict', 'readonly']
 AutoCommitMode = Literal['off', 'ask', 'always']
-PermissionApprover = Callable[[ToolCall, ToolEffect | None], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,69 +39,8 @@ class AutoCommitConfig:
     mode: AutoCommitMode = 'off'
 
 
-class PermissionMiddleware:
-    '''Apply session-level permission policy before tools run.'''
-
-    def __init__(
-        self,
-        mode: PermissionMode = 'strict',
-        approver: PermissionApprover | None = None,
-    ) -> None:
-        self.mode = mode
-        self.approver = approver
-
-    def check(self, tool_call: ToolCall, effect: ToolEffect | None) -> ToolResult | None:
-        if self.mode == 'trusted':
-            return None
-        if self.mode == 'readonly' and effect != 'read_only':
-            return permission_denied_result(
-                tool_call,
-                self.mode,
-                effect,
-                'readonly mode allows only read-only tools',
-            )
-        if self.mode == 'strict' and effect in {'workspace_write', 'process'}:
-            if self.approver is not None and self.approver(tool_call, effect):
-                return None
-            return permission_denied_result(
-                tool_call,
-                self.mode,
-                effect,
-                'user did not approve this tool call',
-                terminal=True,
-            )
-        return None
-
-
-class ToolExecutionLogger:
-    '''Append JSONL audit records for every tool execution attempt.'''
-
-    def __init__(self, root: Path) -> None:
-        self.path = root.resolve() / '.forge' / 'logs' / 'tools.jsonl'
-
-    def record(
-        self,
-        tool_call: ToolCall,
-        record: ToolExecutionRecord,
-    ) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            'timestamp': time(),
-            'tool': tool_call.name,
-            'arguments': tool_call.arguments,
-            'effect': record.effect,
-            'success': record.result.success,
-            'summary': record.result.summary,
-            'error_code': (
-                record.result.error.code
-                if record.result.error is not None
-                else None
-            ),
-            'duration_seconds': round(record.duration_seconds, 6),
-            'permission_mode': record.permission_mode,
-        }
-        with self.path.open('a', encoding='utf-8') as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False) + '\n')
+PermissionMiddleware = PermissionHook
+ToolExecutionLogger = ToolLoggingHook
 
 
 class ToolExecutor:
@@ -107,6 +54,7 @@ class ToolExecutor:
         workspace_tracker: WorkspaceTracker | None = None,
         permission: PermissionMiddleware | None = None,
         logger: ToolExecutionLogger | None = None,
+        hooks: HookRegistry | None = None,
         auto_commit: AutoCommitConfig | None = None,
     ) -> None:
         self.registry = registry
@@ -114,6 +62,7 @@ class ToolExecutor:
         self.workspace_tracker = workspace_tracker
         self.permission = permission or PermissionMiddleware()
         self.logger = logger or ToolExecutionLogger(self.root)
+        self.hooks = hooks or HookRegistry([self.permission, self.logger])
         self.auto_commit = auto_commit or AutoCommitConfig()
 
     def effect(self, name: str) -> ToolEffect | None:
@@ -125,72 +74,45 @@ class ToolExecutor:
             self.workspace_tracker.watch_paths(mutation_target_paths(tool_call))
 
         started = perf_counter()
-        denied = self.permission.check(tool_call, effect)
-        if denied is None:
-            result = await self.registry.execute(
-                tool_call.name,
-                tool_call.arguments,
+        pre = await self.hooks.run(
+            HookContext(
+                event='pre_tool_use',
+                root=self.root,
+                tool_call=tool_call,
+                effect=effect,
+                permission_mode=self.permission.mode,
             )
-        else:
-            result = denied
+        )
+        active_call = pre.tool_call or tool_call
+        result = pre.tool_result
+        if result is None:
+            result = await self.registry.execute(
+                active_call.name,
+                active_call.arguments,
+            )
+        duration = perf_counter() - started
         record = ToolExecutionRecord(
             result=result,
             effect=effect,
-            duration_seconds=perf_counter() - started,
+            duration_seconds=duration,
             permission_mode=self.permission.mode,
         )
-        self.logger.record(tool_call, record)
+        await self.hooks.run(
+            HookContext(
+                event=(
+                    'permission_denied'
+                    if result.metadata.get('permission_denied')
+                    else 'post_tool_use'
+                ),
+                root=self.root,
+                tool_call=active_call,
+                effect=effect,
+                tool_result=result,
+                duration_seconds=duration,
+                permission_mode=self.permission.mode,
+            )
+        )
         return record
-
-
-def normalize_permission_mode(mode: str) -> PermissionMode:
-    normalized = mode.strip().casefold()
-    if normalized not in {'trusted', 'strict', 'readonly'}:
-        raise ValueError(
-            'Permission mode must be one of: trusted, strict, readonly.'
-        )
-    return normalized  # type: ignore[return-value]
-
-
-def render_permission_notice(mode: PermissionMode) -> str:
-    if mode == 'trusted':
-        return (
-            'Permission: trusted. Read, write, and process tools may run '
-            'without runtime permission blocking.'
-        )
-    if mode == 'readonly':
-        return (
-            'Permission: readonly. Only read-only tools may run; write and '
-            'process tools are blocked.'
-        )
-    return (
-        'Permission: strict. Read-only tools may run directly; write and '
-        'process tools ask for confirmation before execution.'
-    )
-
-
-def permission_denied_result(
-    tool_call: ToolCall,
-    mode: PermissionMode,
-    effect: ToolEffect | None,
-    reason: str,
-    *,
-    terminal: bool = False,
-) -> ToolResult:
-    return ToolResult.fail(
-        'permission_denied',
-        f'Permission denied for {tool_call.name}: {reason}.',
-        details={
-            'tool': tool_call.name,
-            'effect': effect,
-            'permission_mode': mode,
-            'terminal': terminal,
-        },
-        metadata={
-            'permission_denied': True,
-            'permission_terminal': terminal,
-        },
-    )
 
 
 def mutation_target_paths(tool_call: ToolCall) -> tuple[str, ...]:

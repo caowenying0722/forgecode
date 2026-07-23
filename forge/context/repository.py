@@ -123,6 +123,41 @@ class MemoryStore:
         self.rebuild_index()
         return True
 
+    def create(
+        self,
+        name: str,
+        content: str,
+        *,
+        description: str = '',
+        memory_type: str = 'project',
+    ) -> MemoryRecord:
+        if self.get(name) is not None:
+            raise ValueError(f'Memory already exists: {name}')
+        return self.remember(
+            name,
+            content,
+            description=description,
+            memory_type=memory_type,
+        )
+
+    def update(
+        self,
+        name: str,
+        content: str,
+        *,
+        description: str = '',
+        memory_type: str | None = None,
+    ) -> MemoryRecord:
+        existing = self.get(name)
+        if existing is None:
+            raise ValueError(f'Memory not found: {name}')
+        return self.remember(
+            existing.name,
+            content,
+            description=description or existing.description,
+            memory_type=memory_type or existing.memory_type,
+        )
+
     def select(self, query: str) -> MemorySelection:
         query_terms = search_terms(query)
         if not query_terms:
@@ -183,12 +218,21 @@ class MemoryStore:
 class RepositoryContext:
     '''Load scoped repository instructions and query-relevant memory.'''
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        cwd: Path | None = None,
+        home: Path | None = None,
+    ) -> None:
         self.root = root.resolve()
+        self.cwd = resolve_context_cwd(self.root, cwd)
+        self.home = (home or Path.home()).resolve()
         self.memory = MemoryStore(self.root)
 
     def instructions(self) -> str:
-        paths = [self.root / 'AGENTS.md', self.root / 'FORGE.md']
+        paths = list(instruction_paths(self.root, self.cwd, self.home))
+        paths.append(self.root / 'FORGE.md')
         rules = self.root / '.forge' / 'rules'
         if rules.exists():
             paths.extend(sorted(rules.glob('*.md')))
@@ -200,7 +244,10 @@ class RepositoryContext:
             content = path.read_text(encoding='utf-8')[:16_000]
             if total + len(content) > 32_000:
                 break
-            sections.append(f'## {path.relative_to(self.root).as_posix()}\n{content}')
+            sections.append(
+                f'## {display_instruction_path(path, self.root, self.home)}\n'
+                f'{content}'
+            )
             total += len(content)
         return '\n\n'.join(sections)
 
@@ -264,6 +311,48 @@ def memory_slug(name: str) -> str:
         return '-'.join(ascii_parts)[:64]
     digest = hashlib.sha256(name.encode('utf-8')).hexdigest()[:12]
     return f'memory-{digest}'
+
+
+def resolve_context_cwd(root: Path, cwd: Path | None) -> Path:
+    candidate = (cwd or Path.cwd()).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return root
+    return candidate
+
+
+def instruction_paths(root: Path, cwd: Path, home: Path) -> tuple[Path, ...]:
+    paths: list[Path] = [home / '.forge' / 'AGENTS.md']
+    directories = path_chain(root, cwd)
+    for directory in directories:
+        paths.append(directory / 'AGENTS.md')
+        paths.append(directory / 'AGENTS.override.md')
+    return tuple(dict.fromkeys(paths))
+
+
+def path_chain(root: Path, cwd: Path) -> tuple[Path, ...]:
+    try:
+        relative = cwd.relative_to(root)
+    except ValueError:
+        return (root,)
+    directories = [root]
+    current = root
+    for part in relative.parts:
+        current = current / part
+        directories.append(current)
+    return tuple(directories)
+
+
+def display_instruction_path(path: Path, root: Path, home: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        pass
+    try:
+        return '~/' + path.relative_to(home).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def search_terms(text: str) -> set[str]:

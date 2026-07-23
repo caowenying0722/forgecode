@@ -26,6 +26,9 @@ _COMBINED_CHANGE_ZH = re.compile(
     rf'[^，。；！？\n]{{0,30}}(?:并|然后|后)'
     rf'[^，。；！？\n]{{0,20}}(?:{_CHANGE_VERBS_ZH})'
 )
+_PRIORITY_FIX_ZH = re.compile(
+    rf'按\s*(?:最高)?\s*优先级\s*[Pp]0\b[^，。；！？\n]{{0,20}}(?:进行|执行|开始|实施|修复|处理|解决|优化|完成|实现|修改|改|新增|添加|重写|重构|落地)'
+)
 _EXECUTE_PLAN_ZH = re.compile(
     r'(?:按|按照).{0,40}(?:方案|计划|上述|刚才).{0,20}'
     r'(?:执行|实施|实现|落地)'
@@ -38,7 +41,7 @@ _READ_ONLY_ZH = re.compile(
     r'(?:^\s*(?:为什么|为何|如何|怎么|(?:帮我|请你?)?'
     r'(?:解释|说明|介绍)|查看|告诉我|'
     r'列出|总结|回顾|分析)|'
-    r'(?:清单|列表|优先级|P0/P1/P2|p0/p1/p2)|'
+    r'(?:清单|列表)|'
     r'(?:出|给|给出|制定|写|编写).{0,30}'
     r'(?:清单|列表|方案|计划|建议|规划|roadmap)|'
     r'(?:修复|改动|修改|优化).{0,16}'
@@ -129,6 +132,7 @@ def infer_change_required(prompt: str) -> bool:
         if (
             _COMBINED_CHANGE_ZH.search(clause)
             or _COMBINED_CHANGE_EN.search(clause)
+            or _PRIORITY_FIX_ZH.search(clause)
             or _EXECUTE_PLAN_ZH.search(clause)
         ):
             return True

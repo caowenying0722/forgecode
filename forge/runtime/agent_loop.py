@@ -14,6 +14,9 @@ from forge.context.manager import (
     ContextStats,
 )
 from forge.context.working import WorkingState
+from forge.hooks import TodoPlanningHook
+from forge.hooks.registry import HookRegistry
+from forge.hooks.state import HookContext
 from forge.mcp.client import MCPConfigurationError, parse_mcp_config
 from forge.runtime.intent import infer_change_required
 from forge.runtime.model_client import (
@@ -55,7 +58,9 @@ from forge.runtime.workspace import WorkspaceTracker
 from forge.sessions.store import SessionStore
 from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolRegistry, ToolResult
+from forge.tools.subagent import ExploreSubagentTool, TaskSubagentTool
 from forge.tools.task import create_task_tools
+from forge.tools.todo import TodoList, TodoWriteTool
 
 
 ACTION_RECOVERY_READ_TOOLS = frozenset(
@@ -69,7 +74,11 @@ PLAN_MODE_TOOLS = frozenset(
         'read_file',
         'grep',
         'git_status',
+        'memory_list',
+        'memory_read',
+        'task',
         'explore_subagent',
+        'todo_write',
     }
 )
 
@@ -180,24 +189,51 @@ class Conversation:
             else Path.cwd()
         )
         self.permission = PermissionMiddleware('trusted')
+        self.todo_list = TodoList()
+        self.todo_planning = TodoPlanningHook()
+        self.tool_logger = ToolExecutionLogger(resolved_context_root)
+        self.hook_registry = HookRegistry(
+            [self.todo_planning, self.permission, self.tool_logger]
+        )
         self.task_manager = TaskManager(resolved_context_root)
         self.session_store = SessionStore(resolved_context_root)
         self.session_id: str | None = None
         self.interaction_mode: InteractionMode = 'auto'
         self.working_state = WorkingState()
         if registry is not None:
+            if 'task' in registry.names:
+                registry.replace(
+                    TaskSubagentTool(
+                        resolved_context_root,
+                        permission=self.permission,
+                        workspace_tracker=tracker,
+                    )
+                )
+            if 'explore_subagent' in registry.names:
+                registry.replace(
+                    ExploreSubagentTool(
+                        resolved_context_root,
+                        permission=self.permission,
+                        workspace_tracker=tracker,
+                    )
+                )
             for task_tool in create_task_tools(
                 resolved_context_root,
                 self.task_manager,
             ):
                 registry.register(task_tool)
+            if 'todo_write' not in registry.names:
+                registry.register(
+                    TodoWriteTool(resolved_context_root, self.todo_list)
+                )
         self.tool_executor = (
             ToolExecutor(
                 registry,
                 root=resolved_context_root,
                 workspace_tracker=tracker,
                 permission=self.permission,
-                logger=ToolExecutionLogger(resolved_context_root),
+                logger=self.tool_logger,
+                hooks=self.hook_registry,
             )
             if registry is not None
             else None
@@ -251,6 +287,14 @@ class Conversation:
         if not prompt.strip():
             raise ValueError('prompt must not be empty')
 
+        await self.hook_registry.run(
+            HookContext(
+                event='user_prompt_submit',
+                root=self.task_manager.root,
+                prompt=prompt,
+                permission_mode=self.permission.mode,
+            )
+        )
         self.task_manager.begin_turn(prompt)
         self.working_state = WorkingState()
         self._last_task_context = self.task_manager.system_suffix()
@@ -279,6 +323,8 @@ class Conversation:
         last_completion_reasons: tuple[str, ...] = ()
         finalization_recovery = False
         stagnation_final_recovery = False
+        token_limit_recovery = False
+        token_limit_reason = ''
         completion_ready_revision: int | None = None
         completion_decision_calls = 0
         completion_ready_context = ''
@@ -306,36 +352,31 @@ class Conversation:
 
             if (
                 self.max_turn_input_tokens is not None
+                and not token_limit_recovery
                 and completed_usage.total_input_tokens
                 >= self.max_turn_input_tokens
             ):
-                reason = (
+                token_limit_reason = (
                     'Stopped after the turn consumed '
                     f'{completed_usage.total_input_tokens} input tokens, '
                     'reaching the configured cumulative input-token limit '
                     f'of {self.max_turn_input_tokens}.'
                 )
-                self.task_manager.stuck((reason,))
-                self.messages[:] = request_messages
-                yield TurnCompleted(
-                    result=TurnResult(
-                        text=reason,
-                        usage=completed_usage,
-                        model_calls=iteration - 1,
-                        tool_calls=tuple(all_tool_calls),
-                        status='stuck',
-                        changed_paths=(
-                            self.workspace_tracker.changed_paths
-                            if self.workspace_tracker is not None
-                            else ()
-                        ),
-                        verification=latest_verification,
-                        completion_reasons=(reason,),
+                token_limit_recovery = True
+                force_synthesis = True
+                request_messages.append(
+                    build_token_limit_recovery_feedback(
+                        token_limit_reason,
+                        self.task_manager.system_suffix(),
+                        self.working_state.system_suffix(),
                     )
                 )
-                return
 
-            if finalization_recovery or stagnation_final_recovery:
+            if (
+                finalization_recovery
+                or stagnation_final_recovery
+                or token_limit_recovery
+            ):
                 request_tools = None
             elif self.interaction_mode == 'plan':
                 request_tools = self._plan_mode_tools()
@@ -359,6 +400,7 @@ class Conversation:
                 mutation_recovery_context=mutation_recovery_context,
                 finalization_recovery=finalization_recovery,
                 stagnation_final_recovery=stagnation_final_recovery,
+                token_limit_recovery=token_limit_recovery,
                 completion_ready_context=completion_ready_context,
                 change_required=change_required,
                 mutation_attempted=mutation_attempted,
@@ -659,13 +701,18 @@ class Conversation:
                 build_assistant_message(text, tool_calls)
             )
 
-            if (finalization_recovery or stagnation_final_recovery) and tool_calls:
+            if (
+                finalization_recovery
+                or stagnation_final_recovery
+                or token_limit_recovery
+            ) and tool_calls:
                 all_tool_calls.extend(tool_calls)
-                recovery_name = (
-                    'finalization recovery'
-                    if finalization_recovery
-                    else 'stagnation final recovery'
-                )
+                if finalization_recovery:
+                    recovery_name = 'finalization recovery'
+                elif stagnation_final_recovery:
+                    recovery_name = 'stagnation final recovery'
+                else:
+                    recovery_name = 'token-limit recovery'
                 reason = (
                     f'The model requested another tool during the dedicated '
                     f'{recovery_name} instead of returning its final '
@@ -693,6 +740,32 @@ class Conversation:
                 return
 
             if not tool_calls:
+                if token_limit_recovery:
+                    reason = (
+                        token_limit_reason
+                        or 'The turn reached the cumulative input-token limit.'
+                    )
+                    self.task_manager.stuck((reason,))
+                    self.messages[:] = request_messages
+                    self.context.capture_explicit_memory(prompt)
+                    yield TurnCompleted(
+                        result=TurnResult(
+                            text=complete_text,
+                            usage=completed_usage,
+                            last_request_usage=request_usage,
+                            model_calls=iteration,
+                            tool_calls=tuple(all_tool_calls),
+                            status='stuck',
+                            changed_paths=(
+                                self.workspace_tracker.changed_paths
+                                if self.workspace_tracker is not None
+                                else ()
+                            ),
+                            verification=latest_verification,
+                            completion_reasons=(reason,),
+                        )
+                    )
+                    return
                 if mutation_failures:
                     reason = (
                         f'Stopped after {mutation_failure_count} failed '
@@ -1765,6 +1838,7 @@ class Conversation:
         mutation_recovery_context: str = '',
         finalization_recovery: bool = False,
         stagnation_final_recovery: bool = False,
+        token_limit_recovery: bool = False,
         completion_ready_context: str = '',
         change_required: bool = False,
         mutation_attempted: bool = False,
@@ -1774,7 +1848,9 @@ class Conversation:
     ) -> str:
         prompt = self._system_prompt_with_task(
             include_tool_availability=not (
-                finalization_recovery or stagnation_final_recovery
+                finalization_recovery
+                or stagnation_final_recovery
+                or token_limit_recovery
             ),
         )
         if self._last_repository_context:
@@ -1816,6 +1892,18 @@ class Conversation:
                 'evidence, state the blocker and the most specific next '
                 'action a future tool-enabled turn should take. Do not '
                 'request or describe another tool call.'
+            )
+        elif token_limit_recovery:
+            prompt += (
+                '\n\n[ForgeCode Token-Limit Recovery]\n'
+                'The current user turn reached its cumulative input-token '
+                'safety threshold. This is one dedicated final recovery '
+                'request with no tools included. Return a concise progress '
+                'summary in the user\'s language using only existing '
+                'conversation and repository evidence. State what was done, '
+                'what remains, any verification already performed, and the '
+                'specific next step a future turn should take. Do not request '
+                'or describe another tool call.'
             )
         elif action_recovery:
             prompt += '\n\n' + render_action_recovery_context(
@@ -1949,6 +2037,12 @@ class Conversation:
             )
         return render_mcp_status(self.task_manager.root, tool_names)
 
+    def hooks_status(self) -> str:
+        return self.hook_registry.describe()
+
+    def todo_status(self) -> str:
+        return self.todo_list.render()
+
     def mode_show(self) -> str:
         return render_mode_notice(self.interaction_mode)
 
@@ -1967,6 +2061,16 @@ class Conversation:
 
     def set_permission_approver(self, approver: Any | None) -> None:
         self.permission.approver = approver
+
+    async def run_stop_hooks(self, result: TurnResult) -> None:
+        await self.hook_registry.run(
+            HookContext(
+                event='stop',
+                root=self.task_manager.root,
+                turn_result=result,
+                permission_mode=self.permission.mode,
+            )
+        )
 
     def save_session(self) -> str:
         snapshot = self.session_store.save(
@@ -2383,6 +2487,25 @@ def build_stagnation_final_recovery_feedback(
     }
 
 
+def build_token_limit_recovery_feedback(
+    reason: str,
+    task_context: str,
+    working_context: str,
+) -> dict[str, Any]:
+    return {
+        'role': 'user',
+        'content': (
+            f'{task_context}\n\n{working_context}\n\n'
+            '[ForgeCode Token-Limit Recovery]\n'
+            f'{reason} The next request will include no tools. Return a '
+            'concise user-facing progress summary from the evidence already '
+            'in context. Include what was completed, what remains, any '
+            'verification already performed, and the exact next action for a '
+            'future tool-enabled turn. Do not request another tool call.'
+        ),
+    }
+
+
 def completion_review_paths(
     tool_results: list[tuple[ToolCall, ToolResult]],
     changed_paths: tuple[str, ...],
@@ -2617,6 +2740,7 @@ def is_tool_protocol_failure(result: ToolResult) -> bool:
             'git_diff_path_is_directory',
             'tool_not_available_in_phase',
             'action_read_limit_reached',
+            'todo_required',
         }
     )
 

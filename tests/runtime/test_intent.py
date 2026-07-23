@@ -16,6 +16,7 @@ from forge.runtime.intent import infer_change_required
         '帮我改一下',
         '请检查并修复这个 bug',
         '按刚才的方案执行',
+        '按最高优先级 P0 进行修复',
         '把 world.js 改成六面渲染',
         '可以，开始吧',
         'Fix the rendering bug.',

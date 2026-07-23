@@ -60,6 +60,55 @@ def test_repository_context_loads_rules_and_relevant_memory(
     assert 'Calculator tests use pytest.' in suffix
 
 
+def test_repository_context_loads_global_and_nested_agents_files(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / 'home'
+    global_forge = home / '.forge'
+    global_forge.mkdir(parents=True)
+    (global_forge / 'AGENTS.md').write_text(
+        'Global instructions.',
+        encoding='utf-8',
+    )
+    repo = tmp_path / 'repo'
+    package = repo / 'src' / 'package'
+    package.mkdir(parents=True)
+    (repo / 'AGENTS.md').write_text('Root instructions.', encoding='utf-8')
+    (repo / 'AGENTS.override.md').write_text(
+        'Root override.',
+        encoding='utf-8',
+    )
+    (repo / 'src' / 'AGENTS.md').write_text(
+        'Source instructions.',
+        encoding='utf-8',
+    )
+    (package / 'AGENTS.override.md').write_text(
+        'Package override.',
+        encoding='utf-8',
+    )
+
+    instructions = RepositoryContext(
+        repo,
+        cwd=package,
+        home=home,
+    ).instructions()
+
+    assert instructions.index('Global instructions.') < instructions.index(
+        'Root instructions.'
+    )
+    assert instructions.index('Root instructions.') < instructions.index(
+        'Root override.'
+    )
+    assert instructions.index('Root override.') < instructions.index(
+        'Source instructions.'
+    )
+    assert instructions.index('Source instructions.') < instructions.index(
+        'Package override.'
+    )
+    assert '## ~/.forge/AGENTS.md' in instructions
+    assert '## src/package/AGENTS.override.md' in instructions
+
+
 def test_consolidation_removes_exact_duplicate_content(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path)
     store.remember('first', 'Same durable fact.')

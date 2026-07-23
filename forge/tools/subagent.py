@@ -1,11 +1,11 @@
-'''Bounded read-only subagents exposed as ForgeCode tools.'''
+'''Bounded supervised subagents exposed as ForgeCode tools.'''
 
 from __future__ import annotations
 
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import Field
 
@@ -14,15 +14,35 @@ from forge.tools.filesystem import ListDirectoryTool, ReadFileTool
 from forge.tools.git import GitStatusTool
 from forge.tools.search import FindFilesTool, GrepTool
 
+if TYPE_CHECKING:
+    from forge.hooks.builtin import PermissionHook
+    from forge.hooks.registry import HookRegistry
+    from forge.runtime.workspace import WorkspaceTracker
+
+
+SUBAGENT_EXCLUDED_TOOLS = frozenset(
+    {
+        'task',
+        'explore_subagent',
+        'task_get',
+        'task_plan',
+        'task_update',
+        'todo_write',
+        'finish_task',
+    }
+)
+
 
 EXPLORE_SUBAGENT_SYSTEM = '''You are ForgeCode Explore Subagent.
-You perform bounded, read-only repository exploration for the main agent.
-Use only the provided read-only tools. Do not modify files, run tests, or
-claim completion of the user task. Return a concise structured report with:
+You perform bounded repository work for the main agent in an isolated context.
+Use the provided tools to inspect, edit, run commands, and verify when needed.
+You cannot spawn recursive subagents or manage the main task plan. Do not claim
+completion of the user's whole task. Return a concise structured report with:
 - relevant_files
 - evidence
-- root_cause_hypotheses
-- suggested_edit_points
+- changes_made
+- verification
+- remaining_risks
 - open_questions
 Ground every claim in observed repository evidence.'''
 
@@ -46,11 +66,11 @@ class ExploreSubagentInput(ToolInput):
 class ExploreSubagentTool(Tool[ExploreSubagentInput]):
     name = 'explore_subagent'
     description = (
-        'Delegate bounded read-only repository exploration to an isolated '
+        'Delegate bounded repository work to an isolated '
         'subagent. Use this to locate relevant files, gather evidence, and '
-        'form hypotheses before editing. The subagent cannot write files or '
-        'run process commands; it returns a structured report for the main '
-        'agent to decide how to proceed.'
+        'make scoped edits. The subagent cannot spawn recursive agents or '
+        'manage task-plan tools; its calls still pass through permissions, '
+        'hooks, and logging. It returns a structured report for the main agent.'
     )
     input_model = ExploreSubagentInput
 
@@ -59,32 +79,68 @@ class ExploreSubagentTool(Tool[ExploreSubagentInput]):
         root: Path,
         *,
         client: SubagentModelClient | None = None,
+        permission: 'PermissionHook | None' = None,
+        workspace_tracker: 'WorkspaceTracker | None' = None,
     ) -> None:
         super().__init__(root)
         self.client = client
+        self.permission = permission
+        self.workspace_tracker = workspace_tracker
 
     async def execute(self, arguments: ExploreSubagentInput) -> ToolResult:
         from forge.runtime.model_client import AnthropicModelClient
 
         client = self.client or AnthropicModelClient.from_config()
-        subagent = ExploreSubagent(self.root, client)
+        subagent = ExploreSubagent(
+            self.root,
+            client,
+            permission=self.permission,
+            workspace_tracker=self.workspace_tracker,
+        )
         return await subagent.run(arguments)
 
 
-class ExploreSubagent:
-    '''A small isolated model loop with only read-only repository tools.'''
+class TaskSubagentTool(ExploreSubagentTool):
+    name = 'task'
+    description = (
+        'Delegate bounded repository work to an isolated '
+        'subagent with a clean context. Use this to split off investigation '
+        'or implementation work. The subagent has normal tools except task, '
+        'subagent, and task-plan control tools, so it cannot recursively spawn '
+        'agents. Its calls still pass through ForgeCode hooks, permissions, '
+        'and tool logging.'
+    )
 
-    def __init__(self, root: Path, client: SubagentModelClient) -> None:
+
+class ExploreSubagent:
+    '''A small isolated model loop without recursive task/subagent tools.'''
+
+    def __init__(
+        self,
+        root: Path,
+        client: SubagentModelClient,
+        *,
+        permission: 'PermissionHook | None' = None,
+        hooks: 'HookRegistry | None' = None,
+        workspace_tracker: 'WorkspaceTracker | None' = None,
+    ) -> None:
+        from forge.hooks.builtin import PermissionHook, ToolLoggingHook
+        from forge.hooks.registry import HookRegistry
+        from forge.runtime.tool_executor import ToolExecutor
+
         self.root = root
         self.client = client
-        self.registry = ToolRegistry(
-            [
-                ListDirectoryTool(root),
-                FindFilesTool(root),
-                ReadFileTool(root),
-                GrepTool(root),
-                GitStatusTool(root),
-            ]
+        self.registry = create_subagent_registry(root, workspace_tracker)
+        self.permission = permission or PermissionHook('trusted')
+        self.logger = ToolLoggingHook(root, agent='explore_subagent')
+        self.hooks = hooks or HookRegistry([self.permission, self.logger])
+        self.executor = ToolExecutor(
+            self.registry,
+            root=root,
+            workspace_tracker=workspace_tracker,
+            permission=self.permission,
+            logger=self.logger,
+            hooks=self.hooks,
         )
 
     async def run(self, arguments: ExploreSubagentInput) -> ToolResult:
@@ -129,10 +185,8 @@ class ExploreSubagent:
             messages.append(build_assistant_message(text, requested))
             results: list[tuple[ToolCall, ToolResult]] = []
             for tool_call in requested:
-                result = await self.registry.execute(
-                    tool_call.name,
-                    tool_call.arguments,
-                )
+                execution = await self.executor.execute(tool_call)
+                result = execution.result
                 results.append((tool_call, result))
                 tool_calls.append(tool_call.name)
             messages.append(build_tool_result_message(results))
@@ -142,7 +196,7 @@ class ExploreSubagent:
                         'role': 'user',
                         'content': (
                             'Round limit reached. Return the structured '
-                            'exploration report now using existing evidence.'
+                            'work report now using existing evidence.'
                         ),
                     }
                 )
@@ -155,10 +209,59 @@ class ExploreSubagent:
                 metadata=metadata(total_usage, tool_calls),
             )
         return ToolResult.ok(
-            'Explore subagent returned a read-only report.',
+            'Explore subagent returned a structured report.',
             content=final_text,
             metadata=metadata(total_usage, tool_calls),
         )
+
+
+def create_subagent_registry(
+    root: Path,
+    workspace_tracker: 'WorkspaceTracker | None' = None,
+) -> ToolRegistry:
+    from forge.mcp import MCPClientManager
+    from forge.tools.filesystem import (
+        ReplaceTextTool,
+        WriteFileChunkTool,
+        WriteFileTool,
+    )
+    from forge.tools.git import GitDiffTool
+    from forge.tools.memory import create_memory_tools
+    from forge.tools.mcp import MCPTool
+    from forge.tools.patch import ApplyPatchTool
+    from forge.tools.shell import RunCommandTool
+    from forge.tools.verify import VerifyTool
+    from forge.runtime.workspace import WorkspaceTracker
+
+    tracker = workspace_tracker or WorkspaceTracker(root)
+    mcp_manager = MCPClientManager.from_config_file(root)
+    tools = [
+        ListDirectoryTool(root),
+        FindFilesTool(root),
+        ReadFileTool(root),
+        GrepTool(root),
+        WriteFileTool(root),
+        WriteFileChunkTool(root),
+        ReplaceTextTool(root),
+        ApplyPatchTool(root),
+        RunCommandTool(root),
+        VerifyTool(root, tracker),
+        GitStatusTool(root),
+        GitDiffTool(root),
+        *create_memory_tools(root),
+        *[
+            MCPTool(root, remote_tool)
+            for remote_tool in mcp_manager.list_tools()
+        ],
+    ]
+    return ToolRegistry(
+        [
+            tool
+            for tool in tools
+            if tool.name not in SUBAGENT_EXCLUDED_TOOLS
+        ],
+        workspace_tracker=tracker,
+    )
 
 
 def render_explore_task(arguments: ExploreSubagentInput) -> str:

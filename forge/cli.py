@@ -168,6 +168,20 @@ def run_interactive_chat(
             resolved_terminal.show_notice('MCP', resolved_session.mcp_status())
             continue
 
+        if prompt.strip() == '/hooks':
+            resolved_terminal.show_notice(
+                'Hooks',
+                resolved_session.hooks_status(),
+            )
+            continue
+
+        if prompt.strip() == '/todo':
+            resolved_terminal.show_notice(
+                'TODO',
+                resolved_session.todo_status(),
+            )
+            continue
+
         if prompt.strip() == '/permission':
             resolved_terminal.show_notice(
                 'Permission',
@@ -349,6 +363,9 @@ async def render_streamed_turn(
             elif isinstance(event, ContextCompacted):
                 response_view.compact_context(event)
             elif isinstance(event, TurnCompleted):
+                run_stop_hooks = getattr(session, 'run_stop_hooks', None)
+                if run_stop_hooks is not None:
+                    await run_stop_hooks(event.result)
                 response_view.complete(event.result)
         save_session = getattr(session, 'save_session', None)
         if save_session is not None:

@@ -325,8 +325,28 @@ def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(
         'read_file',
         'grep',
         'git_status',
+        'memory_list',
+        'memory_read',
+        'task',
         'explore_subagent',
+        'todo_write',
     }
+
+
+def test_subagent_delegate_tools_share_conversation_permission(
+    tmp_path: Path,
+) -> None:
+    registry = create_default_registry(tmp_path)
+    conversation = Conversation(
+        client=FakeModelClient(streamed_response('ready')),
+        registry=registry,
+    )
+
+    task_tool = registry._tools['task']
+    explore_tool = registry._tools['explore_subagent']
+
+    assert task_tool.permission is conversation.permission
+    assert explore_tool.permission is conversation.permission
 
 
 def test_code_mode_requires_diff_even_for_plan_like_prompt(
@@ -374,6 +394,44 @@ def test_strict_permission_blocks_write_tool_in_agent_loop(
     assert isinstance(final, TurnCompleted)
     assert final.result.status == 'blocked'
     assert len(client.calls) == 1
+
+
+def test_todo_required_does_not_count_as_workspace_write_failure(
+    tmp_path: Path,
+) -> None:
+    tool_call = ToolCall(
+        0,
+        'toolu_write',
+        'tiny_write',
+        {'path': 'sample.txt', 'content': 'abc'},
+    )
+    tracker = NoChangeWorkspaceTracker(tmp_path)
+    registry = ToolRegistry(
+        [TinyWriteTool(tmp_path)],
+        workspace_tracker=tracker,
+    )
+    client = FakeModelClient(
+        tool_response(tool_call),
+        streamed_response('I need to plan first.'),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=registry,
+        mutation_recovery_limit=1,
+        max_tool_protocol_recoveries=1,
+    )
+
+    events = collect_turn(conversation, '帮我先按最高优先级P0进行修复')
+
+    completed = [
+        event for event in events if isinstance(event, ToolExecutionCompleted)
+    ][0]
+    assert completed.result.success is False
+    assert completed.result.error is not None
+    assert completed.result.error.code == 'todo_required'
+    final = events[-1]
+    assert isinstance(final, TurnCompleted)
+    assert 'workspace-write attempt' not in final.result.text
 
 
 def test_task_policy_requires_workspace_tracking(tmp_path: Path) -> None:
@@ -1008,7 +1066,7 @@ def test_edit_recovery_allows_one_read_then_blocks_repeated_reads(
     )
 
 
-def test_turn_stops_at_cumulative_input_token_limit(
+def test_turn_enters_recovery_at_cumulative_input_token_limit(
     tmp_path: Path,
 ) -> None:
     tool = RecordingReadFileTool(tmp_path)
@@ -1020,6 +1078,10 @@ def test_turn_stops_at_cumulative_input_token_limit(
         tool_response(
             ToolCall(0, 'read-two', 'read_file', {'path': 'two.js'}),
             input_tokens=60,
+        ),
+        streamed_response(
+            'I inspected two files and should continue in the next turn.',
+            input_tokens=15,
         ),
     )
     conversation = Conversation(
@@ -1036,10 +1098,16 @@ def test_turn_stops_at_cumulative_input_token_limit(
         event.result for event in events if isinstance(event, TurnCompleted)
     )
     assert result.status == 'stuck'
-    assert result.model_calls == 2
-    assert result.usage.input_tokens == 120
-    assert 'cumulative input-token limit of 100' in result.text
-    assert len(client.calls) == 2
+    assert result.model_calls == 3
+    assert result.usage.input_tokens == 135
+    assert 'I inspected two files' in result.text
+    assert result.completion_reasons == (
+        'Stopped after the turn consumed 120 input tokens, reaching the '
+        'configured cumulative input-token limit of 100.',
+    )
+    assert len(client.calls) == 3
+    assert client.calls[2]['tools'] is None
+    assert '[ForgeCode Token-Limit Recovery]' in client.calls[2]['system']
 
 
 def test_failed_mutation_without_tracker_rejects_text_completion(

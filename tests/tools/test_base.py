@@ -27,6 +27,12 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'verify',
         'git_status',
         'git_diff',
+        'memory_list',
+        'memory_read',
+        'memory_write',
+        'memory_update',
+        'memory_delete',
+        'task',
         'explore_subagent',
         'finish_task',
     )

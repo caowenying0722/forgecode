@@ -60,6 +60,8 @@ SLASH_COMMANDS = (
         '切换工具权限模式',
     ),
     SlashCommandSpec('/mcp', '/mcp', '查看 MCP 服务器与工具状态'),
+    SlashCommandSpec('/hooks', '/hooks', '查看当前 Hook 注册列表'),
+    SlashCommandSpec('/todo', '/todo', '查看当前 TODO 计划'),
     SlashCommandSpec('/exit', '/exit', '退出 ForgeCode'),
     SlashCommandSpec('/task', '/task', '查看当前任务与计划'),
     SlashCommandSpec('/task history', '/task history', '列出已保存的复杂任务'),
