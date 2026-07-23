@@ -1136,27 +1136,31 @@ def test_inspection_stagnation_does_not_enter_action_recovery(
 ) -> None:
     initialize_git_repository(tmp_path)
     investigation = read_only_stagnation_calls('inspection')
+    summary = 'sample.txt contains the old baseline value.'
     client = FakeModelClient(
         *(response_with_tool(call) for call in investigation),
+        text_response(summary),
     )
     conversation = Conversation(
         client=client,
         registry=create_default_registry(tmp_path),
+        stagnation_warning=4,
+        stagnation_limit=8,
     )
 
     events = collect_turn(conversation, 'Inspect and explain sample.txt')
 
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
-    assert completed.result.status == 'stuck'
-    assert completed.result.model_calls == 9
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert completed.result.model_calls == 10
     assert completed.result.changed_paths == ()
     assert client.responses == []
-    assert (
-        'without new workspace, plan, or repository evidence'
-        in completed.result.text
+    assert client.calls[-1]['tools'] is None
+    assert '[ForgeCode Stagnation Final Recovery]' in (
+        client.calls[-1]['system'] or ''
     )
-    assert all(call['tools'] is not None for call in client.calls)
     assert all(
         '[ForgeCode Action Recovery]' not in (
             (call['system'] or '') + str(call['messages'])
@@ -1425,12 +1429,14 @@ def test_unfinished_explicit_plan_does_not_enter_finalization_recovery(
         ToolCall(0, f'unfinished-plan-repeat-{index}', 'git_diff', {})
         for index in range(1, 9)
     ]
+    summary = 'Edited and verified sample.txt, but the explicit plan remains incomplete.'
     client = FakeModelClient(
         response_with_tool(plan),
         response_with_tool(edit),
         response_with_tool(verify),
         response_with_tool(diff),
         *(response_with_tool(call) for call in redundant_diffs),
+        text_response(summary),
     )
     conversation = Conversation(
         client=client,
@@ -1441,8 +1447,9 @@ def test_unfinished_explicit_plan_does_not_enter_finalization_recovery(
 
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
-    assert completed.result.status == 'stuck'
-    assert completed.result.model_calls == 12
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert completed.result.model_calls == 13
     assert all(call['tools'] is not None for call in client.calls)
     assert all(
         '[ForgeCode Finalization Recovery]' not in (call['system'] or '')

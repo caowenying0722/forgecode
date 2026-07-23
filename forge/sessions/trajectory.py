@@ -14,6 +14,7 @@ from uuid import uuid4
 from forge.runtime.state import (
     CompletionBlocked,
     ConversationEvent,
+    ContextCompacted,
     ModelCallCompleted,
     ModelCallFailed,
     ModelCallStarted,
@@ -167,6 +168,9 @@ class TrajectoryRecorder:
             return
         if isinstance(event, CompletionBlocked):
             self._write('completion_blocked', asdict(event))
+            return
+        if isinstance(event, ContextCompacted):
+            self._write('context_compacted', asdict(event))
             return
         if isinstance(event, TurnCompleted):
             result = event.result

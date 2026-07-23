@@ -20,7 +20,7 @@ from rich.table import Table
 from rich.text import Text
 
 from forge import __version__
-from forge.runtime.state import TokenUsage, ToolCall, TurnResult
+from forge.runtime.state import ContextCompacted, TokenUsage, ToolCall, TurnResult
 from forge.context.manager import ContextStats
 from forge.context.manager import CompactionReport
 from forge.tools.base import ToolResult
@@ -124,7 +124,14 @@ class _ToolTimelineBlock:
     activities: list[_ToolActivity] = field(default_factory=list)
 
 
-type _TimelineBlock = _TextTimelineBlock | _ToolTimelineBlock
+@dataclass(slots=True)
+class _NoticeTimelineBlock:
+    title: str
+    lines: tuple[str, ...] = ()
+    style: str = 'green'
+
+
+type _TimelineBlock = _TextTimelineBlock | _ToolTimelineBlock | _NoticeTimelineBlock
 
 
 class _InteractivePrompt(Protocol):
@@ -407,6 +414,28 @@ class StreamingResponseView:
         )
         self.live.update(self._render(), refresh=True)
 
+    def compact_context(self, event: ContextCompacted) -> None:
+        '''Show automatic context compaction while the turn continues.'''
+        lines = (
+            (
+                f'{event.before_characters:,} -> '
+                f'{event.after_characters:,} characters'
+            ),
+            *(
+                (f'Full transcript: {event.transcript_path}',)
+                if event.transcript_path
+                else ()
+            ),
+        )
+        self.timeline.append(
+            _NoticeTimelineBlock(
+                title='Context compacted',
+                lines=lines,
+                style='green',
+            )
+        )
+        self.live.update(self._render(), refresh=True)
+
     def _render(self) -> Group:
         content = self._render_timeline()
         renderables: list[object] = [content]
@@ -452,6 +481,8 @@ class StreamingResponseView:
         for block in reversed(self.timeline):
             if isinstance(block, _ToolTimelineBlock):
                 desired_lines = min(len(block.activities), 6) + 1
+            elif isinstance(block, _NoticeTimelineBlock):
+                desired_lines = len(block.lines) + 1
             else:
                 desired_lines = max(1, len(block.text.splitlines()))
             line_budget = min(remaining_lines, desired_lines)
@@ -490,6 +521,13 @@ class StreamingResponseView:
                     ),
                 )
             )
+        if isinstance(block, _NoticeTimelineBlock):
+            rendered = Text()
+            rendered.append('✓ ', style=f'bold {block.style}')
+            rendered.append(block.title, style=f'bold {block.style}')
+            for line in block.lines:
+                rendered.append(f'\n  {line}', style='dim')
+            return rendered
         activity_limit = (
             None if line_budget is None else max(1, line_budget - 1)
         )

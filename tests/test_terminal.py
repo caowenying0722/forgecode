@@ -7,6 +7,7 @@ from prompt_toolkit.document import Document
 from rich.console import Console
 
 from forge.runtime.state import (
+    ContextCompacted,
     TokenUsage,
     ToolCall,
     TurnResult,
@@ -126,6 +127,29 @@ def test_terminal_renders_session_header_and_markdown_response() -> None:
     assert 'output 34' in rendered
     assert 'total 1,234' in rendered
     assert 'Session ended.' in rendered
+
+
+def test_terminal_renders_context_compaction_notice() -> None:
+    terminal, output = terminal_with_output()
+    with terminal.stream_response() as response:
+        response.compact_context(
+            ContextCompacted(
+                before_characters=10_000,
+                after_characters=1_000,
+                transcript_path='.forge/context/transcripts/test.jsonl',
+            )
+        )
+        response.complete(
+            TurnResult(
+                text='Done',
+                usage=TokenUsage(input_tokens=10, output_tokens=2),
+            )
+        )
+
+    rendered = output.getvalue()
+    assert 'Context compacted' in rendered
+    assert '10,000 -> 1,000 characters' in rendered
+    assert '.forge/context/transcripts/test.jsonl' in rendered
 
 
 def test_terminal_renders_cache_token_details() -> None:

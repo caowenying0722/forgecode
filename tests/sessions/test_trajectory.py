@@ -5,6 +5,7 @@ from pathlib import Path
 
 from forge.runtime.state import (
     CompletionBlocked,
+    ContextCompacted,
     ModelCallCompleted,
     ModelCallStarted,
     ModelRetryScheduled,
@@ -78,6 +79,13 @@ def test_trajectory_records_lifecycle_without_large_tool_content(
         CompletionBlocked(attempt=1, reasons=('verification missing',))
     )
     recorder.record_event(
+        ContextCompacted(
+            before_characters=10_000,
+            after_characters=1_000,
+            transcript_path='.forge/context/transcripts/test.jsonl',
+        )
+    )
+    recorder.record_event(
         TurnCompleted(
             result=TurnResult(
                 text='Finished',
@@ -112,6 +120,7 @@ def test_trajectory_records_lifecycle_without_large_tool_content(
         'workspace_changed',
         'verification_completed',
         'completion_blocked',
+        'context_compacted',
         'turn_completed',
     ]
     serialized = json.dumps(records, ensure_ascii=False)

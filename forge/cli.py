@@ -11,6 +11,7 @@ from forge.config import ConfigurationError, ForgeConfig
 from forge.runtime.agent_loop import Conversation
 from forge.runtime.state import (
     CompletionBlocked,
+    ContextCompacted,
     ModelTextDelta,
     ModelUsageUpdate,
     ToolExecutionCompleted,
@@ -280,6 +281,8 @@ async def render_streamed_turn(
                 response_view.complete_tool(event.tool_call, event.result)
             elif isinstance(event, CompletionBlocked):
                 response_view.block_completion(event.reasons)
+            elif isinstance(event, ContextCompacted):
+                response_view.compact_context(event)
             elif isinstance(event, TurnCompleted):
                 response_view.complete(event.result)
         save_session = getattr(session, 'save_session', None)

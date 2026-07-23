@@ -26,6 +26,7 @@ from forge.runtime.completion import CompletionGate, TaskPolicy
 from forge.runtime.state import (
     CompletionBlocked,
     ConversationEvent,
+    ContextCompacted,
     ModelCallCompleted,
     ModelCallFailed,
     ModelCallStarted,
@@ -91,7 +92,7 @@ class Conversation:
         max_output_continuations: int = 2,
         repeated_tool_limit: int = 2,
         stagnation_warning: int = 4,
-        stagnation_limit: int = 8,
+        stagnation_limit: int = 16,
         completion_decision_limit: int = 8,
         mutation_recovery_limit: int = 5,
         pre_mutation_limit: int = 8,
@@ -254,6 +255,7 @@ class Conversation:
         completion_blocks = 0
         last_completion_reasons: tuple[str, ...] = ()
         finalization_recovery = False
+        stagnation_final_recovery = False
         completion_ready_revision: int | None = None
         completion_decision_calls = 0
         completion_ready_context = ''
@@ -310,7 +312,7 @@ class Conversation:
                 )
                 return
 
-            if finalization_recovery:
+            if finalization_recovery or stagnation_final_recovery:
                 request_tools = None
             elif action_recovery:
                 request_tools = self._action_recovery_tools(
@@ -331,6 +333,7 @@ class Conversation:
                 force_synthesis=force_synthesis,
                 mutation_recovery_context=mutation_recovery_context,
                 finalization_recovery=finalization_recovery,
+                stagnation_final_recovery=stagnation_final_recovery,
                 completion_ready_context=completion_ready_context,
                 change_required=change_required,
                 mutation_attempted=mutation_attempted,
@@ -338,7 +341,7 @@ class Conversation:
                 action_recovery_calls=action_recovery_calls,
                 action_read_used=action_read_used,
             )
-            await self.context.compact_history(
+            compaction_report = await self.context.compact_history(
                 request_messages,
                 self.client,
                 system_prompt=request_system_prompt,
@@ -355,6 +358,17 @@ class Conversation:
                     0,
                 ),
             )
+            if (
+                compaction_report is not None
+                and compaction_report.success
+                and compaction_report.automatic
+            ):
+                yield ContextCompacted(
+                    before_characters=compaction_report.before_characters,
+                    after_characters=compaction_report.after_characters,
+                    transcript_path=compaction_report.transcript_path,
+                    automatic=compaction_report.automatic,
+                )
             yield ModelCallStarted(iteration=iteration)
             try:
                 async for event in self.client.stream(
@@ -620,11 +634,16 @@ class Conversation:
                 build_assistant_message(text, tool_calls)
             )
 
-            if finalization_recovery and tool_calls:
+            if (finalization_recovery or stagnation_final_recovery) and tool_calls:
                 all_tool_calls.extend(tool_calls)
+                recovery_name = (
+                    'finalization recovery'
+                    if finalization_recovery
+                    else 'stagnation final recovery'
+                )
                 reason = (
-                    'The model requested another tool during the dedicated '
-                    'finalization recovery instead of returning its final '
+                    f'The model requested another tool during the dedicated '
+                    f'{recovery_name} instead of returning its final '
                     'evidence-based answer.'
                 )
                 self.task_manager.stuck((reason,))
@@ -1196,6 +1215,7 @@ class Conversation:
                 action_read_used = False
                 force_synthesis = False
                 synthesis_retries = 0
+                stagnation_final_recovery = False
                 completion_ready_revision = None
                 completion_decision_calls = 0
                 completion_ready_context = ''
@@ -1304,6 +1324,7 @@ class Conversation:
                 if action_recovery:
                     force_synthesis = False
                     synthesis_retries = 0
+                    stagnation_final_recovery = False
                     calls_without_progress = 0
                     if entered_action_recovery:
                         action_block_events += 1
@@ -1368,6 +1389,7 @@ class Conversation:
                     completion_reviewed_paths.clear()
                     force_synthesis = False
                     synthesis_retries = 0
+                    stagnation_final_recovery = False
                 reviewed_now = completion_review_paths(
                     tool_results,
                     self.workspace_tracker.changed_paths,
@@ -1501,6 +1523,17 @@ class Conversation:
                             self.working_state.system_suffix(),
                             self.workspace_tracker.changed_paths,
                             latest_verification,
+                        )
+                    )
+                    continue
+                if not stagnation_final_recovery:
+                    stagnation_final_recovery = True
+                    force_synthesis = True
+                    request_messages.append(
+                        build_stagnation_final_recovery_feedback(
+                            self.task_manager.system_suffix(),
+                            self.working_state.system_suffix(),
+                            calls_without_progress,
                         )
                     )
                     continue
@@ -1657,6 +1690,7 @@ class Conversation:
         force_synthesis: bool = False,
         mutation_recovery_context: str = '',
         finalization_recovery: bool = False,
+        stagnation_final_recovery: bool = False,
         completion_ready_context: str = '',
         change_required: bool = False,
         mutation_attempted: bool = False,
@@ -1665,7 +1699,9 @@ class Conversation:
         action_read_used: bool = False,
     ) -> str:
         prompt = self._system_prompt_with_task(
-            include_tool_availability=not finalization_recovery,
+            include_tool_availability=not (
+                finalization_recovery or stagnation_final_recovery
+            ),
         )
         if self._last_repository_context:
             prompt += '\n\n' + self._last_repository_context
@@ -1693,6 +1729,19 @@ class Conversation:
                 'verification performed. Be honest about anything that was '
                 'not semantically or visually verified. Do not request or '
                 'describe another tool call.'
+            )
+        elif stagnation_final_recovery:
+            prompt += (
+                '\n\n[ForgeCode Stagnation Final Recovery]\n'
+                'The previous tool-enabled attempts did not produce new '
+                'workspace, plan, or repository evidence. This is one '
+                'dedicated final recovery request with no tools included. '
+                'Return the best concise answer possible in the user\'s '
+                'language using only the existing conversation and repository '
+                'evidence. If the goal cannot be completed from the collected '
+                'evidence, state the blocker and the most specific next '
+                'action a future tool-enabled turn should take. Do not '
+                'request or describe another tool call.'
             )
         elif action_recovery:
             prompt += '\n\n' + render_action_recovery_context(
@@ -2104,6 +2153,27 @@ def build_stagnation_feedback(
             'you understand it; otherwise perform one targeted search for the '
             'specific missing fact. Do not repeat an unchanged failing action '
             'or claim tools are paused.'
+        ),
+    }
+
+
+def build_stagnation_final_recovery_feedback(
+    task_context: str,
+    working_context: str,
+    calls_without_progress: int,
+) -> dict[str, Any]:
+    return {
+        'role': 'user',
+        'content': (
+            f'{task_context}\n\n{working_context}\n\n'
+            '[ForgeCode Stagnation Final Recovery]\n'
+            f'{calls_without_progress} model calls have passed without new '
+            'workspace, plan, or repository evidence. The next request will '
+            'include no tools. Return the best concise answer possible from '
+            'the evidence already in context. If the goal is not actually '
+            'complete, say what blocked completion and the exact next action '
+            'that should be taken in a future tool-enabled turn. Do not '
+            'request another tool call.'
         ),
     }
 

@@ -12,6 +12,7 @@ from forge.cli import app
 from forge.config import ConfigurationError
 from forge.runtime.state import (
     ConversationEvent,
+    ContextCompacted,
     ModelTextDelta,
     ModelUsageUpdate,
     TokenUsage,
@@ -153,6 +154,9 @@ class FakeResponseView:
     def complete(self, result: TurnResult) -> None:
         self.actions.append(('complete', result))
 
+    def compact_context(self, event: ContextCompacted) -> None:
+        self.actions.append(('compact', event))
+
 
 def turn(
     text: str,
@@ -228,6 +232,30 @@ def test_stream_events_are_forwarded_to_live_view() -> None:
         ('usage', final_usage),
         ('complete', result),
     ]
+
+
+def test_context_compaction_event_is_forwarded_to_live_view() -> None:
+    event = ContextCompacted(
+        before_characters=10_000,
+        after_characters=1_000,
+        transcript_path='.forge/context/transcripts/test.jsonl',
+    )
+    result = TurnResult(
+        text='Done',
+        usage=TokenUsage(input_tokens=10, output_tokens=2),
+    )
+    conversation = FakeConversation([event, TurnCompleted(result=result)])
+    response_view = FakeResponseView()
+
+    asyncio.run(
+        cli_module.render_streamed_turn(
+            conversation,
+            'hello',
+            response_view,
+        )
+    )
+
+    assert ('compact', event) in response_view.actions
 
 
 def test_cli_starts_an_interactive_conversation(

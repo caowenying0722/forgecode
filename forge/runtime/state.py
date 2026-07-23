@@ -213,6 +213,16 @@ class CompletionBlocked:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextCompacted:
+    '''The runtime summarized conversation history before continuing.'''
+
+    before_characters: int
+    after_characters: int
+    transcript_path: str | None
+    automatic: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class TurnCompleted:
     '''Final validated result for one streamed conversation turn.'''
 
@@ -238,5 +248,6 @@ type ConversationEvent = (
     | WorkspaceChanged
     | VerificationCompleted
     | CompletionBlocked
+    | ContextCompacted
     | TurnCompleted
 )

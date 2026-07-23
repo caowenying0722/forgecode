@@ -11,6 +11,7 @@ from pydantic import Field
 from unittest.mock import AsyncMock
 
 from forge.context.compactor import CompactionConfig
+from forge.context.manager import CompactionReport
 from forge.runtime.agent_loop import (
     AgentLoopLimitError,
     Conversation,
@@ -25,6 +26,7 @@ from forge.runtime.model_client import (
 )
 from forge.runtime.state import (
     ConversationEvent,
+    ContextCompacted,
     ModelCallCompleted,
     ModelCallStarted,
     ModelStreamEvent,
@@ -712,7 +714,7 @@ def test_current_goal_survives_many_tool_calls_and_message_snipping(
         for index in range(30)
     ]
     client = FakeModelClient(
-        *responses,
+        *responses[:16],
         streamed_response('Finished the original task.'),
     )
     conversation = Conversation(
@@ -727,7 +729,7 @@ def test_current_goal_survives_many_tool_calls_and_message_snipping(
 
     collect_turn(conversation, 'Keep this exact active goal')
 
-    assert len(client.calls) <= 9
+    assert len(client.calls) <= 18
     assert all(
         'Goal:\nKeep this exact active goal' in call['system']
         for call in client.calls
@@ -1208,6 +1210,26 @@ def test_compaction_is_checked_before_every_model_call(
     collect_turn(conversation, 'Read sample.txt')
 
     assert compact.await_count == 2
+
+
+def test_automatic_compaction_emits_visible_event(tmp_path: Path) -> None:
+    client = FakeModelClient(streamed_response('Finished.'))
+    conversation = Conversation(client=client)
+    report = CompactionReport(
+        success=True,
+        automatic=True,
+        before_characters=10_000,
+        after_characters=1_000,
+        transcript_path=str(tmp_path / 'transcript.jsonl'),
+    )
+    conversation.context.compact_history = AsyncMock(return_value=report)
+
+    events = collect_turn(conversation, 'hello')
+
+    compacted = [event for event in events if isinstance(event, ContextCompacted)]
+    assert len(compacted) == 1
+    assert compacted[0].before_characters == 10_000
+    assert compacted[0].after_characters == 1_000
 
 
 def test_conversation_does_not_commit_stream_without_text() -> None:
