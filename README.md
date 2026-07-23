@@ -612,7 +612,7 @@ Working Layer
 项目指令与仓库记忆：
 
 - [x] 加载全局 `~/.forge/AGENTS.md`、从仓库根目录到当前 cwd 的 `AGENTS.md` / `AGENTS.override.md`、根目录 `FORGE.md` 和 `.forge/rules/*.md`；
-- [x] 记忆使用 `.forge/memory/MEMORY.md` 索引和带 YAML frontmatter 的独立 Markdown 文件；
+- [x] 记忆使用 `.forge/memory/MEMORY.md` 索引和带 YAML frontmatter 的独立 Markdown 文件，frontmatter 记录 `name`、`description`、`type`、`source`、`created_at` 和 `updated_at`；
 - [x] 支持 `user`、`feedback`、`project`、`reference` 四类记忆；
 - [x] 使用确定性关键词相关度选择最多 5 条记忆，单条最多 4 KB、总计最多 20 KB；
 - [x] 相关记忆仅注入当前模型请求，不写入会话历史；

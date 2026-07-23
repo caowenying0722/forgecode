@@ -1997,6 +1997,9 @@ class Conversation:
             return f'Memory not found: {name}'
         return (
             f'{record.name} [{record.memory_type}]\n'
+            f'source: {record.source}\n'
+            f'created_at: {record.created_at}\n'
+            f'updated_at: {record.updated_at}\n'
             f'{record.description}\n\n{record.content}'
         )
 

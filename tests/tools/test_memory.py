@@ -44,8 +44,13 @@ def test_memory_tools_create_read_update_delete(tmp_path: Path) -> None:
     assert listed.success is True
     listed_payload = json.loads(listed.content)
     assert listed_payload[0]['name'] == 'testing'
+    assert listed_payload[0]['source'] == 'model_memory_tool'
+    assert listed_payload[0]['created_at']
+    assert listed_payload[0]['updated_at']
     assert read.success is True
-    assert json.loads(read.content)['content'] == 'Run uv run pytest.'
+    read_payload = json.loads(read.content)
+    assert read_payload['content'] == 'Run uv run pytest.'
+    assert read_payload['source'] == 'model_memory_tool'
     assert updated.success is True
     assert deleted.success is True
     assert not (tmp_path / '.forge' / 'memory' / 'testing.md').exists()

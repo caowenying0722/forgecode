@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -21,6 +22,9 @@ class MemoryRecord:
     name: str
     description: str
     memory_type: str
+    source: str
+    created_at: str
+    updated_at: str
     content: str
     path: Path
 
@@ -69,6 +73,7 @@ class MemoryStore:
         *,
         description: str = '',
         memory_type: str = 'project',
+        source: str = 'manual',
     ) -> MemoryRecord:
         clean_name = name.strip()
         clean_content = content.strip()
@@ -84,6 +89,11 @@ class MemoryStore:
             (record for record in self.list() if record.name == clean_name),
             None,
         )
+        timestamp = utc_timestamp()
+        created_at = timestamp if existing is None else existing.created_at
+        clean_source = source.strip() or (
+            'manual' if existing is None else existing.source
+        )
         self.directory.mkdir(parents=True, exist_ok=True)
         path = existing.path if existing is not None else (
             self.directory / f'{memory_slug(clean_name)}.md'
@@ -94,6 +104,9 @@ class MemoryStore:
                 clean_name,
                 resolved_description,
                 memory_type,
+                clean_source,
+                created_at,
+                timestamp,
                 clean_content,
             ),
             encoding='utf-8',
@@ -130,6 +143,7 @@ class MemoryStore:
         *,
         description: str = '',
         memory_type: str = 'project',
+        source: str = 'manual',
     ) -> MemoryRecord:
         if self.get(name) is not None:
             raise ValueError(f'Memory already exists: {name}')
@@ -138,6 +152,7 @@ class MemoryStore:
             content,
             description=description,
             memory_type=memory_type,
+            source=source,
         )
 
     def update(
@@ -147,6 +162,7 @@ class MemoryStore:
         *,
         description: str = '',
         memory_type: str | None = None,
+        source: str = '',
     ) -> MemoryRecord:
         existing = self.get(name)
         if existing is None:
@@ -156,6 +172,7 @@ class MemoryStore:
             content,
             description=description or existing.description,
             memory_type=memory_type or existing.memory_type,
+            source=source or existing.source,
         )
 
     def select(self, query: str) -> MemorySelection:
@@ -266,6 +283,9 @@ def render_memory(
     name: str,
     description: str,
     memory_type: str,
+    source: str,
+    created_at: str,
+    updated_at: str,
     content: str,
 ) -> str:
     return (
@@ -273,6 +293,9 @@ def render_memory(
         f'name: {json.dumps(name, ensure_ascii=False)}\n'
         f'description: {json.dumps(description, ensure_ascii=False)}\n'
         f'type: {json.dumps(memory_type)}\n'
+        f'source: {json.dumps(source, ensure_ascii=False)}\n'
+        f'created_at: {json.dumps(created_at)}\n'
+        f'updated_at: {json.dumps(updated_at)}\n'
         '---\n\n'
         f'{content.strip()}\n'
     )
@@ -296,13 +319,21 @@ def parse_memory(path: Path) -> MemoryRecord:
     memory_type = metadata.get('type', '').strip()
     if not name or memory_type not in MEMORY_TYPES:
         raise ValueError(f'Invalid memory metadata: {path}')
+    now = utc_timestamp()
     return MemoryRecord(
         name=name,
         description=metadata.get('description', '').strip(),
         memory_type=memory_type,
+        source=metadata.get('source', 'legacy').strip() or 'legacy',
+        created_at=metadata.get('created_at', now).strip() or now,
+        updated_at=metadata.get('updated_at', now).strip() or now,
         content=content.strip(),
         path=path,
     )
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def memory_slug(name: str) -> str:

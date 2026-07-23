@@ -237,12 +237,14 @@ class ContextManager:
         *,
         description: str = '',
         memory_type: str = 'project',
+        source: str = 'manual',
     ) -> MemoryRecord:
         return self.repository.memory.remember(
             name,
             content,
             description=description,
             memory_type=memory_type,
+            source=source,
         )
 
     def capture_explicit_memory(self, prompt: str) -> MemoryRecord | None:
@@ -262,6 +264,7 @@ class ContextManager:
                 content,
                 description='Explicit user memory',
                 memory_type='user',
+                source='explicit_user_prompt',
             )
         except ValueError:
             return None

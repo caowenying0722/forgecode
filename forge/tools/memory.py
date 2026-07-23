@@ -62,6 +62,9 @@ class MemoryListTool(Tool[MemoryListInput]):
                     'name': record.name,
                     'description': record.description,
                     'type': record.memory_type,
+                    'source': record.source,
+                    'created_at': record.created_at,
+                    'updated_at': record.updated_at,
                     'path': record.path.relative_to(self.root).as_posix(),
                 }
                 for record in records
@@ -97,6 +100,9 @@ class MemoryReadTool(Tool[MemoryReadInput]):
                 'name': record.name,
                 'description': record.description,
                 'type': record.memory_type,
+                'source': record.source,
+                'created_at': record.created_at,
+                'updated_at': record.updated_at,
                 'path': record.path.relative_to(self.root).as_posix(),
                 'content': record.content,
             },
@@ -131,6 +137,7 @@ class MemoryWriteTool(Tool[MemoryWriteInput]):
                 arguments.content,
                 description=arguments.description,
                 memory_type=arguments.memory_type,
+                source='model_memory_tool',
             )
         except ValueError as error:
             raise ToolExecutionError('memory_write_rejected', str(error)) from error
@@ -169,6 +176,7 @@ class MemoryUpdateTool(Tool[MemoryUpdateInput]):
                 arguments.content,
                 description=arguments.description,
                 memory_type=arguments.memory_type,
+                source='model_memory_tool',
             )
         except ValueError as error:
             raise ToolExecutionError('memory_update_rejected', str(error)) from error

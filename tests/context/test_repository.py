@@ -17,11 +17,61 @@ def test_memory_round_trip_index_and_forget(tmp_path: Path) -> None:
     )
 
     assert record.path.exists()
+    assert record.source == 'manual'
+    assert record.created_at
+    assert record.updated_at
+    text = record.path.read_text(encoding='utf-8')
+    assert 'source: "manual"' in text
+    assert 'created_at:' in text
+    assert 'updated_at:' in text
     assert store.get('testing') is not None
     assert MemoryStore(tmp_path).get('testing') is not None
     assert '[testing](testing.md)' in store.index_path.read_text(encoding='utf-8')
     assert store.forget('testing') is True
     assert store.get('testing') is None
+
+
+def test_memory_update_preserves_created_at_and_updates_metadata(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path)
+    created = store.create(
+        'testing',
+        'Run pytest.',
+        source='manual',
+    )
+
+    updated = store.update(
+        'testing',
+        'Run pytest -q.',
+        source='model_memory_tool',
+    )
+
+    assert updated.created_at == created.created_at
+    assert updated.updated_at >= created.updated_at
+    assert updated.source == 'model_memory_tool'
+    assert updated.content == 'Run pytest -q.'
+
+
+def test_legacy_memory_without_metadata_still_parses(tmp_path: Path) -> None:
+    directory = tmp_path / '.forge' / 'memory'
+    directory.mkdir(parents=True)
+    (directory / 'legacy.md').write_text(
+        '---\n'
+        'name: "legacy"\n'
+        'description: "Old memory"\n'
+        'type: "project"\n'
+        '---\n\n'
+        'Legacy content.\n',
+        encoding='utf-8',
+    )
+
+    record = MemoryStore(tmp_path).get('legacy')
+
+    assert record is not None
+    assert record.source == 'legacy'
+    assert record.created_at
+    assert record.updated_at
 
 
 def test_memory_selection_is_relevant_and_bounded(tmp_path: Path) -> None:
@@ -131,5 +181,6 @@ def test_explicit_user_memory_is_captured_but_secret_is_ignored(
     rejected = manager.capture_explicit_memory('记住：API_KEY=sk-secret1234')
 
     assert saved is not None
+    assert saved.source == 'explicit_user_prompt'
     assert rejected is None
     assert len(MemoryStore(tmp_path).list()) == 1
