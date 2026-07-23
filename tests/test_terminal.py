@@ -77,9 +77,11 @@ def test_slash_opens_command_completion_menu() -> None:
     assert '/resume session-id' in usages
     assert '/sessions' in usages
     assert '/mode' in usages
-    assert '/mode auto|plan|code|edit' in usages
+    assert '/mode auto|plan|code' in usages
     assert '/plan' in usages
     assert '/code' in usages
+    assert '/mcp' in usages
+    assert '/exit' in usages
     assert '/remember name | content' in usages
     assert '/memory consolidate' in usages
     assert '/task' in usages

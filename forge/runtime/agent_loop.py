@@ -14,6 +14,7 @@ from forge.context.manager import (
     ContextStats,
 )
 from forge.context.working import WorkingState
+from forge.mcp.client import MCPConfigurationError, parse_mcp_config
 from forge.runtime.intent import infer_change_required
 from forge.runtime.model_client import (
     AnthropicModelClient,
@@ -1892,6 +1893,20 @@ class Conversation:
         self._last_task_context = self.task_manager.system_suffix()
         return f'Resumed {task.id}: {task.goal}'
 
+    def mcp_status(self) -> str:
+        tool_names: tuple[str, ...]
+        if self.registry is not None:
+            tool_names = tuple(
+                name for name in self.registry.names if name.startswith('mcp_')
+            )
+        else:
+            tool_names = tuple(
+                str(definition.get('name', ''))
+                for definition in (self.tools or [])
+                if str(definition.get('name', '')).startswith('mcp_')
+            )
+        return render_mcp_status(self.task_manager.root, tool_names)
+
     def mode_show(self) -> str:
         return render_mode_notice(self.interaction_mode)
 
@@ -2099,12 +2114,47 @@ def required_change_block_reason() -> str:
     )
 
 
+def render_mcp_status(root: Path, tool_names: tuple[str, ...]) -> str:
+    config_path = root / '.forge' / 'mcp.json'
+    if not config_path.is_file():
+        return (
+            f'Config: {config_path.as_posix()}\n'
+            'Status: no MCP config file found.\n'
+            'Servers: 0\n'
+            f'Tools: {len(tool_names)}'
+        )
+    try:
+        data = json.loads(config_path.read_text(encoding='utf-8'))
+        configs = parse_mcp_config(data, root)
+    except (
+        OSError,
+        json.JSONDecodeError,
+        MCPConfigurationError,
+    ) as error:
+        return (
+            f'Config: {config_path.as_posix()}\n'
+            'Status: invalid MCP config.\n'
+            f'Error: {error}\n'
+            f'Tools registered before error: {len(tool_names)}'
+        )
+
+    lines = [
+        f'Config: {config_path.as_posix()}',
+        'Status: configured',
+        f'Servers: {len(configs)}',
+    ]
+    for config in configs:
+        command = ' '.join((config.command, *config.args)).strip()
+        lines.append(f'- {config.name}: stdio `{command}`')
+    lines.append(f'Tools: {len(tool_names)}')
+    lines.extend(f'- {name}' for name in tool_names)
+    return '\n'.join(lines)
+
+
 def normalize_interaction_mode(mode: str) -> InteractionMode:
     normalized = mode.strip().casefold()
-    if normalized == 'edit':
-        normalized = 'code'
     if normalized not in {'auto', 'plan', 'code'}:
-        raise ValueError('Mode must be one of: auto, plan, code, edit.')
+        raise ValueError('Mode must be one of: auto, plan, code.')
     return normalized  # type: ignore[return-value]
 
 
@@ -2118,8 +2168,8 @@ def render_mode_notice(mode: InteractionMode) -> str:
     if mode == 'plan':
         return (
             'Mode: plan. ForgeCode will only use read-only planning tools and '
-            'will not require or perform workspace edits. Switch to /code or '
-            '/edit when you want the plan implemented.'
+            'will not require or perform workspace edits. Switch to /code '
+            'when you want the plan implemented.'
         )
     return (
         'Mode: code. ForgeCode treats user turns as authorized implementation '
@@ -2135,7 +2185,7 @@ def render_interaction_mode_context(mode: InteractionMode) -> str:
             'checklist only. Do not modify files. Only read-only planning '
             'tools are available. A final answer should present a clear plan '
             'or prioritized checklist and mention that the user can switch to '
-            '/code or /edit to implement it. No workspace Diff is required.'
+            '/code to implement it. No workspace Diff is required.'
         )
     if mode == 'code':
         return (

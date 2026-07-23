@@ -48,12 +48,13 @@ SLASH_COMMANDS = (
     SlashCommandSpec('/mode', '/mode', '查看当前交互模式'),
     SlashCommandSpec(
         '/mode ',
-        '/mode auto|plan|code|edit',
+        '/mode auto|plan|code',
         '切换交互模式',
     ),
     SlashCommandSpec('/plan', '/plan', '切换到只读计划模式'),
     SlashCommandSpec('/code', '/code', '切换到代码执行模式'),
-    SlashCommandSpec('/edit', '/edit', '切换到代码执行模式'),
+    SlashCommandSpec('/mcp', '/mcp', '查看 MCP 服务器与工具状态'),
+    SlashCommandSpec('/exit', '/exit', '退出 ForgeCode'),
     SlashCommandSpec('/task', '/task', '查看当前任务与计划'),
     SlashCommandSpec('/task history', '/task history', '列出已保存的复杂任务'),
     SlashCommandSpec(

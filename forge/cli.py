@@ -107,6 +107,10 @@ def run_interactive_chat(
         if not prompt.strip():
             continue
 
+        if prompt.strip() == '/exit':
+            resolved_terminal.show_goodbye()
+            return
+
         if prompt.strip() == '/context':
             stats = getattr(resolved_session, 'context_stats', None)
             if stats is None:
@@ -160,6 +164,10 @@ def run_interactive_chat(
             )
             continue
 
+        if prompt.strip() == '/mcp':
+            resolved_terminal.show_notice('MCP', resolved_session.mcp_status())
+            continue
+
         if prompt.strip() == '/mode':
             resolved_terminal.show_notice(
                 'Mode',
@@ -185,7 +193,7 @@ def run_interactive_chat(
             )
             continue
 
-        if prompt.strip() in {'/code', '/edit'}:
+        if prompt.strip() == '/code':
             resolved_terminal.show_notice(
                 'Mode',
                 resolved_session.mode_set('code'),

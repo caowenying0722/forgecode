@@ -127,6 +127,9 @@ class FakeConversation:
     def mode_set(self, mode: str) -> str:
         return f'Mode: {mode}.'
 
+    def mcp_status(self) -> str:
+        return 'Status: configured\nTools: 1\n- mcp_demo_echo'
+
 
 class FakeResponseView:
     '''Record live UI updates without rendering a terminal.'''
@@ -412,13 +415,48 @@ def test_mode_commands_do_not_call_model(
 
     result = runner.invoke(
         app,
-        input='/mode\n/mode plan\n/plan\n/code\n/edit\n',
+        input='/mode\n/mode plan\n/plan\n/code\n',
     )
 
     assert result.exit_code == 0
     assert 'Mode: auto.' in result.output
     assert 'Mode: plan.' in result.output
     assert 'Mode: code.' in result.output
+    assert conversation.prompts == []
+
+
+def test_mcp_command_does_not_call_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(app, input='/mcp\n')
+
+    assert result.exit_code == 0
+    assert 'Status: configured' in result.output
+    assert 'mcp_demo_echo' in result.output
+    assert conversation.prompts == []
+
+
+def test_exit_command_ends_interactive_session_without_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(app, input='/exit\nhello\n')
+
+    assert result.exit_code == 0
+    assert 'Session ended.' in result.output
     assert conversation.prompts == []
 
 
