@@ -1,35 +1,52 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>植物大战僵尸（网页版）</title>
-  <link rel="stylesheet" href="styles.css" />
+  <title>最小金铲铲 - Web 原型</title>
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <main class="container">
-    <h1>植物大战僵尸（网页版）</h1>
-    <canvas id="gameCanvas" width="960" height="540"></canvas>
+  <main class="page">
+    <header>
+      <h1>最小金铲铲（Web 版）</h1>
+      <p class="sub">一个可运行的极简自动战斗原型：购买棋子，自动与对手对战。</p>
+    </header>
+
+    <section class="panel hud">
+      <div>第 <strong id="round">1</strong> 回合</div>
+      <div>金币: <strong id="gold">20</strong></div>
+      <div>我方生命值: <strong id="player-hp">100</strong></div>
+      <div>对手生命值: <strong id="enemy-hp">100</strong></div>
+    </section>
 
     <section class="panel">
-      <div class="panel-row">
-        <button data-plant="sunflower">向日葵（50）</button>
-        <button data-plant="peashooter">豌豆射手（100）</button>
-        <button data-plant="frost">寒冰射手（150）</button>
-        <button data-plant="cherry">樱桃炸弹（175）</button>
-        <button data-plant="wallnut">坚果（50）</button>
+      <h2>商店（点击卡牌购买）</h2>
+      <div id="shop" class="card-row"></div>
+      <div class="actions">
+        <button id="refresh-shop">刷新商店（2金币）</button>
       </div>
-      <div class="panel-row">
-        <button id="btnShovel">铲子</button>
-        <button id="btnStart">开始</button>
-        <button id="btnPause">暂停</button>
-        <button id="btnReset">重置</button>
-      </div>
-      <p id="hint">选择植物后点击草坪种植；点击阳光拾取，僵尸到达左边界游戏结束。</p>
-      <div id="status">阳光：<span id="sun">0</span> ｜ 生命：<span id="lives">0</span> ｜ 波数：<span id="wave">0</span> ｜ 记分：<span id="score">0</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>棋盘（最多 6 个）</h2>
+      <div id="bench" class="card-row"></div>
+      <button id="fight">开始对战</button>
+      <button id="reset" class="ghost">重新开始</button>
+    </section>
+
+    <section class="panel">
+      <h2>对手阵容</h2>
+      <div id="enemy" class="card-row"></div>
+    </section>
+
+    <section class="panel">
+      <h2>战报</h2>
+      <div id="battle-log" class="battle-log"></div>
+      <button id="clear-log" class="ghost">清空战报</button>
     </section>
   </main>
 
-  <script src="app.js"></script>
+  <script src="game.js"></script>
 </body>
 </html>
