@@ -27,6 +27,8 @@
     9: [14, 24, 32, 20, 8, 2]
   };
 
+  const MAX_MERGE_STAR = 3;
+
   const TRAIT_BONUS = {
     2: 1.15,
     3: 1.25,
@@ -64,6 +66,12 @@
     { key: 'ahri', name: '阿狸', emoji: '🦊', role: '法师', traits: ['魔导师', '暗影'], cost: 3, hp: 820, atk: 104, def: 27, speed: 9 },
     { key: 'teemo', name: '提莫', emoji: '🍄', role: '射手', traits: ['野兽', '浪客'], cost: 1, hp: 760, atk: 74, def: 20, speed: 9 }
   ];
+
+  const HERO_BY_COST = heroDefs.reduce((acc, hero) => {
+    acc[hero.cost] = acc[hero.cost] || [];
+    acc[hero.cost].push(hero);
+    return acc;
+  }, {});
 
   const state = {
     round: 1,

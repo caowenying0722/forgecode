@@ -42,6 +42,10 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'memory_delete',
         'send_message',
         'check_inbox',
+        'request_team_action',
+        'respond_team_request',
+        'list_team_requests',
+        'claim_next_task',
         'task',
         'explore_subagent',
         'finish_task',
@@ -67,6 +71,10 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
     assert registry.effect('task_complete') == 'workspace_write'
     assert registry.effect('send_message') == 'read_only'
     assert registry.effect('check_inbox') == 'read_only'
+    assert registry.effect('request_team_action') == 'read_only'
+    assert registry.effect('respond_team_request') == 'read_only'
+    assert registry.effect('list_team_requests') == 'read_only'
+    assert registry.effect('claim_next_task') == 'workspace_write'
     assert registry.effect('finish_task') == 'read_only'
     assert registry.effect('missing') is None
 
@@ -98,6 +106,9 @@ def test_tool_descriptions_define_task_boundaries(tmp_path: Path) -> None:
     assert 'call create_directory first' in definitions['write_file']
     assert 'durable team message' in definitions['send_message']
     assert 'Collect and consume durable team messages' in definitions['check_inbox']
+    assert 'pending/approved/rejected' in definitions['request_team_action']
+    assert 'correlated by request_id' in definitions['respond_team_request']
+    assert 'idle teammate should self-claim' in definitions['claim_next_task']
 
 
 def test_registry_returns_structured_unknown_tool_error(

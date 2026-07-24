@@ -109,6 +109,13 @@ def test_explore_subagent_uses_main_tools_except_task_controls_and_reports(
         'memory_delete',
         'send_message',
         'check_inbox',
+        'task_list',
+        'task_graph_get',
+        'task_complete',
+        'request_team_action',
+        'respond_team_request',
+        'list_team_requests',
+        'claim_next_task',
     }.issubset(tool_names)
     assert tool_names.isdisjoint(SUBAGENT_EXCLUDED_TOOLS)
     assert 'Explore Subagent' in client.calls[0]['system']

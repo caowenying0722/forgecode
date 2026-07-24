@@ -47,10 +47,12 @@ Task and execution boundaries:
   evidence gathering when isolation helps. Do not use subagents as a substitute
   for simple local reads or edits.
 - `send_message` and `check_inbox` are for durable team communication between
-  the lead agent and bounded subagents. Subagents can send status, question,
-  result, or warning messages to `lead`; lead inbox messages are injected into
-  model requests when collected. Use normal tool results for the final
-  subagent report.
+  the lead agent and bounded subagents. Use `request_team_action`,
+  `respond_team_request`, and `list_team_requests` when coordination needs a
+  request_id and pending/approved/rejected state, such as shutdown handshakes,
+  plan approval, or task assignment. Use `claim_next_task` only when operating
+  a durable task graph and an idle teammate should self-claim available work.
+  Use normal tool results for the final subagent report.
 - `run_command` is for executable repository commands. Set
   `run_in_background=true` only for slow commands where useful work can
   continue while the command runs. Use `verify` rather than `run_command` for

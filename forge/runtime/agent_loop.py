@@ -75,6 +75,7 @@ ACTION_RECOVERY_EXCLUDED_WRITE_TOOLS = frozenset(
         'task_create',
         'task_claim',
         'task_complete',
+        'claim_next_task',
     }
 )
 PARENT_NOT_FOUND_WRITE_TOOLS = frozenset(

@@ -25,6 +25,8 @@ SUBAGENT_EXCLUDED_TOOLS = frozenset(
     {
         'task',
         'explore_subagent',
+        'task_create',
+        'task_claim',
         'task_get',
         'task_plan',
         'task_update',
@@ -246,6 +248,7 @@ def create_subagent_registry(
     from forge.tools.mcp import MCPTool
     from forge.tools.patch import ApplyPatchTool
     from forge.tools.shell import RunCommandTool
+    from forge.tools.task_graph import create_task_graph_tools
     from forge.tools.team import create_team_tools
     from forge.tools.verify import VerifyTool
     from forge.runtime.workspace import WorkspaceTracker
@@ -267,6 +270,7 @@ def create_subagent_registry(
         VerifyTool(root, tracker),
         GitStatusTool(root),
         GitDiffTool(root),
+        *create_task_graph_tools(root),
         *create_memory_tools(root),
         *create_team_tools(root, bus=bus, agent_id='explore_subagent'),
         *[
