@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>金铲铲高还原度 Web 模拟界面</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <div class="app-bg"></div>
+    <main class="game-wrap">
+      <header class="topbar">
+        <h1>Jing Camp</h1>
+        <div class="top-stat">
+          <span class="pill">当前回合 <strong id="round-label">1-1</strong></span>
+          <span class="pill">金币 <strong id="gold-label">50</strong></span>
+          <span class="pill">等级 <strong id="level-label">6</strong></span>
+          <span class="pill">经验 <strong id="xp-label">30 / 60</strong></span>
+          <span class="pill">战斗阶段 <strong id="phase-label">备战</strong></span>
+        </div>
+      </header>
+
+      <section class="layout-grid">
+        <section class="left-col">
+          <article class="status-card health-card">
+            <div class="hp-head">我方生命</div>
+            <div class="hp-track"><i class="hp-fill" id="ally-hp-fill"></i></div>
+            <div class="hp-value" id="ally-hp-text">100 / 100</div>
+          </article>
+          <article class="status-card health-card enemy">
+            <div class="hp-head">敌方生命</div>
+            <div class="hp-track"><i class="hp-fill" id="enemy-hp-fill"></i></div>
+            <div class="hp-value" id="enemy-hp-text">100 / 100</div>
+          </article>
+
+          <article class="status-card controls">
+            <button id="btn-reroll">重新筛选 (-2 金币)</button>
+            <button id="btn-lock" class="warning">锁定商店</button>
+            <button id="btn-next">开始战斗</button>
+            <button id="btn-reset">重置示例局面</button>
+            <label class="toggle"><input type="checkbox" id="auto-battle" /> 自动战斗</label>
+          </article>
+        </section>
+
+        <section class="center-col">
+          <article class="board-card">
+            <div class="board-title">棋盘（7 × 4）</div>
+            <div class="board" id="board"></div>
+          </article>
+
+          <article class="bench-card">
+            <div class="board-title">后备阵容（9 格）</div>
+            <div class="bench" id="bench"></div>
+          </article>
+        </section>
+
+        <section class="right-col">
+          <article class="status-card shop-wrap">
+            <div class="board-title">商店</div>
+            <div class="shop" id="shop"></div>
+            <small class="hint">点击英雄图标购买，先放入空置后备位。</small>
+          </article>
+
+          <article class="status-card log-wrap">
+            <div class="board-title">战斗日志</div>
+            <ol id="battle-log"></ol>
+          </article>
+        </section>
+      </section>
+
+      <section class="detail-bar" id="detail-bar">
+        <span id="detail-name">点击一个单位查看详情</span>
+        <span id="detail-extra"></span>
+      </section>
+    </main>
+
+    <script src="./src/app.js" defer></script>
+  </body>
+</html>

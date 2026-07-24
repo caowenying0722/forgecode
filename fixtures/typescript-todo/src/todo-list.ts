@@ -24,7 +24,7 @@ export class TodoList {
   }
 
   complete(id: number): Todo {
-    const todo = this.todos[id]
+    const todo = this.todos.find((item) => item.id === id)
     if (!todo) {
       throw new Error('todo not found')
     }

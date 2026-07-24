@@ -17,6 +17,7 @@ from forge.tools.search import FindFilesTool, GrepTool
 if TYPE_CHECKING:
     from forge.hooks.builtin import PermissionHook
     from forge.hooks.registry import HookRegistry
+    from forge.runtime.team import MessageBus
     from forge.runtime.workspace import WorkspaceTracker
 
 
@@ -83,11 +84,13 @@ class ExploreSubagentTool(Tool[ExploreSubagentInput]):
         client: SubagentModelClient | None = None,
         permission: 'PermissionHook | None' = None,
         workspace_tracker: 'WorkspaceTracker | None' = None,
+        team_bus: 'MessageBus | None' = None,
     ) -> None:
         super().__init__(root)
         self.client = client
         self.permission = permission
         self.workspace_tracker = workspace_tracker
+        self.team_bus = team_bus
 
     async def execute(self, arguments: ExploreSubagentInput) -> ToolResult:
         from forge.runtime.model_client import AnthropicModelClient
@@ -98,6 +101,7 @@ class ExploreSubagentTool(Tool[ExploreSubagentInput]):
             client,
             permission=self.permission,
             workspace_tracker=self.workspace_tracker,
+            team_bus=self.team_bus,
         )
         return await subagent.run(arguments)
 
@@ -127,6 +131,7 @@ class ExploreSubagent:
         permission: 'PermissionHook | None' = None,
         hooks: 'HookRegistry | None' = None,
         workspace_tracker: 'WorkspaceTracker | None' = None,
+        team_bus: 'MessageBus | None' = None,
     ) -> None:
         from forge.hooks.builtin import PermissionHook, ToolLoggingHook
         from forge.hooks.registry import HookRegistry
@@ -134,7 +139,11 @@ class ExploreSubagent:
 
         self.root = root
         self.client = client
-        self.registry = create_subagent_registry(root, workspace_tracker)
+        self.registry = create_subagent_registry(
+            root,
+            workspace_tracker,
+            team_bus=team_bus,
+        )
         self.permission = permission or PermissionHook('trusted')
         self.logger = ToolLoggingHook(root, agent='explore_subagent')
         self.hooks = hooks or HookRegistry([self.permission, self.logger])
@@ -222,6 +231,8 @@ class ExploreSubagent:
 def create_subagent_registry(
     root: Path,
     workspace_tracker: 'WorkspaceTracker | None' = None,
+    *,
+    team_bus: 'MessageBus | None' = None,
 ) -> ToolRegistry:
     from forge.mcp import MCPClientManager
     from forge.tools.filesystem import (
@@ -235,10 +246,12 @@ def create_subagent_registry(
     from forge.tools.mcp import MCPTool
     from forge.tools.patch import ApplyPatchTool
     from forge.tools.shell import RunCommandTool
+    from forge.tools.team import create_team_tools
     from forge.tools.verify import VerifyTool
     from forge.runtime.workspace import WorkspaceTracker
 
     tracker = workspace_tracker or WorkspaceTracker(root)
+    bus = team_bus
     mcp_manager = MCPClientManager.from_config_file(root)
     tools = [
         ListDirectoryTool(root),
@@ -255,6 +268,7 @@ def create_subagent_registry(
         GitStatusTool(root),
         GitDiffTool(root),
         *create_memory_tools(root),
+        *create_team_tools(root, bus=bus, agent_id='explore_subagent'),
         *[
             MCPTool(root, remote_tool)
             for remote_tool in mcp_manager.list_tools()

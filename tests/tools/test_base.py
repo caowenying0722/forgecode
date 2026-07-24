@@ -40,6 +40,8 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'memory_write',
         'memory_update',
         'memory_delete',
+        'send_message',
+        'check_inbox',
         'task',
         'explore_subagent',
         'finish_task',
@@ -63,6 +65,8 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
     assert registry.effect('task_graph_get') == 'read_only'
     assert registry.effect('task_claim') == 'workspace_write'
     assert registry.effect('task_complete') == 'workspace_write'
+    assert registry.effect('send_message') == 'read_only'
+    assert registry.effect('check_inbox') == 'read_only'
     assert registry.effect('finish_task') == 'read_only'
     assert registry.effect('missing') is None
 
@@ -92,6 +96,8 @@ def test_tool_descriptions_define_task_boundaries(tmp_path: Path) -> None:
         definitions['run_command']
     )
     assert 'call create_directory first' in definitions['write_file']
+    assert 'durable team message' in definitions['send_message']
+    assert 'Collect and consume durable team messages' in definitions['check_inbox']
 
 
 def test_registry_returns_structured_unknown_tool_error(

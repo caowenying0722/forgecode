@@ -20,6 +20,7 @@ from forge.tools.search import FindFilesTool, GrepTool
 from forge.tools.shell import RunCommandTool
 from forge.tools.subagent import ExploreSubagentTool, TaskSubagentTool
 from forge.tools.task_graph import create_task_graph_tools
+from forge.tools.team import create_team_tools
 from forge.tools.todo import TodoList, TodoWriteTool
 from forge.tools.verify import VerifyTool
 from forge.runtime.workspace import WorkspaceTracker
@@ -51,6 +52,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
             GitDiffTool(root),
             *create_task_graph_tools(root),
             *create_memory_tools(root),
+            *create_team_tools(root),
             TaskSubagentTool(root),
             ExploreSubagentTool(root),
             *mcp_tools,
@@ -74,6 +76,7 @@ __all__ = [
     'ExploreSubagentTool',
     'TaskSubagentTool',
     'create_task_graph_tools',
+    'create_team_tools',
     'ReadFileTool',
     'ReplaceTextTool',
     'RunCommandTool',

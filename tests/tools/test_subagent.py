@@ -8,6 +8,7 @@ import json
 from typing import Any
 
 from forge.hooks.builtin import PermissionHook
+from forge.runtime.team import MessageBus
 from forge.runtime.state import (
     ModelStreamEvent,
     ModelTextDelta,
@@ -106,6 +107,8 @@ def test_explore_subagent_uses_main_tools_except_task_controls_and_reports(
         'memory_write',
         'memory_update',
         'memory_delete',
+        'send_message',
+        'check_inbox',
     }.issubset(tool_names)
     assert tool_names.isdisjoint(SUBAGENT_EXCLUDED_TOOLS)
     assert 'Explore Subagent' in client.calls[0]['system']
@@ -154,6 +157,48 @@ def test_explore_subagent_tool_calls_go_through_permission_hooks(
     assert log['agent'] == 'explore_subagent'
     assert log['tool'] == 'write_file'
     assert log['error_code'] == 'permission_denied'
+
+
+def test_explore_subagent_can_send_team_message_to_lead(tmp_path) -> None:
+    send = ToolCall(
+        index=0,
+        id='toolu_send',
+        name='send_message',
+        arguments={
+            'to': 'lead',
+            'type': 'status',
+            'content': 'Inspected sample.txt.',
+        },
+    )
+    client = FakeSubagentClient(
+        [
+            ModelUsageUpdate(usage=TokenUsage(input_tokens=10, output_tokens=0)),
+            ModelToolCallCompleted(tool_call=send),
+            ModelUsageUpdate(usage=TokenUsage(input_tokens=10, output_tokens=2)),
+        ],
+        [
+            ModelUsageUpdate(usage=TokenUsage(input_tokens=20, output_tokens=0)),
+            ModelTextDelta(text='result: status sent'),
+            ModelUsageUpdate(usage=TokenUsage(input_tokens=20, output_tokens=8)),
+        ],
+    )
+    bus = MessageBus(tmp_path)
+    subagent = ExploreSubagent(tmp_path, client, team_bus=bus)
+
+    result = asyncio.run(
+        subagent.run(
+            ExploreSubagentInput(task='Report progress', max_rounds=2)
+        )
+    )
+    messages = bus.collect('lead')
+
+    assert result.success is True
+    assert result.metadata['tool_calls'] == ['send_message']
+    assert len(messages) == 1
+    assert messages[0].sender == 'explore_subagent'
+    assert messages[0].recipient == 'lead'
+    assert messages[0].type == 'status'
+    assert messages[0].content == 'Inspected sample.txt.'
 
 
 def test_explore_subagent_can_write_when_permission_allows(

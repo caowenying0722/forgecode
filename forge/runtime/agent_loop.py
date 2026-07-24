@@ -28,6 +28,7 @@ from forge.runtime.model_client import (
 )
 from forge.runtime.completion import CompletionGate, TaskPolicy
 from forge.runtime.background import BackgroundTaskManager
+from forge.runtime.team import MessageBus, render_team_notification
 from forge.runtime.state import (
     CompletionBlocked,
     ConversationEvent,
@@ -62,6 +63,7 @@ from forge.tools.base import ToolRegistry, ToolResult
 from forge.tools.shell import RunCommandTool
 from forge.tools.subagent import ExploreSubagentTool, TaskSubagentTool
 from forge.tools.task import create_task_tools
+from forge.tools.team import create_team_tools
 from forge.tools.todo import TodoList, TodoWriteTool
 
 
@@ -216,6 +218,7 @@ class Conversation:
         )
         self.task_manager = TaskManager(resolved_context_root)
         self.background_manager = BackgroundTaskManager(resolved_context_root)
+        self.team_bus = MessageBus(resolved_context_root)
         self.session_store = SessionStore(resolved_context_root)
         self.session_id: str | None = None
         self.interaction_mode: InteractionMode = 'auto'
@@ -227,6 +230,7 @@ class Conversation:
                         resolved_context_root,
                         permission=self.permission,
                         workspace_tracker=tracker,
+                        team_bus=self.team_bus,
                     )
                 )
             if 'explore_subagent' in registry.names:
@@ -235,6 +239,7 @@ class Conversation:
                         resolved_context_root,
                         permission=self.permission,
                         workspace_tracker=tracker,
+                        team_bus=self.team_bus,
                     )
                 )
             if 'run_command' in registry.names:
@@ -249,6 +254,15 @@ class Conversation:
                 self.task_manager,
             ):
                 registry.register(task_tool)
+            for team_tool in create_team_tools(
+                resolved_context_root,
+                bus=self.team_bus,
+                agent_id='lead',
+            ):
+                if team_tool.name in registry.names:
+                    registry.replace(team_tool)
+                else:
+                    registry.register(team_tool)
             if 'todo_write' not in registry.names:
                 registry.register(
                     TodoWriteTool(resolved_context_root, self.todo_list)
@@ -383,6 +397,14 @@ class Conversation:
                 append_background_notification_message(
                     request_messages,
                     background_notifications,
+                )
+            team_notifications = render_team_notification(
+                self.team_bus.collect('lead')
+            )
+            if team_notifications:
+                append_team_notification_message(
+                    request_messages,
+                    team_notifications,
                 )
 
             if (
@@ -2260,6 +2282,40 @@ def append_background_notification_message(
         existing.extend(message['content'])
         return
     messages.append(message)
+
+
+def append_team_notification_message(
+    messages: list[dict[str, Any]],
+    notifications: tuple[str, ...],
+) -> None:
+    message = build_team_notification_message(notifications)
+    if not messages or messages[-1].get('role') != 'user':
+        messages.append(message)
+        return
+    existing = messages[-1].get('content')
+    if isinstance(existing, str):
+        messages[-1]['content'] = [
+            {'type': 'text', 'text': existing},
+            *message['content'],
+        ]
+        return
+    if isinstance(existing, list):
+        existing.extend(message['content'])
+        return
+    messages.append(message)
+
+
+def build_team_notification_message(
+    notifications: tuple[str, ...],
+) -> dict[str, Any]:
+    '''Build one user message containing collected team messages.'''
+    return {
+        'role': 'user',
+        'content': [
+            {'type': 'text', 'text': notification}
+            for notification in notifications
+        ],
+    }
 
 
 def build_background_notification_message(

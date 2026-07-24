@@ -46,6 +46,11 @@ Task and execution boundaries:
   subagent. Use them for parallel investigation, scoped implementation, or
   evidence gathering when isolation helps. Do not use subagents as a substitute
   for simple local reads or edits.
+- `send_message` and `check_inbox` are for durable team communication between
+  the lead agent and bounded subagents. Subagents can send status, question,
+  result, or warning messages to `lead`; lead inbox messages are injected into
+  model requests when collected. Use normal tool results for the final
+  subagent report.
 - `run_command` is for executable repository commands. Set
   `run_in_background=true` only for slow commands where useful work can
   continue while the command runs. Use `verify` rather than `run_command` for

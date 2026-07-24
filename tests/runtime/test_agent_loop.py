@@ -566,6 +566,35 @@ def test_background_notifications_are_injected_before_model_request(
     assert '<task_notification>' in first_message['content'][1]['text']
 
 
+def test_team_messages_are_injected_before_model_request(
+    tmp_path: Path,
+) -> None:
+    client = FakeModelClient(streamed_response('Noted.'))
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry([RecordingReadFileTool(tmp_path)]),
+    )
+    conversation.team_bus.send(
+        sender='explore_subagent',
+        recipient='lead',
+        message_type='status',
+        content='I found the relevant files.',
+    )
+
+    events = collect_turn(conversation, 'Continue')
+
+    assert events[-1].result.text == 'Noted.'
+    first_message = client.calls[0]['messages'][0]
+    assert first_message['role'] == 'user'
+    assert first_message['content'][0] == {
+        'type': 'text',
+        'text': 'Continue',
+    }
+    assert '<team_message>' in first_message['content'][1]['text']
+    assert '<from>explore_subagent</from>' in first_message['content'][1]['text']
+    assert 'I found the relevant files.' in first_message['content'][1]['text']
+
+
 def test_conversation_executes_multiple_tool_calls_in_order(
     tmp_path: Path,
 ) -> None:
@@ -700,7 +729,8 @@ def test_invalid_tool_json_is_retried_without_executing_partial_calls(
     assert events[-1].result.usage.input_tokens == 22
     feedback = client.calls[1]['messages'][-1]['content']
     assert 'No tool was executed' in feedback
-    assert 'Available tools: read_file' in feedback
+    assert 'Available tools:' in feedback
+    assert 'read_file' in feedback
     assert 'write_file with at most 4000 characters' in feedback
     assert 'Recovery attempt 1 of 2' in feedback
 
