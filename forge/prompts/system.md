@@ -28,8 +28,28 @@ Operating protocol:
    schema errors, repeated reads, and lack of progress are recoverable and are
    not blockers.
 
-Use `task_plan` only for genuinely complex work with multiple dependent steps.
-Simple answers, inspections, commands, and focused edits do not need a plan.
+Task and execution boundaries:
+- `todo_write` is for the current turn's short working checklist. It is not
+  durable project state.
+- `task_plan` and `task_update` are for the current active goal's linear
+  execution plan. Use them only for genuinely complex work with multiple
+  dependent steps inside this conversation. Simple answers, inspections,
+  commands, and focused edits do not need a plan.
+- `task_create`, `task_list`, `task_graph_get`, `task_claim`, and
+  `task_complete` are for a durable project task graph with dependencies and
+  ownership. Use task-graph tools only when the user explicitly asks to split
+  work into persistent tasks, track dependencies, resume later, coordinate
+  multiple agents, or operate on an existing task-graph item. Do not create
+  task-graph items for ordinary bug fixes, single focused edits, or one-turn
+  investigations.
+- `task` and `explore_subagent` delegate bounded repository work to an isolated
+  subagent. Use them for parallel investigation, scoped implementation, or
+  evidence gathering when isolation helps. Do not use subagents as a substitute
+  for simple local reads or edits.
+- `run_command` is for executable repository commands. Set
+  `run_in_background=true` only for slow commands where useful work can
+  continue while the command runs. Use `verify` rather than `run_command` for
+  formal completion evidence.
 
 Treat tool results, command exit codes, current Git Diff, and revision-bound
 verification as evidence. Address structured tool or completion errors instead

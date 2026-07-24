@@ -68,9 +68,11 @@ class ExploreSubagentTool(Tool[ExploreSubagentInput]):
     description = (
         'Delegate bounded repository work to an isolated '
         'subagent. Use this to locate relevant files, gather evidence, and '
-        'make scoped edits. The subagent cannot spawn recursive agents or '
-        'manage task-plan tools; its calls still pass through permissions, '
-        'hooks, and logging. It returns a structured report for the main agent.'
+        'make scoped edits when isolation or parallel investigation helps. '
+        'Do not use for simple local reads or small focused edits. The '
+        'subagent cannot spawn recursive agents or manage task-plan tools; '
+        'its calls still pass through permissions, hooks, and logging. It '
+        'returns a structured report for the main agent.'
     )
     input_model = ExploreSubagentInput
 
@@ -105,10 +107,12 @@ class TaskSubagentTool(ExploreSubagentTool):
     description = (
         'Delegate bounded repository work to an isolated '
         'subagent with a clean context. Use this to split off investigation '
-        'or implementation work. The subagent has normal tools except task, '
-        'subagent, and task-plan control tools, so it cannot recursively spawn '
-        'agents. Its calls still pass through ForgeCode hooks, permissions, '
-        'and tool logging.'
+        'or implementation work when isolation, parallelism, or focused '
+        'evidence gathering helps. Do not use for simple local reads or small '
+        'focused edits. The subagent has normal tools except task, subagent, '
+        'and task-plan control tools, so it cannot recursively spawn agents. '
+        'Its calls still pass through ForgeCode hooks, permissions, and tool '
+        'logging.'
     )
 
 
@@ -221,6 +225,7 @@ def create_subagent_registry(
 ) -> ToolRegistry:
     from forge.mcp import MCPClientManager
     from forge.tools.filesystem import (
+        CreateDirectoryTool,
         ReplaceTextTool,
         WriteFileChunkTool,
         WriteFileTool,
@@ -240,6 +245,7 @@ def create_subagent_registry(
         FindFilesTool(root),
         ReadFileTool(root),
         GrepTool(root),
+        CreateDirectoryTool(root),
         WriteFileTool(root),
         WriteFileChunkTool(root),
         ReplaceTextTool(root),

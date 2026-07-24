@@ -19,8 +19,9 @@ class TaskGetTool(Tool[TaskGetInput]):
     name = 'task_get'
     description = (
         'Return the current ForgeCode task and optional plan. Use only when '
-        'you need to inspect task state; the current goal is already injected '
-        'into every model request.'
+        'you need to inspect current active-goal state; the current goal is '
+        'already injected into every model request. This is not the durable '
+        'project task graph.'
     )
     input_model = TaskGetInput
 
@@ -46,11 +47,13 @@ class TaskPlanInput(ToolInput):
 class TaskPlanTool(Tool[TaskPlanInput]):
     name = 'task_plan'
     description = (
-        'Create one persistent plan for complex work with multiple dependent '
-        'steps, multiple files, or implementation plus verification. Do not '
-        'use for questions, directory listings, one command, one file read, '
-        'or a small focused edit. A current plan is replaced only when '
-        'replace=true.'
+        'Create one active-goal linear plan for complex work with multiple '
+        'dependent steps, multiple files, or implementation plus verification '
+        'inside the current conversation. Do not use for questions, directory '
+        'listings, one command, one file read, or a small focused edit. Do '
+        'not use this for durable project task queues; use task-graph tools '
+        'only when persistent dependency tracking is explicitly needed. A '
+        'current plan is replaced only when replace=true.'
     )
     input_model = TaskPlanInput
 
@@ -84,9 +87,11 @@ class TaskUpdateInput(ToolInput):
 class TaskUpdateTool(Tool[TaskUpdateInput]):
     name = 'task_update'
     description = (
-        'Update one step of an existing complex task plan. Use only when a '
-        'step actually starts, completes, or becomes blocked. This tool cannot '
-        'complete the whole task; ForgeCode completion checks own that state.'
+        'Update one step of the current active-goal linear plan. Use only '
+        'when a step actually starts, completes, or becomes blocked. This '
+        'tool cannot complete the whole task; ForgeCode completion checks own '
+        'that state. This is not for claiming or completing durable '
+        'task-graph items.'
     )
     input_model = TaskUpdateInput
 

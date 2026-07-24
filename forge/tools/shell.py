@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 from time import perf_counter
+from typing import TYPE_CHECKING
 
 from pydantic import Field
 
@@ -19,6 +20,9 @@ from forge.tools.base import (
     display_path,
     resolve_repository_path,
 )
+
+if TYPE_CHECKING:
+    from forge.runtime.background import BackgroundTaskManager
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +112,7 @@ class RunCommandInput(ToolInput):
     cwd: str = '.'
     timeout_seconds: float = Field(default=120.0, gt=0, le=600)
     stdin: str | None = Field(default=None, max_length=8_000)
+    run_in_background: bool = False
 
 
 class RunCommandTool(Tool[RunCommandInput]):
@@ -118,9 +123,12 @@ class RunCommandTool(Tool[RunCommandInput]):
         'trees; use read_file, grep, find_files, or list_directory. Do not '
         'write files through scripts or redirection; use write_file, '
         'replace_text, or apply_patch. Use verify instead when the command is '
-        'intended as formal completion evidence. For multiline scripts, pass '
-        'command="python -" or command="node" and put the script in stdin; '
-        'do not embed a POSIX heredoc in command. '
+        'intended as formal completion evidence. Set run_in_background=true '
+        'only for slow commands where useful work can continue while the '
+        'command runs; completion will be injected later as a '
+        'task_notification. For multiline scripts, pass command="python -" '
+        'or command="node" and put the script in stdin; do not embed a POSIX '
+        'heredoc in command. '
         + (
             'Commands run through Windows cmd.exe, which does not support '
             'the POSIX << heredoc syntax.'
@@ -130,6 +138,14 @@ class RunCommandTool(Tool[RunCommandInput]):
     )
     input_model = RunCommandInput
     effect = 'process'
+
+    def __init__(
+        self,
+        root: Path,
+        background_manager: 'BackgroundTaskManager | None' = None,
+    ) -> None:
+        super().__init__(root)
+        self.background_manager = background_manager
 
     async def execute(self, arguments: RunCommandInput) -> ToolResult:
         if os.name == 'nt' and has_unquoted_heredoc(arguments.command):
@@ -187,6 +203,35 @@ class RunCommandTool(Tool[RunCommandInput]):
             raise ToolExecutionError(
                 'not_a_directory',
                 f'Command cwd is not a directory: {arguments.cwd}',
+            )
+        if arguments.run_in_background:
+            if self.background_manager is None:
+                raise ToolExecutionError(
+                    'background_not_available',
+                    'run_in_background is only available inside the main '
+                    'ForgeCode conversation loop.',
+                )
+            background = self.background_manager.start_command(
+                command=arguments.command,
+                cwd=cwd,
+                display_cwd=display_path(self.root, cwd),
+                timeout_seconds=arguments.timeout_seconds,
+                input_text=arguments.stdin,
+            )
+            return ToolResult.ok(
+                f'Background command {background.id} started.',
+                content=(
+                    f'[Background task {background.id} started]\n'
+                    f'Command: {arguments.command}\n'
+                    'Result will be injected as a task_notification when '
+                    'the command completes.'
+                ),
+                metadata={
+                    'background_started': True,
+                    'background_id': background.id,
+                    'command': arguments.command,
+                    'cwd': background.cwd,
+                },
             )
         result = await run_process(
             arguments.command,

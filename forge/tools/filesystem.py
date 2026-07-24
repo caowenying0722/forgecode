@@ -164,7 +164,8 @@ class WriteFileTool(Tool[WriteFileInput]):
         'Create or fully replace one small UTF-8 repository text file '
         'atomically. Content is limited to 30000 characters. For larger '
         'files, use write_file_chunk with ordered offsets. Do not use this '
-        'for a small edit to an existing large file.'
+        'for a small edit to an existing large file. The parent directory '
+        'must already exist; if it does not, call create_directory first.'
     )
     input_model = WriteFileInput
     effect = 'workspace_write'
@@ -186,7 +187,10 @@ class WriteFileTool(Tool[WriteFileInput]):
         if not path.parent.is_dir():
             raise ToolExecutionError(
                 'parent_not_found',
-                f'Parent directory does not exist: {arguments.path}',
+                f'Parent directory does not exist: {arguments.path}. '
+                'Call create_directory for the parent directory, then retry '
+                'the file write.',
+                details={'parent': display_path(self.root, path.parent)},
             )
 
         existed = path.exists()
@@ -234,6 +238,8 @@ class WriteFileChunkTool(Tool[WriteFileChunkInput]):
         'writing. Set final=true on the last chunk and optionally provide '
         'expected_sha256 for whole-file integrity. Total file size is '
         'limited to 1000000 characters.'
+        ' The parent directory must already exist; if it does not, call '
+        'create_directory first.'
     )
     input_model = WriteFileChunkInput
     effect = 'workspace_write'
@@ -255,7 +261,10 @@ class WriteFileChunkTool(Tool[WriteFileChunkInput]):
         if not path.parent.is_dir():
             raise ToolExecutionError(
                 'parent_not_found',
-                f'Parent directory does not exist: {arguments.path}',
+                f'Parent directory does not exist: {arguments.path}. '
+                'Call create_directory for the parent directory, then retry '
+                'the chunked file write.',
+                details={'parent': display_path(self.root, path.parent)},
             )
 
         existed = path.exists()
@@ -319,6 +328,66 @@ class WriteFileChunkTool(Tool[WriteFileChunkInput]):
                 'truncated': arguments.truncate,
                 'final': arguments.final,
                 'sha256': digest,
+            },
+        )
+
+
+class CreateDirectoryInput(ToolInput):
+    path: str = Field(min_length=1)
+    parents: bool = True
+
+
+class CreateDirectoryTool(Tool[CreateDirectoryInput]):
+    name = 'create_directory'
+    description = (
+        'Create one repository directory before writing files inside it. '
+        'Use this when the user asks to create a directory or when a write '
+        'tool reports parent_not_found. Set parents=true to create missing '
+        'intermediate directories. Do not use for files; use write_file, '
+        'write_file_chunk, or apply_patch after the directory exists.'
+    )
+    input_model = CreateDirectoryInput
+    effect = 'workspace_write'
+
+    async def execute(self, arguments: CreateDirectoryInput) -> ToolResult:
+        return await asyncio.to_thread(self._execute_sync, arguments)
+
+    def _execute_sync(self, arguments: CreateDirectoryInput) -> ToolResult:
+        path = resolve_repository_path(
+            self.root,
+            arguments.path,
+            must_exist=False,
+        )
+        if path.exists() and not path.is_dir():
+            raise ToolExecutionError(
+                'not_a_directory',
+                f'Path exists but is not a directory: {arguments.path}',
+            )
+        if path.exists():
+            shown_path = display_path(self.root, path)
+            return ToolResult.ok(
+                f'Directory already exists: {shown_path}.',
+                metadata={
+                    'path': shown_path,
+                    'created': False,
+                    'parents': arguments.parents,
+                },
+            )
+        try:
+            path.mkdir(parents=arguments.parents, exist_ok=False)
+        except FileNotFoundError as error:
+            raise ToolExecutionError(
+                'parent_not_found',
+                f'Parent directory does not exist: {arguments.path}',
+                details={'path': arguments.path, 'parents': arguments.parents},
+            ) from error
+        shown_path = display_path(self.root, path)
+        return ToolResult.ok(
+            f'Created directory {shown_path}.',
+            metadata={
+                'path': shown_path,
+                'created': True,
+                'parents': arguments.parents,
             },
         )
 

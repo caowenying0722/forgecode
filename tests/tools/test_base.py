@@ -5,6 +5,8 @@ from pathlib import Path
 
 from forge.tools import create_default_registry
 from forge.tools.base import ToolResult
+from forge.tasks.manager import TaskManager
+from forge.tools.task import create_task_tools
 
 
 def run(coroutine: object) -> ToolResult:
@@ -19,6 +21,7 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'find_files',
         'read_file',
         'grep',
+        'create_directory',
         'write_file',
         'write_file_chunk',
         'replace_text',
@@ -27,6 +30,11 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'verify',
         'git_status',
         'git_diff',
+        'task_create',
+        'task_list',
+        'task_graph_get',
+        'task_claim',
+        'task_complete',
         'memory_list',
         'memory_read',
         'memory_write',
@@ -44,13 +52,46 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         for definition in registry.definitions
     )
     assert registry.effect('read_file') == 'read_only'
+    assert registry.effect('create_directory') == 'workspace_write'
     assert registry.effect('write_file') == 'workspace_write'
     assert registry.effect('write_file_chunk') == 'workspace_write'
     assert registry.effect('replace_text') == 'workspace_write'
     assert registry.effect('apply_patch') == 'workspace_write'
     assert registry.effect('run_command') == 'process'
+    assert registry.effect('task_create') == 'workspace_write'
+    assert registry.effect('task_list') == 'read_only'
+    assert registry.effect('task_graph_get') == 'read_only'
+    assert registry.effect('task_claim') == 'workspace_write'
+    assert registry.effect('task_complete') == 'workspace_write'
     assert registry.effect('finish_task') == 'read_only'
     assert registry.effect('missing') is None
+
+
+def test_tool_descriptions_define_task_boundaries(tmp_path: Path) -> None:
+    definitions = {
+        definition['name']: definition['description']
+        for definition in create_default_registry(tmp_path).definitions
+    }
+    definitions.update(
+        {
+            tool.definition['name']: tool.definition['description']
+            for tool in create_task_tools(
+                tmp_path,
+                TaskManager(tmp_path),
+            )
+        }
+    )
+
+    assert 'active-goal linear plan' in definitions['task_plan']
+    assert 'durable project task queues' in definitions['task_plan']
+    assert 'ordinary bug fixes' in definitions['task_create']
+    assert 'existing durable task graph' in definitions['task_graph_get']
+    assert 'not for the current active-goal plan' in definitions['task_claim']
+    assert 'simple local reads or small focused edits' in definitions['task']
+    assert 'run_in_background=true only for slow commands' in (
+        definitions['run_command']
+    )
+    assert 'call create_directory first' in definitions['write_file']
 
 
 def test_registry_returns_structured_unknown_tool_error(

@@ -124,6 +124,7 @@ class WorkingState:
         self.discovered_files: set[tuple[int, str]] = set()
         self.successful_signatures: set[str] = set()
         self.cached_results: dict[str, ToolResult] = {}
+        self.cache_hit_counts: dict[str, int] = {}
         self.failures: list[str] = []
         self.failure_codes: set[str] = set()
         self.latest_failure_code: str | None = None
@@ -139,6 +140,19 @@ class WorkingState:
             if replay is not None:
                 return replay
         if signature is not None and signature in self.cached_results:
+            count = self.cache_hit_counts.get(signature, 0)
+            self.cache_hit_counts[signature] = count + 1
+            if count >= 1:
+                return ToolResult.fail(
+                    'redundant_cached_tool_call',
+                    (
+                        f'{tool_call.name} was already repeated with the same '
+                        'arguments at this workspace revision. Reuse the '
+                        'existing cache-hit evidence and take the next '
+                        'non-redundant action.'
+                    ),
+                    metadata={'cache_hit': True, 'redundant_cache_hit': True},
+                )
             cached = self.cached_results[signature]
             return ToolResult.ok(
                 f'Cache hit: {cached.summary}',
@@ -244,6 +258,7 @@ class WorkingState:
         # Signatures include the workspace revision. Dropping this small cache
         # is safer than replaying stale content after any repository change.
         self.cached_results.clear()
+        self.cache_hit_counts.clear()
         self.latest_failure_code = None
 
     def system_suffix(self) -> str:

@@ -66,10 +66,11 @@ class ApplyPatchTool(Tool[ApplyPatchInput]):
         'or *** Delete File sections; Update sections may use bare @@ hunks). '
         'The patch is limited to 30000 characters; split large HTML, CSS, '
         'JavaScript, or source files across multiple calls. Use '
-        'repository-relative paths. On patch_rejected, inspect the error and '
-        'relevant current lines instead of retrying the same patch. Prefer '
-        'replace_text for one exact replacement. Use write_file only for '
-        'small full-file content.'
+        'repository-relative paths. Add File requires the parent directory to '
+        'exist; if it does not, call create_directory first. On '
+        'patch_rejected, inspect the error and relevant current lines instead '
+        'of retrying the same patch. Prefer replace_text for one exact '
+        'replacement. Use write_file only for small full-file content.'
     )
     input_model = ApplyPatchInput
     effect = 'workspace_write'
@@ -329,7 +330,12 @@ def build_unified_patch(
             if not path.parent.is_dir():
                 raise _EnvelopeError(
                     f'Cannot add {operation.path!r}: parent directory does '
-                    'not exist.'
+                    'not exist. Call create_directory for the parent '
+                    'directory, then retry the patch.',
+                    details={
+                        'path': operation.path,
+                        'parent': display_path(root, path.parent),
+                    },
                 )
             after = parse_added_file(operation)
             changes.append((display_path(root, path), None, after))

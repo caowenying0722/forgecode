@@ -4,6 +4,7 @@ from pathlib import Path
 
 from forge.tools.base import ToolRegistry
 from forge.tools.filesystem import (
+    CreateDirectoryTool,
     ListDirectoryTool,
     ReadFileTool,
     ReplaceTextTool,
@@ -18,6 +19,7 @@ from forge.tools.patch import ApplyPatchTool
 from forge.tools.search import FindFilesTool, GrepTool
 from forge.tools.shell import RunCommandTool
 from forge.tools.subagent import ExploreSubagentTool, TaskSubagentTool
+from forge.tools.task_graph import create_task_graph_tools
 from forge.tools.todo import TodoList, TodoWriteTool
 from forge.tools.verify import VerifyTool
 from forge.runtime.workspace import WorkspaceTracker
@@ -38,6 +40,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
             FindFilesTool(root),
             ReadFileTool(root),
             GrepTool(root),
+            CreateDirectoryTool(root),
             WriteFileTool(root),
             WriteFileChunkTool(root),
             ReplaceTextTool(root),
@@ -46,6 +49,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
             VerifyTool(root, tracker),
             GitStatusTool(root),
             GitDiffTool(root),
+            *create_task_graph_tools(root),
             *create_memory_tools(root),
             TaskSubagentTool(root),
             ExploreSubagentTool(root),
@@ -58,6 +62,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
 
 __all__ = [
     'ApplyPatchTool',
+    'CreateDirectoryTool',
     'FindFilesTool',
     'FinishTaskTool',
     'GitDiffTool',
@@ -68,6 +73,7 @@ __all__ = [
     'create_memory_tools',
     'ExploreSubagentTool',
     'TaskSubagentTool',
+    'create_task_graph_tools',
     'ReadFileTool',
     'ReplaceTextTool',
     'RunCommandTool',

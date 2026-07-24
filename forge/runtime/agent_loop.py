@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from functools import cache
 from itertools import count
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from forge.context.compactor import CompactionConfig
@@ -27,6 +27,7 @@ from forge.runtime.model_client import (
     ModelProtocolError,
 )
 from forge.runtime.completion import CompletionGate, TaskPolicy
+from forge.runtime.background import BackgroundTaskManager
 from forge.runtime.state import (
     CompletionBlocked,
     ConversationEvent,
@@ -58,6 +59,7 @@ from forge.runtime.workspace import WorkspaceTracker
 from forge.sessions.store import SessionStore
 from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolRegistry, ToolResult
+from forge.tools.shell import RunCommandTool
 from forge.tools.subagent import ExploreSubagentTool, TaskSubagentTool
 from forge.tools.task import create_task_tools
 from forge.tools.todo import TodoList, TodoWriteTool
@@ -65,6 +67,21 @@ from forge.tools.todo import TodoList, TodoWriteTool
 
 ACTION_RECOVERY_READ_TOOLS = frozenset(
     {'read_file', 'grep'}
+)
+ACTION_RECOVERY_EXCLUDED_WRITE_TOOLS = frozenset(
+    {
+        'task_create',
+        'task_claim',
+        'task_complete',
+    }
+)
+PARENT_NOT_FOUND_WRITE_TOOLS = frozenset(
+    {
+        'apply_patch',
+        'create_directory',
+        'write_file',
+        'write_file_chunk',
+    }
 )
 InteractionMode = Literal['auto', 'plan', 'code']
 PLAN_MODE_TOOLS = frozenset(
@@ -78,6 +95,8 @@ PLAN_MODE_TOOLS = frozenset(
         'memory_read',
         'task',
         'explore_subagent',
+        'task_list',
+        'task_graph_get',
         'todo_write',
     }
 )
@@ -196,6 +215,7 @@ class Conversation:
             [self.todo_planning, self.permission, self.tool_logger]
         )
         self.task_manager = TaskManager(resolved_context_root)
+        self.background_manager = BackgroundTaskManager(resolved_context_root)
         self.session_store = SessionStore(resolved_context_root)
         self.session_id: str | None = None
         self.interaction_mode: InteractionMode = 'auto'
@@ -215,6 +235,13 @@ class Conversation:
                         resolved_context_root,
                         permission=self.permission,
                         workspace_tracker=tracker,
+                    )
+                )
+            if 'run_command' in registry.names:
+                registry.replace(
+                    RunCommandTool(
+                        resolved_context_root,
+                        background_manager=self.background_manager,
                     )
                 )
             for task_tool in create_task_tools(
@@ -349,6 +376,14 @@ class Conversation:
             text_parts: list[str] = []
             tool_calls: list[ToolCall] = []
             request_usage: TokenUsage | None = None
+            background_notifications = (
+                self.background_manager.collect_notifications()
+            )
+            if background_notifications:
+                append_background_notification_message(
+                    request_messages,
+                    background_notifications,
+                )
 
             if (
                 self.max_turn_input_tokens is not None
@@ -385,7 +420,8 @@ class Conversation:
                     read_available=not action_read_used
                 )
             elif mutation_failures:
-                request_tools = self._action_recovery_tools(
+                request_tools = self._mutation_recovery_tools(
+                    mutation_failures,
                     read_available=not mutation_recovery_read_used,
                     include_finish=False,
                 )
@@ -1764,10 +1800,48 @@ class Conversation:
                 or (
                     self.tool_executor is not None
                     and self.tool_executor.effect(name) == 'workspace_write'
+                    and name not in ACTION_RECOVERY_EXCLUDED_WRITE_TOOLS
                 )
             ):
                 selected.append(definition)
         return selected
+
+    def _mutation_recovery_tools(
+        self,
+        failures: list[dict[str, Any]],
+        *,
+        read_available: bool,
+        include_finish: bool = False,
+    ) -> list[dict[str, Any]] | None:
+        latest = failures[-1] if failures else {}
+        if latest.get('code') != 'parent_not_found':
+            return self._action_recovery_tools(
+                read_available=read_available,
+                include_finish=include_finish,
+            )
+        if self.registry is None or self.tools is None:
+            return self.tools
+        failed_write_tools = {
+            str(failure.get('tool', ''))
+            for failure in failures
+            if str(failure.get('code', '')) == 'parent_not_found'
+        }
+        allowed = {
+            'create_directory',
+            *(
+                failed_write_tools
+                & {'apply_patch', 'write_file', 'write_file_chunk'}
+            ),
+        }
+        if not allowed & {'apply_patch', 'write_file', 'write_file_chunk'}:
+            allowed.update({'write_file', 'write_file_chunk', 'apply_patch'})
+        if read_available:
+            allowed.add('list_directory')
+        return [
+            definition
+            for definition in self.tools
+            if str(definition.get('name', '')) in allowed
+        ]
 
     async def _finish_rejection_reasons(
         self,
@@ -2165,6 +2239,40 @@ def build_tool_result_message(
             }
         )
     return {'role': 'user', 'content': content}
+
+
+def append_background_notification_message(
+    messages: list[dict[str, Any]],
+    notifications: tuple[str, ...],
+) -> None:
+    message = build_background_notification_message(notifications)
+    if not messages or messages[-1].get('role') != 'user':
+        messages.append(message)
+        return
+    existing = messages[-1].get('content')
+    if isinstance(existing, str):
+        messages[-1]['content'] = [
+            {'type': 'text', 'text': existing},
+            *message['content'],
+        ]
+        return
+    if isinstance(existing, list):
+        existing.extend(message['content'])
+        return
+    messages.append(message)
+
+
+def build_background_notification_message(
+    notifications: tuple[str, ...],
+) -> dict[str, Any]:
+    '''Build one user message containing background completion notices.'''
+    return {
+        'role': 'user',
+        'content': [
+            {'type': 'text', 'text': notification}
+            for notification in notifications
+        ],
+    }
 
 
 def serialize_tool_result(result: ToolResult) -> str:
@@ -2685,17 +2793,53 @@ def render_mutation_recovery_context(
         if diagnostic:
             lines.append(f'  diagnostic: {diagnostic}')
     lines.append(
-        'All normal tools remain available. Do not restart broad discovery. '
-        'If the latest diagnostic includes Closest current text, copy it '
-        'verbatim as the next old_text and do not re-read that region. Only '
-        'when no exact candidate is supplied, make one targeted read before '
-        'retrying a smaller corrected edit.'
+        mutation_recovery_instruction(failures)
     )
     lines.append(
         'apply_patch accepts unified diff and Begin Patch; use replace_text '
         'for an exact change. Only a real workspace revision clears this.'
     )
     return '\n'.join(lines)
+
+
+def mutation_recovery_instruction(
+    failures: list[dict[str, Any]],
+) -> str:
+    latest = failures[-1] if failures else {}
+    if latest.get('code') == 'parent_not_found':
+        parents = parent_directories_from_failures(failures)
+        parent_text = ', '.join(parents) if parents else 'the missing parent'
+        return (
+            'The latest failure is parent_not_found. Do not retry another '
+            'file write first. Call create_directory for '
+            f'{parent_text}, then retry the original file write. Do not '
+            'restart broad discovery, use placeholder writes, or patch '
+            'unrelated files.'
+        )
+    return (
+        'All normal tools remain available. Do not restart broad discovery. '
+        'If the latest diagnostic includes Closest current text, copy it '
+        'verbatim as the next old_text and do not re-read that region. Only '
+        'when no exact candidate is supplied, make one targeted read before '
+        'retrying a smaller corrected edit.'
+    )
+
+
+def parent_directories_from_failures(
+    failures: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    parents: list[str] = []
+    for failure in failures:
+        if failure.get('code') != 'parent_not_found':
+            continue
+        for target in failure.get('targets', []):
+            if not isinstance(target, str) or not target.strip():
+                continue
+            normalized = target.strip().replace('\\', '/')
+            parent = PurePosixPath(normalized).parent.as_posix()
+            if parent and parent != '.':
+                parents.append(parent)
+    return tuple(dict.fromkeys(parents))[:5]
 
 
 def build_mutation_recovery_feedback(

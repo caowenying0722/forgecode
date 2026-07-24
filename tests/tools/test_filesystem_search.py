@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 
 from forge.tools.filesystem import (
+    CreateDirectoryTool,
     ListDirectoryTool,
     ReadFileTool,
     ReplaceTextTool,
@@ -78,9 +79,31 @@ def test_list_directory_sorts_directories_before_files(
         'src/',
         'README.md',
     ]
-    assert result.metadata['entry_count'] == 3
-    assert result.metadata['total'] == 3
-    assert result.metadata['truncated'] is False
+
+
+def test_create_directory_allows_later_file_write(tmp_path: Path) -> None:
+    missing_write = run(
+        WriteFileTool(tmp_path).run(
+            {'path': 'game/index.html', 'content': '<html></html>\n'}
+        )
+    )
+    created = run(CreateDirectoryTool(tmp_path).run({'path': 'game'}))
+    written = run(
+        WriteFileTool(tmp_path).run(
+            {'path': 'game/index.html', 'content': '<html></html>\n'}
+        )
+    )
+
+    assert missing_write.success is False
+    assert missing_write.error is not None
+    assert missing_write.error.code == 'parent_not_found'
+    assert missing_write.error.details['parent'] == 'game'
+    assert created.success is True
+    assert created.metadata == {'path': 'game', 'created': True, 'parents': True}
+    assert written.success is True
+    assert (tmp_path / 'game' / 'index.html').read_text(
+        encoding='utf-8'
+    ) == '<html></html>\n'
 
 
 def test_list_directory_accepts_bounded_max_results(

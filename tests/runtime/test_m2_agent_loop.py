@@ -593,6 +593,118 @@ def test_pending_write_failure_hides_finish_and_bounds_invalid_attempts(
     assert 'Finished despite the unresolved edit.' not in completed.result.text
 
 
+def test_parent_not_found_recovery_exposes_create_directory_then_write(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    failed_write = ToolCall(
+        0,
+        'write-missing-parent',
+        'write_file',
+        {
+            'path': 'game/index.html',
+            'content': '<!doctype html>\n<html></html>\n',
+        },
+    )
+    todo = ToolCall(
+        0,
+        'plan-game',
+        'todo_write',
+        {
+            'todos': [
+                {
+                    'id': 'plan',
+                    'content': '规划金铲铲风格 Web UI 结构和交互',
+                    'status': 'completed',
+                    'priority': 'high',
+                },
+                {
+                    'id': 'implement',
+                    'content': '创建 game 目录并写入页面文件',
+                    'status': 'in_progress',
+                    'priority': 'high',
+                },
+                {
+                    'id': 'verify',
+                    'content': '运行验证命令',
+                    'status': 'pending',
+                    'priority': 'medium',
+                },
+            ]
+        },
+    )
+    create_directory = ToolCall(
+        0,
+        'create-game-directory',
+        'create_directory',
+        {'path': 'game'},
+    )
+    write_file = ToolCall(
+        1,
+        'write-game-index',
+        'write_file',
+        {
+            'path': 'game/index.html',
+            'content': '<!doctype html>\n<html></html>\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'verify-game',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    client = FakeModelClient(
+        response_with_tool(todo),
+        response_with_tool(failed_write),
+        response_with_tools(create_directory, write_file),
+        response_with_tool(verify),
+        finish_response(
+            'finish-game',
+            task_kind='change',
+            summary='Created game web UI skeleton.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(
+        conversation,
+        '帮我新建一个game/目录，然后写一个高还原度的金铲铲游戏的web界面，先规划再行动',
+    )
+
+    first_failure = next(
+        event.result
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.tool_call.id == 'write-missing-parent'
+    )
+    assert first_failure.error is not None
+    assert first_failure.error.code == 'parent_not_found'
+    recovery_tool_names = {
+        definition['name'] for definition in client.calls[2]['tools'] or ()
+    }
+    assert recovery_tool_names == {
+        'create_directory',
+        'list_directory',
+        'write_file',
+    }
+    recovery_request = (
+        (client.calls[2]['system'] or '')
+        + str(client.calls[2]['messages'])
+    )
+    assert 'Call create_directory for game' in recovery_request
+    assert (tmp_path / 'game' / 'index.html').read_text(
+        encoding='utf-8'
+    ) == '<!doctype html>\n<html></html>\n'
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert 'game/index.html' in completed.result.changed_paths
+
+
 def test_required_change_stagnation_enters_action_recovery_and_can_finish(
     tmp_path: Path,
 ) -> None:
@@ -1529,6 +1641,58 @@ def test_malformed_tool_arguments_recover_without_pausing_tools(
     )
     assert isinstance(events[-1], TurnCompleted)
     assert events[-1].result.status == 'completed'
+
+
+def test_repeated_exact_cache_hit_is_rejected_as_non_progress(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    first = ToolCall(
+        0,
+        'list-root-first',
+        'list_directory',
+        {'path': '.', 'max_results': 200},
+    )
+    second = ToolCall(
+        0,
+        'list-root-second',
+        'list_directory',
+        {'path': '.', 'max_results': 200},
+    )
+    third = ToolCall(
+        0,
+        'list-root-third',
+        'list_directory',
+        {'path': '.', 'max_results': 200},
+    )
+    client = FakeModelClient(
+        response_with_tool(first),
+        response_with_tool(second),
+        response_with_tool(third),
+        text_response('Used existing directory evidence.'),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        stagnation_warning=10,
+        stagnation_limit=20,
+    )
+
+    events = collect_turn(conversation, 'Inspect the repository root')
+
+    results = [
+        event
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+    ]
+    assert results[1].result.success is True
+    assert results[1].result.metadata['cache_hit'] is True
+    assert results[2].result.success is False
+    assert results[2].result.error is not None
+    assert results[2].result.error.code == 'redundant_cached_tool_call'
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
 
 
 def test_invalid_grep_regex_recovers_as_tool_protocol_failure(

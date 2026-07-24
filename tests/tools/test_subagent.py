@@ -93,6 +93,7 @@ def test_explore_subagent_uses_main_tools_except_task_controls_and_reports(
         'read_file',
         'grep',
         'git_status',
+        'create_directory',
         'write_file',
         'write_file_chunk',
         'replace_text',

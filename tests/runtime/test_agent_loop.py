@@ -264,6 +264,11 @@ def test_system_prompt_defines_forgecode_identity() -> None:
     assert 'Tool\n   schema errors, repeated reads' in prompt
     assert 'Do not run destructive commands' in prompt
     assert 'call `verify`' in prompt
+    assert 'Task and execution boundaries:' in prompt
+    assert '`task_plan` and `task_update` are for the current active goal' in prompt
+    assert '`task_create`, `task_list`, `task_graph_get`, `task_claim`, and' in prompt
+    assert 'Do not create\n  task-graph items for ordinary bug fixes' in prompt
+    assert '`run_in_background=true` only for slow commands' in prompt
 
 
 def test_conversation_accepts_an_explicit_system_prompt() -> None:
@@ -325,6 +330,8 @@ def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(
         'read_file',
         'grep',
         'git_status',
+        'task_list',
+        'task_graph_get',
         'memory_list',
         'memory_read',
         'task',
@@ -530,6 +537,33 @@ def test_conversation_executes_tool_and_continues_until_final_text(
         tool_result_message,
         {'role': 'assistant', 'content': 'Finished'},
     ]
+
+
+def test_background_notifications_are_injected_before_model_request(
+    tmp_path: Path,
+) -> None:
+    client = FakeModelClient(streamed_response('Noted.'))
+    conversation = Conversation(
+        client=client,
+        registry=ToolRegistry([RecordingReadFileTool(tmp_path)]),
+    )
+    conversation.background_manager.collect_notifications = lambda: (
+        '<task_notification>\n'
+        '  <task_id>bg-0001</task_id>\n'
+        '  <status>completed</status>\n'
+        '</task_notification>',
+    )
+
+    events = collect_turn(conversation, 'Continue')
+
+    assert events[-1].result.text == 'Noted.'
+    first_message = client.calls[0]['messages'][0]
+    assert first_message['role'] == 'user'
+    assert first_message['content'][0] == {
+        'type': 'text',
+        'text': 'Continue',
+    }
+    assert '<task_notification>' in first_message['content'][1]['text']
 
 
 def test_conversation_executes_multiple_tool_calls_in_order(
@@ -898,8 +932,11 @@ def test_exact_tool_repeat_is_skipped_after_limit(tmp_path: Path) -> None:
         event for event in events
         if isinstance(event, ToolExecutionCompleted)
     ]
-    assert completed[-1].result.success is True
-    assert completed[-1].result.metadata['cache_hit'] is True
+    assert completed[1].result.success is True
+    assert completed[1].result.metadata['cache_hit'] is True
+    assert completed[-1].result.success is False
+    assert completed[-1].result.error is not None
+    assert completed[-1].result.error.code == 'redundant_cached_tool_call'
 
 
 def test_edit_recovery_stops_noop_writes_without_total_call_limit(
