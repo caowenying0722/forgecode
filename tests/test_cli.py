@@ -185,6 +185,9 @@ class FakeResponseView:
     def complete(self, result: TurnResult) -> None:
         self.actions.append(('complete', result))
 
+    def interrupt(self) -> None:
+        self.actions.append(('interrupt', None))
+
     def compact_context(self, event: ContextCompacted) -> None:
         self.actions.append(('compact', event))
 
@@ -265,6 +268,36 @@ def test_stream_events_are_forwarded_to_live_view() -> None:
     ]
 
 
+def test_escape_interrupt_cancels_only_the_active_response() -> None:
+    cancelled = False
+
+    class SlowConversation:
+        async def stream(self, _prompt: str):
+            nonlocal cancelled
+            try:
+                yield ModelTextDelta(text='partial')
+                await asyncio.Future()
+            finally:
+                cancelled = True
+
+    async def escape_pressed() -> None:
+        await asyncio.sleep(0)
+
+    response_view = FakeResponseView()
+    with pytest.raises(cli_module.UserTurnInterrupted):
+        asyncio.run(
+            cli_module.render_streamed_turn_interruptibly(
+                SlowConversation(),  # type: ignore[arg-type]
+                'long task',
+                response_view,  # type: ignore[arg-type]
+                wait_for_interrupt=escape_pressed,
+            )
+        )
+
+    assert cancelled is True
+    assert response_view.actions[-1] == ('interrupt', None)
+
+
 def test_context_compaction_event_is_forwarded_to_live_view() -> None:
     event = ContextCompacted(
         before_characters=10_000,
@@ -306,7 +339,7 @@ def test_cli_starts_an_interactive_conversation(
 
     assert result.exit_code == 0
     assert 'ForgeCode v0.1.0' in result.output
-    assert 'Ctrl+C to exit' in result.output
+    assert 'Esc interrupt · Ctrl+C exit' in result.output
     assert 'Ask a question or describe a coding task.' in result.output
     assert 'Hello' in result.output
     assert 'I remember' in result.output

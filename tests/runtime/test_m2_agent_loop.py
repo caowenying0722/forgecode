@@ -217,7 +217,7 @@ def test_agent_loop_rejects_early_answer_then_accepts_verify_evidence(
     assert 'has not been verified' in feedback
 
 
-def test_default_policy_can_finish_a_valid_diff_without_verify(
+def test_default_policy_rejects_unverified_change_then_accepts_verify(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -231,12 +231,24 @@ def test_default_policy_can_finish_a_valid_diff_without_verify(
             'new_text': 'new\n',
         },
     )
+    verify = ToolCall(
+        0,
+        'toolu_default_verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
     client = FakeModelClient(
         response_with_tool(edit),
         finish_response(
             'finish_without_verify',
             task_kind='change',
             summary='Implemented the requested change.',
+        ),
+        response_with_tool(verify),
+        finish_response(
+            'finish_with_verify',
+            task_kind='change',
+            summary='Implemented and verified the requested change.',
         ),
     )
     conversation = Conversation(
@@ -250,8 +262,8 @@ def test_default_policy_can_finish_a_valid_diff_without_verify(
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'completed'
     assert completed.result.changed_paths == ('sample.txt',)
-    assert completed.result.verification is None
-    assert not any(isinstance(item, CompletionBlocked) for item in events)
+    assert completed.result.verification is not None
+    assert any(isinstance(item, CompletionBlocked) for item in events)
 
 
 def test_replayed_game_evidence_can_progress_to_edit_and_verification(
@@ -1342,7 +1354,7 @@ def test_verified_change_stagnation_allows_final_summary_recovery(
     )
 
 
-def test_unverified_change_stagnation_allows_final_summary_recovery(
+def test_unverified_change_stagnation_cannot_claim_completion(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -1377,17 +1389,14 @@ def test_unverified_change_stagnation_allows_final_summary_recovery(
 
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
-    assert completed.result.status == 'completed'
+    assert completed.result.status == 'stuck'
     assert completed.result.text == summary
     assert completed.result.changed_paths == ('sample.txt',)
     assert completed.result.verification is None
-    assert client.calls[-1]['tools'] is None
-    final_request = (
-        (client.calls[-1]['system'] or '')
-        + str(client.calls[-1]['messages'])
+    assert any(
+        'has not been verified' in reason
+        for reason in completed.result.completion_reasons
     )
-    assert '[ForgeCode Finalization Recovery]' in final_request
-    assert 'not required / not run' in final_request
 
 
 def test_novel_repository_evidence_cannot_extend_completion_ready_loop(

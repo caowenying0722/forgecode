@@ -141,7 +141,7 @@ def test_terminal_renders_session_header_and_markdown_response() -> None:
     rendered = output.getvalue()
     assert 'ForgeCode v0.1.0' in rendered
     assert 'test-model' in rendered
-    assert 'Ctrl+C to exit' in rendered
+    assert 'Esc interrupt · Ctrl+C exit' in rendered
     assert 'Hello from ForgeCode' in rendered
     assert rendered.count('Hello from ForgeCode') == 1
     assert 'input 1,200' in rendered

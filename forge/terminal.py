@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
+import select
+import sys
 from typing import Any, Protocol
 
 from prompt_toolkit import PromptSession
@@ -199,7 +205,7 @@ class TerminalUI:
             Panel.fit(
                 details,
                 title=title,
-                subtitle=Text('Ctrl+C to exit', style='dim'),
+                subtitle=Text('Esc interrupt · Ctrl+C exit', style='dim'),
                 border_style='bright_cyan',
                 padding=(1, 2),
             )
@@ -220,6 +226,14 @@ class TerminalUI:
     def stream_response(self) -> StreamingResponseView:
         '''Create a live view for one streaming model response.'''
         return StreamingResponseView(self.console)
+
+    async def wait_for_interrupt(self) -> None:
+        '''Wait until Esc is pressed while a response is running.'''
+        await wait_for_escape_key()
+
+    def show_interrupted(self) -> None:
+        '''Confirm that only the active response was stopped.'''
+        self.console.print('[yellow]Interrupted current response.[/]')
 
     def show_error(self, error: Exception) -> None:
         '''Render a recoverable request error without interpreting its markup.'''
@@ -341,6 +355,7 @@ class StreamingResponseView:
         self.request_usage: TokenUsage | None = None
         self.model_calls = 0
         self.completed = False
+        self.interrupted = False
         self.result: TurnResult | None = None
         self.phase: AgentPhase | None = None
         self.phase_reason = ''
@@ -454,6 +469,19 @@ class StreamingResponseView:
         )
         self.live.update(self._render(), refresh=True)
 
+    def interrupt(self) -> None:
+        '''Finalize the live frame after a user-requested interruption.'''
+        self.interrupted = True
+        self.completed = True
+        self.timeline.append(
+            _NoticeTimelineBlock(
+                title='回答已中断',
+                lines=('已完成的工具操作不会回滚',),
+                style='yellow',
+            )
+        )
+        self.live.update(self._render(), refresh=True)
+
     def update_phase(self, phase: AgentPhase, reason: str) -> None:
         '''Show the current orchestration phase without polluting the timeline.'''
         self.phase = phase
@@ -508,6 +536,8 @@ class StreamingResponseView:
                     style='dim bright_cyan',
                 )
             )
+        if not self.completed:
+            renderables.append(Text('Esc 中断当前回答', style='dim'))
         if self.result is not None and (
             self.result.changed_paths
             or self.result.verification is not None
@@ -704,6 +734,43 @@ def streaming_preview(
     if truncated:
         preview = f'…\n{preview.lstrip()}'
     return preview
+
+
+async def wait_for_escape_key() -> None:
+    '''Poll the active terminal for Esc without blocking the event loop.'''
+    if not sys.stdin.isatty():
+        await asyncio.Future()
+        return
+    if os.name == 'nt':
+        import msvcrt
+
+        while True:
+            while msvcrt.kbhit():
+                if msvcrt.getwch() == '\x1b':
+                    return
+            await asyncio.sleep(0.05)
+
+    file_descriptor = sys.stdin.fileno()
+    with terminal_cbreak(file_descriptor):
+        while True:
+            readable, _, _ = select.select([file_descriptor], [], [], 0)
+            if readable and os.read(file_descriptor, 1) == b'\x1b':
+                return
+            await asyncio.sleep(0.05)
+
+
+@contextmanager
+def terminal_cbreak(file_descriptor: int) -> Iterator[None]:
+    '''Temporarily enable single-key reads and restore terminal settings.'''
+    import termios
+    import tty
+
+    previous = termios.tcgetattr(file_descriptor)
+    tty.setcbreak(file_descriptor)
+    try:
+        yield
+    finally:
+        termios.tcsetattr(file_descriptor, termios.TCSADRAIN, previous)
 
 
 def permission_answer_allows(answer: str) -> bool:

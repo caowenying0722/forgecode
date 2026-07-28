@@ -1,5 +1,6 @@
 '''Multi-step model and tool execution for the M1 Agent Loop.'''
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import cache
@@ -436,6 +437,18 @@ class Conversation:
                         yield phase_event
                 self._persist_rollout_event(event)
                 yield event
+        except asyncio.CancelledError:
+            phase_event = self._transition(
+                AgentPhase.FAILED,
+                reason='user_interrupted',
+                iteration=self.run_state.iteration,
+            )
+            if phase_event is not None:
+                self._persist_rollout_event(phase_event)
+            self._persist_rollout_interruption(
+                RuntimeError('User interrupted the active turn with Esc.')
+            )
+            raise
         except Exception as error:
             phase_event = self._transition(
                 AgentPhase.FAILED,
@@ -1082,6 +1095,7 @@ class Conversation:
                         mutation_attempted=(
                             mutation_attempted or change_required
                         ),
+                        reviewed_paths=completion_reviewed_paths,
                     )
                     if not decision.allowed:
                         last_completion_reasons = decision.reasons
@@ -1262,6 +1276,7 @@ class Conversation:
                         mutation_attempted=mutation_attempted,
                         change_required=change_required,
                         verification=latest_verification,
+                        reviewed_paths=completion_reviewed_paths,
                     )
                     if (
                         result.metadata.get('status') != 'blocked'
@@ -1479,6 +1494,16 @@ class Conversation:
                 completion_decision_calls = 0
                 completion_ready_context = ''
                 completion_reviewed_paths.clear()
+            reviewed_now = completion_review_paths(
+                batch.results,
+                (
+                    self.workspace_tracker.changed_paths
+                    if self.workspace_tracker is not None
+                    else ()
+                ),
+            )
+            new_reviews = reviewed_now - completion_reviewed_paths
+            completion_reviewed_paths.update(reviewed_now)
             pending_write_results = batch.pending_write_results(
                 reverted_to_baseline=batch_reverted_to_baseline,
             )
@@ -1623,6 +1648,7 @@ class Conversation:
                     mutation_attempted=mutation_attempted,
                     verification=latest_verification,
                     mutation_failures=mutation_failures,
+                    reviewed_paths=completion_reviewed_paths,
                 )
             )
             if completion_ready:
@@ -1639,12 +1665,6 @@ class Conversation:
                     force_synthesis = False
                     synthesis_retries = 0
                     stagnation_final_recovery = False
-                reviewed_now = completion_review_paths(
-                    batch.results,
-                    self.workspace_tracker.changed_paths,
-                )
-                new_reviews = reviewed_now - completion_reviewed_paths
-                completion_reviewed_paths.update(reviewed_now)
                 if not new_ready_revision and not new_reviews:
                     completion_decision_calls += 1
                 completion_ready_context = render_completion_ready_context(

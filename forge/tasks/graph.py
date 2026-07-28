@@ -380,10 +380,24 @@ class TaskGraphStore:
                 f'Task {task_id} declares verification requirements; '
                 'completion evidence is required.'
             )
+        combined_evidence = tuple(dict.fromkeys((*task.evidence, *additions)))
+        missing_requirements = tuple(
+            requirement
+            for requirement in task.verification
+            if not any(
+                requirement.casefold() in item.casefold()
+                for item in combined_evidence
+            )
+        )
+        if missing_requirements:
+            raise ValueError(
+                'Completion evidence does not reference planned verification: '
+                + ', '.join(missing_requirements)
+            )
         updated = replace(
             task,
             status='completed',
-            evidence=tuple(dict.fromkeys((*task.evidence, *additions))),
+            evidence=combined_evidence,
             updated_at=now_utc(),
         )
         self.save(updated)

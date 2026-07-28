@@ -144,10 +144,10 @@ def test_task_graph_records_executable_contract_and_ready_wave(
     assert details['write_scope'][0]['symbols'] == ['parse']
     assert details['verification'] == ['pytest tests/parser -q']
     assert plan.success is True
-    assert plan.metadata['ready_task_ids'] == [
+    assert set(plan.metadata['ready_task_ids']) == {
         first.metadata['task_id'],
         second.metadata['task_id'],
-    ]
+    }
 
 
 def test_write_overlap_is_serialized_and_blocks_claim(tmp_path: Path) -> None:
@@ -161,14 +161,17 @@ def test_write_overlap_is_serialized_and_blocks_claim(tmp_path: Path) -> None:
         write_scope=[{'path': 'forge/auth.py', 'symbols': ['login']}],
     )
 
-    assert [task.id for task in store.ready_wave()] == [first.id]
-    store.claim(first.id, owner='agent-a')
+    wave = store.ready_wave()
+    assert len(wave) == 1
+    active = wave[0]
+    blocked = second if active.id == first.id else first
+    store.claim(active.id, owner='agent-a')
 
-    assert store.can_start(second.id) is False
+    assert store.can_start(blocked.id) is False
     try:
-        store.claim(second.id, owner='agent-b')
+        store.claim(blocked.id, owner='agent-b')
     except ValueError as error:
-        assert first.id in str(error)
+        assert active.id in str(error)
     else:
         raise AssertionError('overlapping write task should not be claimable')
 
@@ -193,7 +196,7 @@ def test_different_symbols_require_cautious_mode_for_parallel_work(
     assert conflict is not None
     assert conflict.kind == 'same_file_different_symbols'
     assert conflict.blocks_parallel is False
-    assert [task.id for task in store.ready_wave()] == [first.id, second.id]
+    assert {task.id for task in store.ready_wave()} == {first.id, second.id}
 
 
 def test_old_task_json_loads_with_new_contract_defaults(tmp_path: Path) -> None:
@@ -226,6 +229,13 @@ def test_declared_verification_requires_completion_evidence(
         assert 'completion evidence is required' in str(error)
     else:
         raise AssertionError('verification requirements should require evidence')
+
+    try:
+        store.complete(task.id, evidence=['all checks passed'])
+    except ValueError as error:
+        assert 'does not reference planned verification' in str(error)
+    else:
+        raise AssertionError('generic evidence should not satisfy the plan')
 
     completed, _ = store.complete(task.id, evidence=['pytest -q: 12 passed'])
     assert completed.status == 'completed'

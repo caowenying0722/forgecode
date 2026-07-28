@@ -11,12 +11,48 @@ from forge.runtime.workspace import WorkspaceTracker
 from forge.runtime.process import run_process
 
 
+CODE_SUFFIXES = frozenset(
+    {
+        '.c', '.cc', '.cpp', '.cs', '.go', '.h', '.hpp', '.java', '.js',
+        '.jsx', '.kt', '.kts', '.php', '.py', '.rb', '.rs', '.scala',
+        '.svelte', '.swift', '.ts', '.tsx', '.vue',
+    }
+)
+PROJECT_VALIDATION_MARKERS = (
+    ' test',
+    'build',
+    'cargo ',
+    'cmake',
+    'dotnet ',
+    'eslint',
+    'gradle',
+    'jest',
+    'lint',
+    'make ',
+    'mocha',
+    'mvn ',
+    'mypy',
+    'ninja',
+    'playwright',
+    'pytest',
+    'pyright',
+    'ruff',
+    'tsc',
+    'typecheck',
+    'unittest',
+    'vet',
+    'vitest',
+)
+
+
 @dataclass(frozen=True, slots=True)
 class TaskPolicy:
     '''Explicit requirements supplied by a caller or evaluation case.'''
 
     require_changes: bool = False
     require_verification: bool = False
+    require_change_verification: bool = True
+    require_diff_review: bool = False
     allowed_paths: tuple[str, ...] = ()
     forbidden_paths: tuple[str, ...] = (
         'tests/hidden/**',
@@ -47,6 +83,7 @@ class CompletionGate:
         verification: VerificationEvidence | None,
         *,
         mutation_attempted: bool,
+        reviewed_paths: set[str] | None = None,
     ) -> CompletionDecision:
         changed_paths = tracker.changed_paths
         code_task = (
@@ -74,7 +111,11 @@ class CompletionGate:
 
         reasons.extend(self._path_violations(changed_paths))
 
-        if self.policy.require_verification:
+        verification_required = self.policy.require_verification or (
+            self.policy.require_change_verification
+            and (mutation_attempted or bool(changed_paths))
+        )
+        if verification_required:
             if verification is None:
                 reasons.append(
                     'The current code has not been verified with the verify tool.'
@@ -89,6 +130,15 @@ class CompletionGate:
                     'The code changed after verification; run verify again for '
                     f'workspace revision {tracker.revision}.'
                 )
+            elif self._needs_project_validation(changed_paths) and not (
+                command_is_project_validation(verification.command)
+            ):
+                reasons.append(
+                    'Source code changed, but the verification command does '
+                    'not run a recognizable test, build, lint, or type-check '
+                    'for this repository. A whitespace check, syntax-only '
+                    'check, or arbitrary command is insufficient.'
+                )
         elif (
             verification is not None
             and verification.workspace_revision == tracker.revision
@@ -98,6 +148,24 @@ class CompletionGate:
                 f'The latest verification failed with exit code '
                 f'{verification.exit_code}.'
             )
+
+        if (
+            self.policy.require_diff_review
+            and changed_paths
+            and reviewed_paths is not None
+        ):
+            reviewed = {path.replace('\\', '/') for path in reviewed_paths}
+            unreviewed = tuple(
+                path
+                for path in changed_paths
+                if path.replace('\\', '/') not in reviewed
+            )
+            if unreviewed:
+                reasons.append(
+                    'The final Diff has not been reviewed for: '
+                    + ', '.join(unreviewed)
+                    + '. Run git_diff for these current-revision paths.'
+                )
 
         if changed_paths and tracker.available:
             reasons.extend(
@@ -193,6 +261,28 @@ class CompletionGate:
                     + ', '.join(outside)
                 )
         return reasons
+
+    def _needs_project_validation(self, paths: tuple[str, ...]) -> bool:
+        if not any(Path(path).suffix.casefold() in CODE_SUFFIXES for path in paths):
+            return False
+        markers = (
+            'Cargo.toml',
+            'go.mod',
+            'package.json',
+            'pom.xml',
+            'pyproject.toml',
+            'setup.cfg',
+            'tox.ini',
+        )
+        return any((self.root / marker).exists() for marker in markers) or any(
+            (self.root / directory).is_dir()
+            for directory in ('test', 'tests', '__tests__')
+        )
+
+
+def command_is_project_validation(command: str) -> bool:
+    normalized = f' {command.strip().casefold()} '
+    return any(marker in normalized for marker in PROJECT_VALIDATION_MARKERS)
 
 def matches_any(path: str, patterns: tuple[str, ...]) -> bool:
     candidate = path.replace('\\', '/')

@@ -41,7 +41,9 @@ class FinishTaskTool(Tool[FinishTaskInput]):
         'Call this tool alone, only after all necessary repository actions. '
         'Choose task_kind=answer for a direct response, inspection after '
         'collecting repository evidence, or change after creating a real Diff '
-        'and verifying the latest workspace revision. Use status=blocked with '
+        'and obtaining successful verify evidence for the exact latest '
+        'workspace revision. A change declaration without current verification '
+        'is rejected. Use status=blocked with '
         'specific blocked_reasons when the goal cannot be completed. The '
         'runtime validates the declaration against objective evidence.'
     )

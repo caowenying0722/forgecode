@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import signal
 from time import perf_counter
 
 
@@ -27,6 +29,11 @@ async def run_process(
 ) -> ProcessResult:
     started = perf_counter()
     stdin = asyncio.subprocess.PIPE if input_text is not None else None
+    process_group = (
+        {'creationflags': 0x00000200}
+        if os.name == 'nt'
+        else {'start_new_session': True}
+    )
     if shell:
         if not isinstance(command, str):
             raise TypeError('Shell commands must be strings.')
@@ -36,6 +43,7 @@ async def run_process(
             stdin=stdin,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_group,
         )
     else:
         if isinstance(command, str):
@@ -46,6 +54,7 @@ async def run_process(
             stdin=stdin,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_group,
         )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -56,9 +65,11 @@ async def run_process(
         )
         timed_out = False
     except TimeoutError:
-        process.kill()
-        stdout_bytes, stderr_bytes = await process.communicate()
+        stdout_bytes, stderr_bytes = await terminate_process_tree(process)
         timed_out = True
+    except asyncio.CancelledError:
+        await terminate_process_tree(process)
+        raise
     return ProcessResult(
         exit_code=process.returncode if process.returncode is not None else -1,
         stdout=stdout_bytes.decode('utf-8', errors='replace'),
@@ -66,6 +77,35 @@ async def run_process(
         duration_seconds=perf_counter() - started,
         timed_out=timed_out,
     )
+
+
+async def terminate_process_tree(
+    process: asyncio.subprocess.Process,
+) -> tuple[bytes, bytes]:
+    '''Terminate a foreground command and descendants, then drain its pipes.'''
+    if process.returncode is None:
+        if os.name == 'nt':
+            killer = await asyncio.create_subprocess_exec(
+                'taskkill',
+                '/PID',
+                str(process.pid),
+                '/T',
+                '/F',
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.communicate()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    return await process.communicate()
 
 
 def process_metadata(result: ProcessResult) -> dict[str, object]:

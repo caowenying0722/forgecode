@@ -1,6 +1,8 @@
 '''Command-line entry point for ForgeCode.'''
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Annotated
 
@@ -352,19 +354,66 @@ def run_interactive_chat(
         try:
             with resolved_terminal.stream_response() as response_view:
                 asyncio.run(
-                    render_streamed_turn(
+                    render_streamed_turn_interruptibly(
                         resolved_session,
                         prompt,
                         response_view,
                         resolved_recorder,
+                        wait_for_interrupt=getattr(
+                            resolved_terminal,
+                            'wait_for_interrupt',
+                            None,
+                        ),
                     )
                 )
+        except UserTurnInterrupted:
+            resolved_terminal.show_interrupted()
+            continue
         except (KeyboardInterrupt, typer.Abort):
             resolved_terminal.show_goodbye()
             return
         except Exception as error:
             resolved_terminal.show_error(error)
             continue
+
+
+class UserTurnInterrupted(Exception):
+    '''The user pressed Esc to stop only the active response.'''
+
+
+async def render_streamed_turn_interruptibly(
+    session: Conversation,
+    prompt: str,
+    response_view: StreamingResponseView,
+    recorder: TrajectoryRecorder | None = None,
+    *,
+    wait_for_interrupt: Callable[[], Awaitable[None]] | None,
+) -> None:
+    '''Race one response against the terminal Esc watcher.'''
+    if wait_for_interrupt is None:
+        await render_streamed_turn(session, prompt, response_view, recorder)
+        return
+    response_task = asyncio.create_task(
+        render_streamed_turn(session, prompt, response_view, recorder)
+    )
+    interrupt_task = asyncio.create_task(wait_for_interrupt())
+    try:
+        done, _ = await asyncio.wait(
+            {response_task, interrupt_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if response_task in done:
+            await response_task
+            return
+        response_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await response_task
+        response_view.interrupt()
+        raise UserTurnInterrupted('Esc pressed')
+    finally:
+        interrupt_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await interrupt_task
 
 
 async def render_streamed_turn(

@@ -205,7 +205,7 @@ def test_completion_gate_requires_verification_only_when_policy_requests_it(
     assert any('changed after verification' in item for item in stale.reasons)
 
 
-def test_completion_gate_allows_unverified_diff_by_default(
+def test_completion_gate_requires_current_verification_for_changes_by_default(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -222,7 +222,99 @@ def test_completion_gate_allows_unverified_diff_by_default(
         )
     )
 
-    assert decision.allowed is True
+    assert decision.allowed is False
+    assert 'has not been verified' in decision.reasons[0]
+
+
+def test_completion_gate_requires_final_diff_review_when_review_state_is_known(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    (tmp_path / 'sample.txt').write_text('changed\n', encoding='utf-8')
+    run(tracker.refresh())
+    evidence = VerificationEvidence(
+        command='pytest',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=1,
+    )
+
+    missing_review = run(
+        CompletionGate(
+            tmp_path,
+            TaskPolicy(require_diff_review=True),
+        ).evaluate(
+            tracker,
+            evidence,
+            mutation_attempted=True,
+            reviewed_paths=set(),
+        )
+    )
+    reviewed = run(
+        CompletionGate(
+            tmp_path,
+            TaskPolicy(require_diff_review=True),
+        ).evaluate(
+            tracker,
+            evidence,
+            mutation_attempted=True,
+            reviewed_paths={'sample.txt'},
+        )
+    )
+
+    assert missing_review.allowed is False
+    assert 'final Diff has not been reviewed' in missing_review.reasons[0]
+    assert reviewed.allowed is True
+
+
+def test_source_change_rejects_format_only_verification_when_tests_exist(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    (tmp_path / 'pyproject.toml').write_text(
+        '[tool.pytest.ini_options]\n', encoding='utf-8'
+    )
+    source = tmp_path / 'app.py'
+    source.write_text('value = 1\n', encoding='utf-8')
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    source.write_text('value = 2\n', encoding='utf-8')
+    run(tracker.refresh())
+    weak = VerificationEvidence(
+        command='git diff --check',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=1,
+    )
+    strong = VerificationEvidence(
+        command='python -m pytest -q',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=1,
+    )
+
+    weak_decision = run(
+        CompletionGate(tmp_path).evaluate(
+            tracker, weak, mutation_attempted=True
+        )
+    )
+    strong_decision = run(
+        CompletionGate(tmp_path).evaluate(
+            tracker, strong, mutation_attempted=True
+        )
+    )
+
+    assert weak_decision.allowed is False
+    assert 'verification command does not run' in weak_decision.reasons[0]
+    assert strong_decision.allowed is True
 
 
 def test_completion_gate_blocks_current_optional_verification_failure(

@@ -38,6 +38,7 @@ class CompletionChecker:
         verification: VerificationEvidence | None,
         *,
         mutation_attempted: bool,
+        reviewed_paths: set[str] | None = None,
     ) -> CompletionDecision:
         if self.tracker is None or self.gate is None:
             return CompletionDecision(allowed=True)
@@ -45,6 +46,7 @@ class CompletionChecker:
             self.tracker,
             verification,
             mutation_attempted=mutation_attempted,
+            reviewed_paths=reviewed_paths,
         )
 
     async def finish_rejection_reasons(
@@ -55,6 +57,7 @@ class CompletionChecker:
         mutation_attempted: bool,
         change_required: bool,
         verification: VerificationEvidence | None,
+        reviewed_paths: set[str] | None = None,
     ) -> tuple[str, ...]:
         metadata = result.metadata
         if metadata.get('status') == 'blocked':
@@ -94,7 +97,10 @@ class CompletionChecker:
                 )
             else:
                 decision = await self.gate.evaluate(
-                    self.tracker, verification, mutation_attempted=True
+                    self.tracker,
+                    verification,
+                    mutation_attempted=True,
+                    reviewed_paths=reviewed_paths,
                 )
                 reasons.extend(decision.reasons)
         elif mutation_attempted and not changed_paths:
@@ -110,6 +116,7 @@ class CompletionChecker:
         mutation_attempted: bool,
         verification: VerificationEvidence | None,
         mutation_failures: list[dict[str, object]],
+        reviewed_paths: set[str] | None = None,
     ) -> bool:
         if (
             self.tracker is None
@@ -127,6 +134,7 @@ class CompletionChecker:
             self.tracker,
             verification,
             mutation_attempted=mutation_attempted,
+            reviewed_paths=reviewed_paths,
         )
         return decision.allowed
 
