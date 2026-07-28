@@ -45,6 +45,12 @@ SLASH_COMMANDS = (
         '/resume session-id',
         '恢复指定保存会话',
     ),
+    SlashCommandSpec('/fork', '/fork', '分叉最近保存的会话'),
+    SlashCommandSpec(
+        '/fork ',
+        '/fork session-id',
+        '分叉指定保存会话',
+    ),
     SlashCommandSpec('/sessions', '/sessions', '列出已保存会话'),
     SlashCommandSpec('/mode', '/mode', '查看当前交互模式'),
     SlashCommandSpec(

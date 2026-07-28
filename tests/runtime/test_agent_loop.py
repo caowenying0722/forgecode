@@ -334,6 +334,50 @@ def test_conversation_saves_and_resumes_session(tmp_path: Path) -> None:
     assert resumed.permission.mode == 'readonly'
 
 
+def test_conversation_persists_rollout_during_stream(tmp_path: Path) -> None:
+    conversation = Conversation(
+        client=FakeModelClient(streamed_response('persisted')),
+        tools=[],
+        context_root=tmp_path,
+    )
+    conversation.enable_rollout_persistence()
+
+    collect_turn(conversation, 'hello')
+
+    assert conversation.session_id is not None
+    rollout = conversation.session_manager.store.rollout.read(
+        conversation.session_id
+    )
+    assert any(record['type'] == 'model_call_started' for record in rollout)
+    assert any(record['type'] == 'turn_completed' for record in rollout)
+    assert not any(record['type'] == 'model_text_delta' for record in rollout)
+    resumed = Conversation(
+        client=FakeModelClient(streamed_response('again')),
+        tools=[],
+        context_root=tmp_path,
+    )
+    notice = resumed.resume_session(conversation.session_id)
+    assert conversation.session_id in notice
+    assert resumed.messages == conversation.messages
+
+
+def test_conversation_forks_saved_session(tmp_path: Path) -> None:
+    conversation = Conversation(
+        client=FakeModelClient(streamed_response('original')),
+        tools=[],
+        context_root=tmp_path,
+    )
+    collect_turn(conversation, 'hello')
+    parent_id = conversation.save_session()
+
+    notice = conversation.fork_session(parent_id)
+
+    assert parent_id in notice
+    assert conversation.session_id != parent_id
+    child = conversation.session_manager.load(conversation.session_id)
+    assert child.parent_session_id == parent_id
+
+
 def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(
     tmp_path: Path,
 ) -> None:

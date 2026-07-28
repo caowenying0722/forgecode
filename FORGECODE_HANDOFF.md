@@ -83,12 +83,23 @@ ForgeCode has session save/resume support:
 - saves active task
 - saves interaction mode
 - saves permission mode
+- appends numbered runtime events and message deltas to per-session rollout JSONL
+- flushes each rollout append for crash recovery
+- repairs interrupted tool batches without replaying recorded successful tools
+- warns when Git HEAD, branch, or working-tree state differs on resume
+- forks sessions while preserving the parent transcript
 
 Useful commands:
 
 - `/resume`
 - `/resume <session-id>`
+- `/fork`
+- `/fork <session-id>`
 - `/sessions`
+
+This intentionally follows the Codex model: resume and fork restore Agent
+state, while Git remains responsible for code history and rollback. ForgeCode
+does not silently restore files or run `git reset` during session recovery.
 
 ### Completion And Recovery
 

@@ -1,6 +1,7 @@
 '''Multi-step model and tool execution for the M1 Agent Loop.'''
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from functools import cache
 from itertools import count
 import json
@@ -76,6 +77,9 @@ from forge.runtime.state import (
     ContextCompacted,
     ModelCallCompleted,
     ModelCallStarted,
+    ModelTextDelta,
+    ModelToolCallArgumentsDelta,
+    ModelUsageUpdate,
     TokenUsage,
     ToolExecutionCompleted,
     ToolExecutionStarted,
@@ -148,6 +152,14 @@ class ModelResponseError(RuntimeError):
 
 class AgentLoopLimitError(RuntimeError):
     '''Raised when one user turn exceeds its model-call safety limit.'''
+
+
+@dataclass(frozen=True, slots=True)
+class TurnInterrupted:
+    '''Persist an unexpected process-level turn interruption.'''
+
+    error_type: str
+    message: str
 
 
 @cache
@@ -261,6 +273,8 @@ class Conversation:
             SessionStore(resolved_context_root)
         )
         self.session_id: str | None = None
+        self._rollout_enabled = False
+        self._inflight_messages: list[dict[str, Any]] | None = None
         self.interaction_mode: InteractionMode = 'auto'
         self.working_state = WorkingState()
         self.run_state = AgentRunState()
@@ -409,6 +423,11 @@ class Conversation:
 
     async def stream(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         '''Expose lifecycle transitions around the internal turn engine.'''
+        if self._rollout_enabled and prompt.strip():
+            self._inflight_messages = [
+                *self.messages,
+                {'role': 'user', 'content': prompt},
+            ]
         try:
             async for event in self._stream_turn(prompt):
                 if isinstance(event, TurnCompleted):
@@ -422,17 +441,23 @@ class Conversation:
                         iteration=self.run_state.iteration,
                     )
                     if phase_event is not None:
+                        self._persist_rollout_event(phase_event)
                         yield phase_event
+                self._persist_rollout_event(event)
                 yield event
-        except Exception:
+        except Exception as error:
             phase_event = self._transition(
                 AgentPhase.FAILED,
                 reason='unhandled_turn_error',
                 iteration=self.run_state.iteration,
             )
             if phase_event is not None:
+                self._persist_rollout_event(phase_event)
                 yield phase_event
+            self._persist_rollout_interruption(error)
             raise
+        finally:
+            self._inflight_messages = None
 
     async def _stream_turn(
         self,
@@ -455,7 +480,11 @@ class Conversation:
         self.run_state = AgentRunState()
         self._last_task_context = self.task_manager.system_suffix()
         user_message = {'role': 'user', 'content': prompt}
-        request_messages = [*self.messages, user_message]
+        request_messages = (
+            self._inflight_messages
+            if self._inflight_messages is not None
+            else [*self.messages, user_message]
+        )
         completed_usage = TokenUsage(input_tokens=0, output_tokens=0)
         all_tool_calls: list[ToolCall] = []
         latest_verification: VerificationEvidence | None = None
@@ -1968,6 +1997,10 @@ class Conversation:
     def set_permission_approver(self, approver: Any | None) -> None:
         self.permission.approver = approver
 
+    def enable_rollout_persistence(self) -> None:
+        '''Persist replayable session state after every runtime event.'''
+        self._rollout_enabled = True
+
     async def run_stop_hooks(self, result: TurnResult) -> None:
         await self.hook_registry.run(
             HookContext(
@@ -1991,6 +2024,25 @@ class Conversation:
 
     def resume_session(self, session_id: str | None = None) -> str:
         snapshot = self.session_manager.load(session_id)
+        warnings = self.session_manager.consistency_warnings(snapshot)
+        self._apply_session_snapshot(snapshot)
+        notice = (
+            f'Resumed {snapshot.id}: '
+            f'{len(snapshot.messages)} message(s), updated {snapshot.updated_at}'
+        )
+        if warnings:
+            notice += '\nWorkspace warning: ' + '; '.join(warnings)
+        return notice
+
+    def fork_session(self, session_id: str | None = None) -> str:
+        snapshot = self.session_manager.fork(session_id)
+        self._apply_session_snapshot(snapshot)
+        return (
+            f'Forked {snapshot.parent_session_id} into {snapshot.id}: '
+            f'{len(snapshot.messages)} message(s)'
+        )
+
+    def _apply_session_snapshot(self, snapshot: Any) -> None:
         self.messages[:] = snapshot.messages
         self.session_id = snapshot.id
         self.task_manager.active = snapshot.active_task
@@ -2002,10 +2054,49 @@ class Conversation:
         )
         self._last_task_context = self.task_manager.system_suffix()
         self._last_repository_context = self.context.repository.system_suffix('')
-        return (
-            f'Resumed {snapshot.id}: '
-            f'{len(snapshot.messages)} message(s), updated {snapshot.updated_at}'
+
+    def _persist_rollout_event(self, event: ConversationEvent) -> None:
+        if not self._rollout_enabled or isinstance(
+            event,
+            (
+                ModelTextDelta,
+                ModelToolCallArgumentsDelta,
+                ModelUsageUpdate,
+            ),
+        ):
+            return
+        snapshot = self.session_manager.record_event(
+            event,
+            self._inflight_messages or self.messages,
+            session_id=self.session_id,
+            active_task=self.task_manager.active,
+            interaction_mode=self.interaction_mode,
+            permission_mode=self.permission.mode,
+            update_workspace=isinstance(
+                event,
+                (WorkspaceChanged, TurnCompleted),
+            ),
         )
+        self.session_id = snapshot.id
+
+    def _persist_rollout_interruption(self, error: Exception) -> None:
+        if not self._rollout_enabled:
+            return
+        try:
+            self.session_manager.store.record_event(
+                TurnInterrupted(
+                    error_type=type(error).__name__,
+                    message=str(error),
+                ),
+                self._inflight_messages or self.messages,
+                session_id=self.session_id,
+                active_task=self.task_manager.active,
+                interaction_mode=self.interaction_mode,
+                permission_mode=self.permission.mode,
+                update_workspace=True,
+            )
+        except OSError:
+            pass
 
     def session_history(self) -> str:
         return self.session_manager.history()

@@ -27,12 +27,42 @@ class SessionManager:
             permission_mode=permission_mode,
         )
 
+    def record_event(
+        self,
+        event: object,
+        messages: list[dict[str, object]],
+        *,
+        session_id: str | None,
+        active_task: ActiveTask | None,
+        interaction_mode: str,
+        permission_mode: str,
+        update_workspace: bool = False,
+    ) -> SessionSnapshot:
+        return self.store.record_event(
+            event,
+            messages,
+            session_id=session_id,
+            active_task=active_task,
+            interaction_mode=interaction_mode,
+            permission_mode=permission_mode,
+            update_workspace=update_workspace,
+        )
+
     def load(self, session_id: str | None) -> SessionSnapshot:
         return (
             self.store.load(session_id)
             if session_id is not None
             else self.store.load_current()
         )
+
+    def fork(self, session_id: str | None = None) -> SessionSnapshot:
+        return self.store.fork(session_id)
+
+    def consistency_warnings(
+        self,
+        snapshot: SessionSnapshot,
+    ) -> tuple[str, ...]:
+        return self.store.consistency_warnings(snapshot)
 
     def history(self) -> str:
         sessions = self.store.list()
@@ -42,8 +72,13 @@ class SessionManager:
         for snapshot in sessions[:20]:
             task = snapshot.active_task.goal if snapshot.active_task else ''
             suffix = f' — {task[:80]}' if task else ''
+            parent = (
+                f' forked from {snapshot.parent_session_id}'
+                if snapshot.parent_session_id
+                else ''
+            )
             lines.append(
                 f'- {snapshot.id} [{len(snapshot.messages)} messages] '
-                f'{snapshot.updated_at}{suffix}'
+                f'{snapshot.updated_at}{parent}{suffix}'
             )
         return '\n'.join(lines)

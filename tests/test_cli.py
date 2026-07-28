@@ -76,6 +76,10 @@ class FakeConversation:
             stored_estimated_characters=537_342,
             stored_tool_result_characters=457_675,
         )
+        self.rollout_enabled = False
+
+    def enable_rollout_persistence(self) -> None:
+        self.rollout_enabled = True
 
     async def stream(
         self,
@@ -117,6 +121,9 @@ class FakeConversation:
 
     def resume_session(self, session_id: str | None = None) -> str:
         return f'Resumed session {session_id or "latest"}'
+
+    def fork_session(self, session_id: str | None = None) -> str:
+        return f'Forked session {session_id or "latest"}'
 
     def session_history(self) -> str:
         return '- session-123456789abc [2 messages]'
@@ -405,13 +412,19 @@ def test_session_commands_do_not_call_model(
 
     result = runner.invoke(
         app,
-        input='/sessions\n/resume\n/resume session-123456789abc\n',
+        input=(
+            '/sessions\n/resume\n/resume session-123456789abc\n'
+            '/fork\n/fork session-123456789abc\n'
+        ),
     )
 
     assert result.exit_code == 0
     assert 'session-123456789abc' in result.output
     assert 'Resumed session latest' in result.output
     assert 'Resumed session session-123456789abc' in result.output
+    assert 'Forked session latest' in result.output
+    assert 'Forked session session-123456789abc' in result.output
+    assert conversation.rollout_enabled is True
     assert conversation.prompts == []
 
 

@@ -94,6 +94,13 @@ def run_interactive_chat(
         if recorder is not None
         else create_trajectory_recorder(Path.cwd())
     )
+    enable_rollout = getattr(
+        resolved_session,
+        'enable_rollout_persistence',
+        None,
+    )
+    if enable_rollout is not None:
+        enable_rollout()
     client = getattr(resolved_session, 'client', None)
     model = getattr(client, 'model', 'configured model')
     resolved_terminal.show_welcome(model)
@@ -153,6 +160,32 @@ def run_interactive_chat(
                     resolved_terminal.show_notice(
                         'Session',
                         resolved_session.resume_session(session_id),
+                    )
+                except (OSError, ValueError) as error:
+                    resolved_terminal.show_error(error)
+            continue
+
+        if prompt.strip() == '/fork':
+            try:
+                resolved_terminal.show_notice(
+                    'Session',
+                    resolved_session.fork_session(),
+                )
+            except (OSError, ValueError) as error:
+                resolved_terminal.show_error(error)
+            continue
+
+        if prompt.strip().startswith('/fork '):
+            session_id = prompt.strip()[len('/fork '):].strip()
+            if not session_id:
+                resolved_terminal.show_error(
+                    ValueError('Usage: /fork session-id')
+                )
+            else:
+                try:
+                    resolved_terminal.show_notice(
+                        'Session',
+                        resolved_session.fork_session(session_id),
                     )
                 except (OSError, ValueError) as error:
                     resolved_terminal.show_error(error)
