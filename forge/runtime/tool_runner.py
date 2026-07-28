@@ -185,3 +185,11 @@ def is_tool_protocol_failure(result: ToolResult) -> bool:
             'todo_required',
         }
     )
+
+
+def is_satisfied_non_diff_workspace_write(
+    tool_call: ToolCall,
+    result: ToolResult,
+) -> bool:
+    '''Treat successful idempotent directory setup as a satisfied write.'''
+    return tool_call.name == 'create_directory' and result.success

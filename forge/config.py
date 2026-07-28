@@ -6,14 +6,35 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import tomllib
 from urllib.parse import urlsplit
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 
 DEFAULT_ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
 DEFAULT_MODEL_MAX_TOKENS = 8_192
 DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS = 120.0
+USER_CONFIG_TEMPLATE = '''# ForgeCode user defaults
+[model]
+model_id = ""
+base_url = "https://api.anthropic.com"
+max_tokens = 8192
+# context_window = 2000000
+request_timeout_seconds = 120
+'''
+USER_ENV_TEMPLATE = '''# Keep credentials out of config.toml.
+ANTHROPIC_API_KEY=
+'''
+
+CONFIG_KEYS = {
+    'api_key': 'ANTHROPIC_API_KEY',
+    'model_id': 'MODEL_ID',
+    'base_url': 'ANTHROPIC_BASE_URL',
+    'max_tokens': 'MODEL_MAX_TOKENS',
+    'context_window': 'MODEL_CONTEXT_WINDOW',
+    'request_timeout_seconds': 'MODEL_REQUEST_TIMEOUT_SECONDS',
+}
 
 
 class ConfigurationError(ValueError):
@@ -73,25 +94,42 @@ class ForgeConfig:
     def from_env(
         cls,
         environ: Mapping[str, str] | None = None,
+        *,
+        cwd: Path | None = None,
+        home: Path | None = None,
     ) -> ForgeConfig:
-        '''Load Anthropic-compatible settings from environment variables.'''
+        '''Load env > project > user settings with safe default values.'''
         if environ is None:
-            load_dotenv(dotenv_path=Path.cwd() / '.env', override=False)
+            resolved_cwd = (cwd or Path.cwd()).resolve()
+            resolved_home = forge_home(home=home)
             source: Mapping[str, str] = os.environ
+            values = {
+                **read_config_file(resolved_home / 'config.toml'),
+                **read_dotenv_file(resolved_home / '.env'),
+                **read_config_file(resolved_cwd / '.forge' / 'config.toml'),
+                **read_dotenv_file(resolved_cwd / '.env'),
+                **{
+                    key: value
+                    for key, value in source.items()
+                    if key in CONFIG_KEYS.values()
+                },
+            }
         else:
-            source = environ
+            values = dict(environ)
 
-        raw_max_tokens = source.get(
+        raw_max_tokens = str(values.get(
             'MODEL_MAX_TOKENS',
             str(DEFAULT_MODEL_MAX_TOKENS),
-        )
+        ))
         try:
             max_tokens = int(raw_max_tokens)
         except ValueError as error:
             raise ConfigurationError(
                 'MODEL_MAX_TOKENS must be an integer.'
             ) from error
-        raw_context_window = source.get('MODEL_CONTEXT_WINDOW', '').strip()
+        raw_context_window = str(
+            values.get('MODEL_CONTEXT_WINDOW', '')
+        ).strip()
         try:
             context_window = (
                 int(raw_context_window) if raw_context_window else None
@@ -100,10 +138,10 @@ class ForgeConfig:
             raise ConfigurationError(
                 'MODEL_CONTEXT_WINDOW must be an integer.'
             ) from error
-        raw_request_timeout = source.get(
+        raw_request_timeout = str(values.get(
             'MODEL_REQUEST_TIMEOUT_SECONDS',
             str(DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS),
-        )
+        ))
         try:
             request_timeout_seconds = float(raw_request_timeout)
         except ValueError as error:
@@ -112,13 +150,105 @@ class ForgeConfig:
             ) from error
 
         return cls(
-            api_key=source.get('ANTHROPIC_API_KEY', ''),
-            model_id=source.get('MODEL_ID', ''),
-            base_url=source.get(
+            api_key=str(values.get('ANTHROPIC_API_KEY', '')),
+            model_id=str(values.get('MODEL_ID', '')),
+            base_url=str(values.get(
                 'ANTHROPIC_BASE_URL',
                 DEFAULT_ANTHROPIC_BASE_URL,
-            ),
+            )),
             max_tokens=max_tokens,
             context_window=context_window,
             request_timeout_seconds=request_timeout_seconds,
         )
+
+
+def forge_home(*, home: Path | None = None) -> Path:
+    if home is not None:
+        return home.expanduser().resolve()
+    configured = os.environ.get('FORGE_HOME', '').strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path.home() / '.forge'
+
+
+def read_config_file(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {}
+    try:
+        parsed = tomllib.loads(path.read_text(encoding='utf-8'))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ConfigurationError(f'Invalid ForgeCode config: {path}: {error}') from error
+    model = parsed.get('model', parsed)
+    if not isinstance(model, dict):
+        raise ConfigurationError(f'ForgeCode config [model] must be a table: {path}')
+    values: dict[str, object] = {}
+    for key, environment_key in CONFIG_KEYS.items():
+        if key in model and model[key] is not None:
+            values[environment_key] = model[key]
+    return values
+
+
+def read_dotenv_file(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {}
+    return {
+        key: value
+        for key, value in dotenv_values(path).items()
+        if key in CONFIG_KEYS.values() and value is not None
+    }
+
+
+def initialize_user_config(*, home: Path | None = None) -> tuple[Path, Path]:
+    directory = forge_home(home=home)
+    directory.mkdir(parents=True, exist_ok=True)
+    config_path = directory / 'config.toml'
+    env_path = directory / '.env'
+    if not config_path.exists():
+        config_path.write_text(USER_CONFIG_TEMPLATE, encoding='utf-8')
+    if not env_path.exists():
+        env_path.write_text(USER_ENV_TEMPLATE, encoding='utf-8')
+    return config_path, env_path
+
+
+def write_user_config(
+    config: ForgeConfig,
+    *,
+    home: Path | None = None,
+) -> tuple[Path, Path]:
+    '''Persist validated user defaults without printing credential contents.'''
+    directory = forge_home(home=home)
+    directory.mkdir(parents=True, exist_ok=True)
+    config_path = directory / 'config.toml'
+    env_path = directory / '.env'
+    context_line = (
+        f'context_window = {config.context_window}\n'
+        if config.context_window is not None
+        else ''
+    )
+    config_path.write_text(
+        '# ForgeCode user defaults\n'
+        '[model]\n'
+        f'model_id = {toml_string(config.model_id)}\n'
+        f'base_url = {toml_string(config.base_url)}\n'
+        f'max_tokens = {config.max_tokens}\n'
+        f'{context_line}'
+        f'request_timeout_seconds = {config.request_timeout_seconds:g}\n',
+        encoding='utf-8',
+    )
+    env_path.write_text(
+        f'ANTHROPIC_API_KEY={dotenv_string(config.api_key)}\n',
+        encoding='utf-8',
+    )
+    if os.name != 'nt':
+        env_path.chmod(0o600)
+    return config_path, env_path
+
+
+def toml_string(value: str) -> str:
+    escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def dotenv_string(value: str) -> str:
+    escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{escaped}"'

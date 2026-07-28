@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
 import random
 from typing import Any, Protocol, runtime_checkable
 
@@ -112,12 +113,17 @@ class AnthropicModelClient:
     def from_config(
         cls,
         config: ForgeConfig | None = None,
+        config_cwd: Path | None = None,
         max_tokens: int | None = None,
         max_retries: int = 3,
         client: AsyncAnthropic | None = None,
     ) -> AnthropicModelClient:
         '''Create a model client from .env or an explicit ForgeConfig.'''
-        resolved_config = config if config is not None else ForgeConfig.from_env()
+        resolved_config = (
+            config
+            if config is not None
+            else ForgeConfig.from_env(cwd=config_cwd)
+        )
         return cls(
             model=resolved_config.model_id,
             max_tokens=(

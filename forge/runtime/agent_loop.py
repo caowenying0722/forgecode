@@ -62,6 +62,7 @@ from forge.runtime.tool_runner import (
     ToolBatchState,
     ToolRunner,
     ToolRunPolicy,
+    is_satisfied_non_diff_workspace_write,
     is_tool_protocol_failure,
 )
 from forge.runtime.model_client import (
@@ -231,8 +232,19 @@ class Conversation:
             raise ValueError('action_recovery_limit must be positive')
         if max_turn_input_tokens is not None and max_turn_input_tokens < 1:
             raise ValueError('max_turn_input_tokens must be positive')
+        config_root = (
+            context_root
+            or getattr(
+                getattr(registry, 'workspace_tracker', None),
+                'root',
+                None,
+            )
+            or Path.cwd()
+        )
         self.client = (
-            client if client is not None else AnthropicModelClient.from_config()
+            client
+            if client is not None
+            else AnthropicModelClient.from_config(config_cwd=config_root)
         )
         self.system_prompt = (
             system_prompt
@@ -1382,6 +1394,11 @@ class Conversation:
                             revision=change.revision,
                             paths=change.paths,
                         )
+                    elif is_satisfied_non_diff_workspace_write(
+                        tool_call,
+                        result,
+                    ):
+                        tool_changed_workspace = True
                 elif tool_effect == 'workspace_write' and result.success:
                     tool_changed_workspace = True
                     batch.last_workspace_change_position = tool_position

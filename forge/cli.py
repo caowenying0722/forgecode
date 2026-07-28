@@ -3,13 +3,21 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+import os
 from pathlib import Path
+import shutil
 from typing import Annotated
 
 import typer
 
 from forge import __version__
-from forge.config import ConfigurationError, ForgeConfig
+from forge.config import (
+    ConfigurationError,
+    ForgeConfig,
+    forge_home,
+    initialize_user_config,
+    write_user_config,
+)
 from forge.runtime.agent_loop import Conversation
 from forge.runtime.state import (
     AgentPhaseChanged,
@@ -24,6 +32,7 @@ from forge.runtime.state import (
 from forge.sessions.trajectory import TrajectoryRecorder
 from forge.terminal import StreamingResponseView, TerminalUI
 from forge.tools import create_default_registry
+from forge.workspace_root import WorkspaceLocation, resolve_workspace
 
 
 app = typer.Typer(
@@ -55,11 +64,49 @@ def main(
             help='Show the ForgeCode version and exit.',
         ),
     ] = False,
+    cwd: Annotated[
+        Path | None,
+        typer.Option(
+            '--cwd', '--cd', '-C',
+            help='Start in this directory before resolving the workspace.',
+        ),
+    ] = None,
+    root: Annotated[
+        Path | None,
+        typer.Option(
+            '--root',
+            help='Use this directory as the workspace boundary.',
+        ),
+    ] = None,
+    no_git_root: Annotated[
+        bool,
+        typer.Option(
+            '--no-git-root',
+            help='Use cwd directly instead of discovering a parent Git root.',
+        ),
+    ] = False,
 ) -> None:
     '''Start the ForgeCode command-line interface.'''
+    del version
+    try:
+        location = resolve_workspace(
+            cwd=cwd,
+            root=root,
+            discover_git=not no_git_root,
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    ctx.ensure_object(dict)
+    ctx.obj['workspace'] = location
+    previous_cwd = Path.cwd()
+    os.chdir(location.cwd)
+    ctx.call_on_close(lambda: os.chdir(previous_cwd))
     if ctx.invoked_subcommand is None:
         try:
-            run_interactive_chat()
+            run_interactive_chat(
+                workspace_root=location.root,
+                startup_cwd=location.cwd,
+            )
         except ConfigurationError as error:
             print_configuration_error(error)
             raise typer.Exit(code=1) from error
@@ -70,7 +117,7 @@ def print_configuration_error(error: ConfigurationError) -> None:
     typer.echo('Model configuration is incomplete.', err=True)
     typer.echo(str(error), err=True)
     typer.echo(
-        'Set ANTHROPIC_API_KEY and MODEL_ID before starting ForgeCode.',
+        'Run `forge config --init`, then set your model and API key.',
         err=True,
     )
     typer.echo(
@@ -83,18 +130,25 @@ def run_interactive_chat(
     session: Conversation | None = None,
     terminal: TerminalUI | None = None,
     recorder: TrajectoryRecorder | None = None,
+    workspace_root: Path | None = None,
+    startup_cwd: Path | None = None,
 ) -> None:
     '''Run a local chat session until the user interrupts it.'''
+    root = (workspace_root or Path.cwd()).resolve()
+    cwd = (startup_cwd or Path.cwd()).resolve()
     resolved_session = (
         session
         if session is not None
-        else Conversation(registry=create_default_registry(Path.cwd()))
+        else Conversation(
+            registry=create_default_registry(root),
+            context_root=root,
+        )
     )
     resolved_terminal = terminal if terminal is not None else TerminalUI()
     resolved_recorder = (
         recorder
         if recorder is not None
-        else create_trajectory_recorder(Path.cwd())
+        else create_trajectory_recorder(root)
     )
     enable_rollout = getattr(
         resolved_session,
@@ -105,7 +159,7 @@ def run_interactive_chat(
         enable_rollout()
     client = getattr(resolved_session, 'client', None)
     model = getattr(client, 'model', 'configured model')
-    resolved_terminal.show_welcome(model)
+    resolved_terminal.show_welcome(model, workspace_root=root, cwd=cwd)
 
     while True:
         try:
@@ -477,10 +531,42 @@ def create_trajectory_recorder(root: Path) -> TrajectoryRecorder:
 
 
 @app.command('config')
-def show_config() -> None:
+def show_config(
+    ctx: typer.Context,
+    init: Annotated[
+        bool,
+        typer.Option('--init', help='Create user config and credential templates.'),
+    ] = False,
+    migrate_project: Annotated[
+        bool,
+        typer.Option(
+            '--migrate-project',
+            help='Copy validated current-project model settings to user config.',
+        ),
+    ] = False,
+) -> None:
     '''Check the Anthropic-compatible model configuration.'''
+    home = forge_home()
+    location: WorkspaceLocation = ctx.obj['workspace']
+    if migrate_project:
+        try:
+            existing = ForgeConfig.from_env(cwd=location.root, home=home)
+        except ConfigurationError as error:
+            print_configuration_error(error)
+            raise typer.Exit(code=1) from error
+        config_path, env_path = write_user_config(existing, home=home)
+        typer.echo(f'Migrated user config: {config_path}')
+        typer.echo(f'Migrated credentials: {env_path}')
+        typer.echo('API key value was not printed.')
+        return
+    if init:
+        config_path, env_path = initialize_user_config(home=home)
+        typer.echo(f'User config: {config_path}')
+        typer.echo(f'Credentials: {env_path}')
+        typer.echo('Edit both files, then run `forge config` to validate them.')
+        return
     try:
-        config = ForgeConfig.from_env()
+        config = ForgeConfig.from_env(cwd=location.root, home=home)
     except ConfigurationError as error:
         print_configuration_error(error)
         raise typer.Exit(code=1) from error
@@ -501,6 +587,28 @@ def show_config() -> None:
         )
     )
     typer.echo('API key: configured')
+    typer.echo(f'User config: {home / "config.toml"}')
+    typer.echo(f'Project config: {location.root / ".forge" / "config.toml"}')
+
+
+@app.command('doctor')
+def doctor(ctx: typer.Context) -> None:
+    '''Diagnose global command, workspace, Git, and model configuration.'''
+    location: WorkspaceLocation = ctx.obj['workspace']
+    typer.echo('ForgeCode doctor')
+    typer.echo(f'Executable: {shutil.which("forge") or "not on PATH"}')
+    typer.echo(f'Workspace: {location.root} ({location.source})')
+    typer.echo(f'Cwd: {location.cwd}')
+    typer.echo(f'User config: {forge_home() / "config.toml"}')
+    typer.echo(
+        f'Project config: {location.root / ".forge" / "config.toml"}'
+    )
+    try:
+        config = ForgeConfig.from_env(cwd=location.root)
+    except ConfigurationError as error:
+        typer.echo(f'Model config: invalid ({error})')
+        raise typer.Exit(code=1) from error
+    typer.echo(f'Model config: ready ({config.model_id})')
 
 
 if __name__ == '__main__':

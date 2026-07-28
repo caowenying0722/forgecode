@@ -717,6 +717,121 @@ def test_parent_not_found_recovery_exposes_create_directory_then_write(
     assert 'game/index.html' in completed.result.changed_paths
 
 
+def test_empty_directory_scaffold_does_not_trigger_edit_recovery(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    directories = tuple(
+        ToolCall(
+            index,
+            f'create-directory-{index}',
+            'create_directory',
+            {'path': path},
+        )
+        for index, path in enumerate(
+            (
+                'src',
+                'src/game',
+                'src/game/scenes',
+                'src/game/entities',
+                'src/game/systems',
+                'src/game/configs',
+                'src/game/tests',
+                'public',
+            )
+        )
+    )
+    write = ToolCall(
+        0,
+        'write-after-scaffold',
+        'write_file',
+        {'path': 'src/game/README.txt', 'content': 'game scaffold\n'},
+    )
+    verify = ToolCall(
+        0,
+        'verify-scaffold',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    client = FakeModelClient(
+        response_with_tools(*directories),
+        response_with_tool(write),
+        response_with_tool(verify),
+        finish_response(
+            'finish-scaffold',
+            task_kind='change',
+            summary='Created and verified the scaffold.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(conversation, 'Create the requested scaffold')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert (tmp_path / 'src' / 'game' / 'README.txt').is_file()
+    failures = [
+        event.result.error.code
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.result.error is not None
+    ]
+    assert 'no_workspace_change' not in failures
+
+
+def test_existing_directory_scaffold_is_safe_to_resume(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    for index in range(8):
+        (tmp_path / f'existing-{index}').mkdir()
+    calls = tuple(
+        ToolCall(
+            index,
+            f'existing-directory-{index}',
+            'create_directory',
+            {'path': f'existing-{index}'},
+        )
+        for index in range(8)
+    )
+    write = ToolCall(
+        0,
+        'write-after-existing-directories',
+        'write_file',
+        {'path': 'existing-0/app.txt', 'content': 'resumed\n'},
+    )
+    verify = ToolCall(
+        0,
+        'verify-existing-directories',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    conversation = Conversation(
+        client=FakeModelClient(
+            response_with_tools(*calls),
+            response_with_tool(write),
+            response_with_tool(verify),
+            finish_response(
+                'finish-existing-directories',
+                task_kind='change',
+                summary='Resumed and verified the scaffold.',
+            ),
+        ),
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(conversation, 'Create a real project change')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert (tmp_path / 'existing-0' / 'app.txt').is_file()
+
+
 def test_required_change_stagnation_enters_action_recovery_and_can_finish(
     tmp_path: Path,
 ) -> None:

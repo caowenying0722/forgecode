@@ -10,6 +10,8 @@ from forge.config import (
     DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS,
     ConfigurationError,
     ForgeConfig,
+    initialize_user_config,
+    write_user_config,
 )
 
 
@@ -86,6 +88,67 @@ def test_environment_variables_override_dotenv(
     assert config.api_key == 'environment-key'
     assert config.model_id == 'environment-model'
     assert config.base_url == 'https://environment.example.com'
+
+
+def test_user_project_and_environment_config_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / 'home'
+    project = tmp_path / 'project'
+    (project / '.forge').mkdir(parents=True)
+    home.mkdir()
+    (home / 'config.toml').write_text(
+        '[model]\nmodel_id = "user-model"\nmax_tokens = 4096\n',
+        encoding='utf-8',
+    )
+    (home / '.env').write_text(
+        'ANTHROPIC_API_KEY=user-key\n', encoding='utf-8'
+    )
+    (project / '.forge' / 'config.toml').write_text(
+        '[model]\nmodel_id = "project-model"\nmax_tokens = 16384\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('MODEL_ID', 'environment-model')
+    monkeypatch.delenv('ANTHROPIC_API_KEY', raising=False)
+
+    config = ForgeConfig.from_env(cwd=project, home=home)
+
+    assert config.api_key == 'user-key'
+    assert config.model_id == 'environment-model'
+    assert config.max_tokens == 16_384
+
+
+def test_initialize_user_config_does_not_overwrite_existing_files(
+    tmp_path: Path,
+) -> None:
+    config_path, env_path = initialize_user_config(home=tmp_path)
+    config_path.write_text('custom = true\n', encoding='utf-8')
+    env_path.write_text('CUSTOM=value\n', encoding='utf-8')
+
+    initialize_user_config(home=tmp_path)
+
+    assert config_path.read_text(encoding='utf-8') == 'custom = true\n'
+    assert env_path.read_text(encoding='utf-8') == 'CUSTOM=value\n'
+
+
+def test_write_user_config_round_trips_without_exposing_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = ForgeConfig(
+        api_key='secret-key',
+        model_id='test-model',
+        max_tokens=16_384,
+        context_window=2_000_000,
+    )
+    write_user_config(original, home=tmp_path)
+    monkeypatch.delenv('ANTHROPIC_API_KEY', raising=False)
+    monkeypatch.delenv('MODEL_ID', raising=False)
+
+    loaded = ForgeConfig.from_env(cwd=tmp_path / 'project', home=tmp_path)
+
+    assert loaded == original
 
 
 def test_config_rejects_missing_api_key() -> None:

@@ -353,6 +353,80 @@ def test_cli_starts_an_interactive_conversation(
     assert conversation.prompts == ['first', 'second']
 
 
+def test_cli_can_start_from_nested_directory_and_use_git_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / '.git').mkdir()
+    nested = tmp_path / 'apps' / 'web'
+    nested.mkdir(parents=True)
+    conversation = FakeConversation()
+    captured: dict[str, object] = {}
+
+    def conversation_factory(**kwargs):
+        captured['root'] = kwargs['registry'].workspace_tracker.root
+        captured['context_root'] = kwargs['context_root']
+        return conversation
+
+    monkeypatch.setattr(cli_module, 'Conversation', conversation_factory)
+
+    result = runner.invoke(app, ['-C', str(nested)], input='/exit\n')
+
+    assert result.exit_code == 0
+    assert captured['root'] == tmp_path.resolve()
+    assert captured['context_root'] == tmp_path.resolve()
+    assert 'workspace' in result.output
+    assert 'cwd' in result.output
+
+
+def test_config_init_creates_user_templates(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / 'forge-home'
+
+    result = runner.invoke(
+        app,
+        ['--no-git-root', 'config', '--init'],
+        env={'FORGE_HOME': str(home)},
+    )
+
+    assert result.exit_code == 0
+    assert (home / 'config.toml').is_file()
+    assert (home / '.env').is_file()
+    assert 'Edit both files' in result.output
+
+
+def test_config_migration_copies_project_settings_without_printing_key(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / 'project'
+    home = tmp_path / 'forge-home'
+    project.mkdir()
+    (project / '.env').write_text(
+        'ANTHROPIC_API_KEY=secret-migration-key\n'
+        'MODEL_ID=migrated-model\n'
+        'MODEL_CONTEXT_WINDOW=2000000\n',
+        encoding='utf-8',
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            '--no-git-root',
+            '-C',
+            str(project),
+            'config',
+            '--migrate-project',
+        ],
+        env={'FORGE_HOME': str(home)},
+    )
+
+    assert result.exit_code == 0
+    assert 'migrated-model' in (home / 'config.toml').read_text(encoding='utf-8')
+    assert 'secret-migration-key' in (home / '.env').read_text(encoding='utf-8')
+    assert 'secret-migration-key' not in result.output
+
+
 def test_context_command_does_not_call_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -669,8 +743,9 @@ def test_config_command_explains_missing_api_key(
     monkeypatch.delenv('ANTHROPIC_API_KEY', raising=False)
     monkeypatch.delenv('MODEL_ID', raising=False)
     monkeypatch.delenv('ANTHROPIC_BASE_URL', raising=False)
+    monkeypatch.setenv('FORGE_HOME', str(tmp_path / 'home'))
 
-    result = runner.invoke(app, ['config'])
+    result = runner.invoke(app, ['--no-git-root', 'config'])
 
     assert result.exit_code == 1
     assert 'Model configuration is incomplete.' in result.output
@@ -685,8 +760,9 @@ def test_config_command_explains_missing_model_id(
     monkeypatch.setenv('ANTHROPIC_API_KEY', 'test-key')
     monkeypatch.delenv('MODEL_ID', raising=False)
     monkeypatch.delenv('ANTHROPIC_BASE_URL', raising=False)
+    monkeypatch.setenv('FORGE_HOME', str(tmp_path / 'home'))
 
-    result = runner.invoke(app, ['config'])
+    result = runner.invoke(app, ['--no-git-root', 'config'])
 
     assert result.exit_code == 1
     assert 'MODEL_ID is not set.' in result.output

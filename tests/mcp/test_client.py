@@ -121,6 +121,49 @@ def test_default_registry_exposes_mcp_tools(tmp_path: Path) -> None:
     assert result.metadata['mcp_tool'] == 'echo'
 
 
+def test_project_mcp_config_overrides_user_server_with_same_name(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / 'home'
+    project = tmp_path / 'project'
+    (project / '.forge').mkdir(parents=True)
+    home.mkdir()
+    server = tmp_path / 'server.py'
+    server.write_text(SERVER_SCRIPT, encoding='utf-8')
+    (home / 'mcp.json').write_text(
+        json.dumps(
+            {
+                'servers': {
+                    'demo': {
+                        'command': sys.executable,
+                        'args': [str(server)],
+                    }
+                }
+            }
+        ),
+        encoding='utf-8',
+    )
+    (project / '.forge' / 'mcp.json').write_text(
+        json.dumps(
+            {
+                'servers': {
+                    'demo': {
+                        'command': sys.executable,
+                        'args': [str(server)],
+                    }
+                }
+            }
+        ),
+        encoding='utf-8',
+    )
+
+    manager = MCPClientManager.from_config_file(project, home=home)
+
+    assert len(manager.clients) == 1
+    assert manager.clients[0].config.cwd == project.resolve()
+    manager.close()
+
+
 def write_config(tmp_path: Path, server: Path) -> Path:
     config_dir = tmp_path / '.forge'
     config_dir.mkdir()

@@ -14,6 +14,8 @@ import subprocess
 import threading
 from typing import Any
 
+from forge.config import forge_home
+
 
 JSONRPC_VERSION = '2.0'
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -250,13 +252,26 @@ class MCPClientManager:
         self.clients = tuple(clients)
 
     @classmethod
-    def from_config_file(cls, root: Path) -> MCPClientManager:
-        path = root / '.forge' / 'mcp.json'
-        if not path.is_file():
-            return cls(())
-        data = json.loads(path.read_text(encoding='utf-8'))
-        configs = parse_mcp_config(data, root)
-        clients = [StdioMCPClient(config) for config in configs]
+    def from_config_file(
+        cls,
+        root: Path,
+        *,
+        home: Path | None = None,
+    ) -> MCPClientManager:
+        resolved_home = forge_home(home=home)
+        configs_by_name: dict[str, MCPServerConfig] = {}
+        for path, cwd in (
+            (resolved_home / 'mcp.json', resolved_home),
+            (root / '.forge' / 'mcp.json', root),
+        ):
+            if not path.is_file():
+                continue
+            data = json.loads(path.read_text(encoding='utf-8'))
+            for config in parse_mcp_config(data, cwd):
+                configs_by_name[config.name] = config
+        clients = [
+            StdioMCPClient(config) for config in configs_by_name.values()
+        ]
         return cls(clients)
 
     def list_tools(self) -> tuple[MCPRemoteTool, ...]:

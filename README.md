@@ -48,7 +48,7 @@ ForgeCode 的核心职责是为模型提供一套可靠、可恢复、可评测�
 - 持续交互的多步 Agent Loop，支持流式文本、多工具调用、结构化错误恢复和 JSONL 轨迹；
 - 仓库范围内的读取、搜索、原子写入、分块写入、精确替换、Patch、命令、验证和 Git 工具；
 - 基于任务起始快照的工作区版本追踪，内置写入工具可以追踪 Git ignored 目标文件；
-- 默认交互模式允许有效 Diff 自然完成；评测或 CI 可以通过 `TaskPolicy(require_verification=True)` 强制当前 revision 的成功验证；
+- 所有修改任务默认要求当前 revision 的成功验证；源码项目会拒绝只做空白或语法检查的弱验证；
 - Edit Recovery 默认累计 5 次失败写入，每次失败后最多允许一次针对性读取，随后只开放写入工具；
 - 相同 revision 中已覆盖的文件范围不会重新访问磁盘，也不会再次向模型注入完整源码，只返回短引用；
 - 单次用户回合默认累计输入上限为 2,000,000 Token，达到上限后安全停止；
@@ -58,6 +58,40 @@ ForgeCode 的核心职责是为模型提供一套可靠、可恢复、可评测�
 ## 技术基线
 
 当前基线采用 Python 3.12、uv、Typer、Rich、Pydantic 和 pytest，并默认直接在用户本机运行，不要求安装 Docker。Rich 用于交互终端，Pydantic 用于工具输入 Schema 和运行时校验，SQLite 使用 Python 标准库并在 M4 接入。模型层定义统一的 `ModelClient` 接口，首版只接入一个模型 Provider，后续再扩展多模型或模型路由。
+
+### 普通用户安装与任意目录启动
+
+ForgeCode 提供 `forge` 控制台命令。尚未发布到包索引时，可以从源码目录做一次全局工具安装；`--editable` 适合当前开发阶段，后续拉取代码即可生效：
+
+```powershell
+uv tool install --editable D:\Downloads\forgecode
+forge config --init
+forge doctor
+```
+
+编辑 `~/.forge/config.toml` 设置模型，编辑 `~/.forge/.env` 设置 `ANTHROPIC_API_KEY`。之后可以像 Claude Code 或 Codex CLI 一样在任意项目中启动：
+
+如果当前项目已经有可用的 `.env`，可以显式迁移到用户配置；命令不会打印 API Key：
+
+```powershell
+forge config --migrate-project
+```
+
+```powershell
+cd D:\Projects\my-app
+forge
+
+# 从别处直接指定启动目录；会自动识别父级 Git 根目录
+forge -C D:\Projects\my-app\src
+
+# 显式固定工作区边界，或禁用 Git 根发现
+forge --root D:\Projects\my-app
+forge -C D:\Projects\my-app\src --no-git-root
+```
+
+默认工作区是启动目录所属的最近 Git 仓库；非 Git 目录直接使用启动目录。`--root` 的优先级最高，`--cwd/-C` 必须位于显式 root 内。欢迎页和 `forge doctor` 会同时显示 workspace 与实际 cwd。
+
+配置优先级从高到低为：操作系统环境变量、项目 `.env`、项目 `.forge/config.toml`、用户 `~/.forge/.env`、用户 `~/.forge/config.toml`、内置默认值。`FORGE_HOME` 可以覆盖默认的 `~/.forge`。MCP 同样支持用户 `~/.forge/mcp.json` 和项目 `.forge/mcp.json`，同名 server 由项目配置覆盖。
 
 ### 本地开发
 
@@ -89,7 +123,7 @@ M0 的三个 Fixture 仅用于项目维护者评测。普通用户无需同时�
 
 首个 Model Provider 确定为 Anthropic，但 SDK 只允许出现在 `forge/runtime/model_client.py` 中，用于创建客户端、发送模型请求和接收流。参考 Anthropic Tool Use 的原始消息格式，ForgeCode 直接使用普通的 `list[dict]` 保存消息和工具 Schema，不再额外包装 `ModelRequest`、`ModelMessage` 等类型。Agent Loop、工具执行、上下文和终端仍由 ForgeCode 自己实现，核心代码不依赖 `anthropic.types`。
 
-模型 ID、API Key 和自定义接口地址从当前目录的 `.env` 读取，最大输出 Token 通过适配器构造参数配置。先复制示例文件：
+模型 ID、API Key 和自定义接口地址支持用户级配置、项目级配置与环境变量覆盖。源码开发时仍可复制项目 `.env` 示例：
 
 PowerShell：
 

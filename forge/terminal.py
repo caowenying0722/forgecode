@@ -188,7 +188,13 @@ class TerminalUI:
                 reserve_space_for_menu=8,
             )
 
-    def show_welcome(self, model: str) -> None:
+    def show_welcome(
+        self,
+        model: str,
+        *,
+        workspace_root: Path | None = None,
+        cwd: Path | None = None,
+    ) -> None:
         '''Show a compact session header inspired by modern coding agents.'''
         title = Text.assemble(
             ('\u25c6 ', 'bold bright_cyan'),
@@ -199,7 +205,11 @@ class TerminalUI:
         details.add_column(style='dim', no_wrap=True)
         details.add_column()
         details.add_row('model', Text(model, style='bright_white'))
-        details.add_row('cwd', Text(str(Path.cwd()), style='bright_white'))
+        resolved_cwd = (cwd or Path.cwd()).resolve()
+        resolved_root = (workspace_root or resolved_cwd).resolve()
+        details.add_row('workspace', Text(str(resolved_root), style='bright_white'))
+        if resolved_cwd != resolved_root:
+            details.add_row('cwd', Text(str(resolved_cwd), style='bright_white'))
 
         self.console.print(
             Panel.fit(
