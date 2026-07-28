@@ -59,7 +59,11 @@ class ToolExecutor:
 
     async def execute(self, tool_call: ToolCall) -> ToolExecutionRecord:
         effect = self.effect(tool_call.name)
-        if effect == 'workspace_write' and self.workspace_tracker is not None:
+        if (
+            effect == 'workspace_write'
+            and tool_call.name != 'create_directory'
+            and self.workspace_tracker is not None
+        ):
             self.workspace_tracker.watch_paths(mutation_target_paths(tool_call))
 
         started = perf_counter()

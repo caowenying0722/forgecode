@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import re
 import select
 import sys
 from typing import Any, Protocol
@@ -31,6 +32,7 @@ from forge.runtime.state import ContextCompacted, TokenUsage, ToolCall, TurnResu
 from forge.context.manager import ContextStats
 from forge.context.manager import CompactionReport
 from forge.tools.base import ToolResult
+from forge.tools.search import iter_files
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +142,107 @@ class SlashCommandCompleter(Completer):
 SLASH_COMMAND_COMPLETER = SlashCommandCompleter()
 
 
+def workspace_file_match_score(
+    path: str,
+    query: str,
+) -> tuple[int, int, int, str] | None:
+    '''Rank one workspace path using prefix, substring, then subsequence match.'''
+    candidate = path.casefold()
+    normalized = query.casefold().replace('\\', '/')
+    if not normalized:
+        return (0, 0, len(candidate), candidate)
+
+    name = candidate.rsplit('/', 1)[-1]
+    if candidate.startswith(normalized):
+        return (0, 0, len(candidate), candidate)
+    if name.startswith(normalized):
+        return (1, 0, len(candidate), candidate)
+    if normalized in candidate:
+        return (2, candidate.index(normalized), len(candidate), candidate)
+
+    position = -1
+    gap = 0
+    for character in normalized:
+        next_position = candidate.find(character, position + 1)
+        if next_position < 0:
+            return None
+        gap += next_position - position - 1
+        position = next_position
+    return (3, gap, len(candidate), candidate)
+
+
+class WorkspaceFileCompleter(Completer):
+    '''Complete an active @token with a protected workspace-relative file.'''
+
+    MAX_RESULTS = 100
+    _mention = re.compile(r'(?<!\S)@(?P<query>\S*)$')
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self.paths: tuple[str, ...] = ()
+        self.refresh()
+
+    def refresh(self) -> None:
+        try:
+            self.paths = tuple(
+                path.relative_to(self.root).as_posix()
+                for path in iter_files(self.root)
+            )
+        except OSError:
+            self.paths = ()
+
+    def get_completions(
+        self,
+        document: Document,
+        complete_event: object,
+    ):
+        del complete_event
+        match = self._mention.search(document.text_before_cursor)
+        if match is None:
+            return
+        query = match.group('query')
+        ranked: list[tuple[tuple[int, int, int, str], str]] = []
+        for path in self.paths:
+            score = workspace_file_match_score(path, query)
+            if score is not None:
+                ranked.append((score, path))
+        ranked.sort()
+        start_position = -(len(query) + 1)
+        for _, path in ranked[: self.MAX_RESULTS]:
+            yield Completion(
+                f'@{path} ',
+                start_position=start_position,
+                display=path,
+                display_meta='workspace file',
+            )
+
+
+class ForgePromptCompleter(Completer):
+    '''Combine Slash Commands and @ workspace-file mentions.'''
+
+    def __init__(self, root: Path) -> None:
+        self.workspace_files = WorkspaceFileCompleter(root)
+
+    def refresh(self) -> None:
+        self.workspace_files.refresh()
+
+    def get_completions(
+        self,
+        document: Document,
+        complete_event: object,
+    ):
+        if document.text_before_cursor.startswith('/'):
+            yield from SLASH_COMMAND_COMPLETER.get_completions(
+                document,
+                complete_event,
+            )
+            return
+        yield from self.workspace_files.get_completions(
+            document,
+            complete_event,
+        )
+
+
 @dataclass(slots=True)
 class _TextTimelineBlock:
     text: str = ''
@@ -178,12 +281,15 @@ class TerminalUI:
         self,
         console: Console | None = None,
         prompt_session: _InteractivePrompt | None = None,
+        workspace_root: Path | None = None,
     ) -> None:
         self.console = console if console is not None else Console()
+        self.workspace_root = (workspace_root or Path.cwd()).resolve()
+        self.prompt_completer = ForgePromptCompleter(self.workspace_root)
         self.prompt_session = prompt_session
         if self.prompt_session is None and self.console.is_terminal:
             self.prompt_session = PromptSession(
-                completer=SLASH_COMMAND_COMPLETER,
+                completer=self.prompt_completer,
                 complete_while_typing=True,
                 reserve_space_for_menu=8,
             )
@@ -221,13 +327,15 @@ class TerminalUI:
             )
         )
         self.console.print(
-            '[dim]Ask a question or describe a coding task.[/]'
+            '[dim]Ask a question or describe a coding task. '
+            'Type @ for workspace files and / for commands.[/]'
         )
         self.console.print()
 
     def read_prompt(self) -> str:
         '''Read one message, preserving bracketed multi-line terminal paste.'''
         if self.prompt_session is not None:
+            self.prompt_completer.refresh()
             return self.prompt_session.prompt(
                 [('ansibrightcyan bold', '\u276f ')]
             )

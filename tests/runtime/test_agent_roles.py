@@ -40,6 +40,14 @@ class NeverExecute:
         raise AssertionError('guarded calls must not reach the executor')
 
 
+class EffectByName:
+    def __init__(self, workspace_writes: set[str]) -> None:
+        self.workspace_writes = workspace_writes
+
+    def effect(self, name: str) -> str:
+        return 'workspace_write' if name in self.workspace_writes else 'read'
+
+
 def test_agent_run_state_records_only_phase_changes() -> None:
     state = AgentRunState()
     first = state.transition(
@@ -145,6 +153,24 @@ def test_request_builder_uses_plan_tool_surface() -> None:
 
     assert spec.tools == plan_tools
     assert spec.tool_names == frozenset({'read_file'})
+
+
+def test_action_recovery_excludes_directory_only_writes() -> None:
+    tools = [
+        {'name': 'read_file'},
+        {'name': 'create_directory'},
+        {'name': 'write_file'},
+    ]
+    recovery = RecoveryManager(
+        tools,
+        EffectByName({'create_directory', 'write_file'}),
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset({'create_directory'}),
+    )
+
+    selected = recovery.action_tools(read_available=False)
+
+    assert selected == [{'name': 'write_file'}]
 
 
 def test_model_failure_handler_preserves_partial_output() -> None:

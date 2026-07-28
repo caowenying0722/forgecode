@@ -774,6 +774,7 @@ def test_empty_directory_scaffold_does_not_trigger_edit_recovery(
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'completed'
     assert (tmp_path / 'src' / 'game' / 'README.txt').is_file()
+    assert completed.result.changed_paths == ('src/game/README.txt',)
     failures = [
         event.result.error.code
         for event in events
@@ -1408,6 +1409,124 @@ def test_inspection_stagnation_does_not_enter_action_recovery(
     )
 
 
+def test_tool_enabled_checkpoint_recovers_unverified_final_answer(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'checkpoint-edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    first_status = ToolCall(0, 'checkpoint-status-1', 'git_status', {})
+    cached_status = ToolCall(0, 'checkpoint-status-2', 'git_status', {})
+    verify = ToolCall(
+        0,
+        'checkpoint-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    summary = 'Updated and verified sample.txt.'
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(first_status),
+        response_with_tool(cached_status),
+        text_response('I cannot continue because tools are unavailable.'),
+        response_with_tool(verify),
+        finish_response(
+            'checkpoint-finish',
+            task_kind='change',
+            summary=summary,
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
+        stagnation_warning=1,
+        stagnation_limit=4,
+    )
+
+    events = collect_turn(conversation, 'Change and verify sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert completed.result.verification is not None
+    assert completed.result.verification.success is True
+    assert client.calls[3]['tools'] is not None
+    assert client.calls[4]['tools'] is not None
+    assert '[ForgeCode Stagnation Final Recovery]' not in (
+        client.calls[4]['system'] or ''
+    )
+    assert any(
+        isinstance(event, CompletionBlocked)
+        and any('verify tool' in reason for reason in event.reasons)
+        for event in events
+    )
+
+
+def test_stagnation_limit_keeps_tools_for_incomplete_change_recovery(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'limit-edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    statuses = [
+        ToolCall(0, f'limit-status-{index}', 'git_status', {})
+        for index in range(1, 4)
+    ]
+    verify = ToolCall(
+        0,
+        'limit-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        *(response_with_tool(call) for call in statuses),
+        response_with_tool(verify),
+        finish_response(
+            'limit-finish',
+            task_kind='change',
+            summary='Recovered, verified, and finished the change.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
+        stagnation_warning=1,
+        stagnation_limit=2,
+    )
+
+    events = collect_turn(conversation, 'Change and verify sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.verification is not None
+    assert completed.result.verification.success is True
+    assert client.calls[4]['tools'] is not None
+    assert '[ForgeCode Stagnation Final Recovery]' not in (
+        client.calls[4]['system'] or ''
+    )
+
+
 def test_verified_change_stagnation_allows_final_summary_recovery(
     tmp_path: Path,
 ) -> None:
@@ -1469,7 +1588,7 @@ def test_verified_change_stagnation_allows_final_summary_recovery(
     )
 
 
-def test_unverified_change_stagnation_cannot_claim_completion(
+def test_unverified_change_stagnation_recovers_before_completion(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -1488,12 +1607,25 @@ def test_unverified_change_stagnation_cannot_claim_completion(
         ToolCall(0, f'unverified-redundant-diff-{index}', 'git_diff', {})
         for index in range(1, 9)
     ]
-    summary = 'Updated sample.txt; no verification was required or run.'
+    verify = ToolCall(
+        0,
+        'unverified-recovery-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    premature = 'Updated sample.txt; no verification was required or run.'
+    summary = 'Updated and verified sample.txt after recovery.'
     client = FakeModelClient(
         response_with_tool(edit),
         response_with_tool(initial_diff),
         *(response_with_tool(call) for call in redundant_diffs),
-        text_response(summary),
+        text_response(premature),
+        response_with_tool(verify),
+        finish_response(
+            'unverified-recovery-finish',
+            task_kind='change',
+            summary=summary,
+        ),
     )
     conversation = Conversation(
         client=client,
@@ -1504,14 +1636,21 @@ def test_unverified_change_stagnation_cannot_claim_completion(
 
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
-    assert completed.result.status == 'stuck'
+    assert completed.result.status == 'completed'
     assert completed.result.text == summary
     assert completed.result.changed_paths == ('sample.txt',)
-    assert completed.result.verification is None
+    assert completed.result.verification is not None
+    assert completed.result.verification.success is True
     assert any(
         'has not been verified' in reason
         for reason in completed.result.completion_reasons
+    ) is False
+    assert any(
+        isinstance(event, CompletionBlocked)
+        and any('verify tool' in reason for reason in event.reasons)
+        for event in events
     )
+    assert client.calls[-2]['tools'] is not None
 
 
 def test_novel_repository_evidence_cannot_extend_completion_ready_loop(

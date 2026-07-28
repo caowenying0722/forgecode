@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from forge.runtime.completion import (
     CompletionGate,
     TaskPolicy,
@@ -55,6 +57,42 @@ def test_workspace_tracker_imports_in_fresh_process() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == 'WorkspaceTracker'
+
+
+def test_workspace_tracker_initializes_private_gitdir_for_non_git_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path.parent))
+    task = tmp_path / 'task.md'
+    task.write_text('existing task\n', encoding='utf-8')
+    tracker = WorkspaceTracker(tmp_path)
+
+    run(tracker.begin_turn())
+
+    git_marker = tmp_path / '.git'
+    assert tracker.available is True
+    assert git_marker.is_file()
+    assert git_marker.read_text(encoding='utf-8').startswith('gitdir: ')
+    assert 'task.md' in tracker.baseline.files
+    assert not any(path.startswith('.forge/') for path in tracker.current.files)
+    head = subprocess.run(
+        ['git', 'rev-parse', '--verify', 'HEAD'],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert head.returncode == 0
+
+    generated = tmp_path / 'src' / 'main.ts'
+    generated.parent.mkdir()
+    generated.write_text('export {};\n', encoding='utf-8')
+    change = run(tracker.refresh())
+
+    assert change is not None
+    assert change.paths == ('src/main.ts',)
+    assert tracker.changed_paths == ('src/main.ts',)
 
 
 def run(coroutine: object) -> Any:

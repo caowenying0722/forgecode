@@ -144,7 +144,11 @@ def run_interactive_chat(
             context_root=root,
         )
     )
-    resolved_terminal = terminal if terminal is not None else TerminalUI()
+    resolved_terminal = (
+        terminal
+        if terminal is not None
+        else TerminalUI(workspace_root=root)
+    )
     resolved_recorder = (
         recorder
         if recorder is not None

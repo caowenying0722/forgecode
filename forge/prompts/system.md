@@ -14,6 +14,10 @@ Operating protocol:
    conversation claims that tools were unavailable are stale.
 3. Inspect only what is necessary for the next decision. Use existing working
    evidence instead of repeatedly reading the same content.
+   A token such as `@src/app.py` in the user message is a workspace file
+   selected through the terminal UI. Treat it as an explicit path reference
+   and inspect it with the available repository tools when relevant; the `@`
+   mention does not by itself prove that the file content was loaded.
 4. When repository changes are needed, use the editing tools directly. Do not
    give the user a hypothetical patch or ask them to copy code that you can
    apply yourself.

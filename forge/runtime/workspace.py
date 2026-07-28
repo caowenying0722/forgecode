@@ -25,6 +25,8 @@ DEFAULT_UNWATCHED_PARTS = frozenset(
         'node_modules',
     }
 )
+INTERNAL_GIT_DIRECTORY = Path('.forge') / 'git'
+INTERNAL_GIT_EXCLUDE = '.forge/'
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,11 +59,85 @@ class WorkspaceTracker:
         '''Use the current working tree as the immutable baseline for one turn.'''
         self._watched_paths.clear()
         snapshot = await self._capture()
+        if snapshot is None and not (self.root / '.git').exists():
+            await self._initialize_internal_repository()
+            snapshot = await self._capture()
         self.available = snapshot is not None
         resolved = snapshot or WorkspaceSnapshot()
         self.baseline = resolved
         self.current = resolved
         self.revision = 0
+
+    async def _initialize_internal_repository(self) -> bool:
+        '''Create a private gitdir pointer for an otherwise non-Git workspace.'''
+        control_dir = self.root / INTERNAL_GIT_DIRECTORY.parent
+        if control_dir.exists() and (
+            control_dir.is_symlink()
+            or (
+                hasattr(control_dir, 'is_junction')
+                and control_dir.is_junction()
+            )
+        ):
+            return False
+        try:
+            control_dir.mkdir(parents=True, exist_ok=True)
+            git_dir = (self.root / INTERNAL_GIT_DIRECTORY).resolve()
+            git_dir.relative_to(self.root)
+        except OSError:
+            return False
+        except ValueError:
+            return False
+
+        result = await run_process(
+            [
+                'git',
+                'init',
+                '--quiet',
+                f'--separate-git-dir={git_dir}',
+                '.',
+            ],
+            cwd=self.root,
+            timeout_seconds=30,
+        )
+        if result.exit_code != 0:
+            return False
+
+        exclude_path = git_dir / 'info' / 'exclude'
+        try:
+            existing = exclude_path.read_text(encoding='utf-8')
+            patterns = {
+                line.strip()
+                for line in existing.splitlines()
+                if line.strip() and not line.lstrip().startswith('#')
+            }
+            if INTERNAL_GIT_EXCLUDE not in patterns:
+                separator = '' if not existing or existing.endswith('\n') else '\n'
+                exclude_path.write_text(
+                    f'{existing}{separator}{INTERNAL_GIT_EXCLUDE}\n',
+                    encoding='utf-8',
+                )
+        except OSError:
+            return False
+
+        baseline = await run_process(
+            [
+                'git',
+                '-c',
+                'user.name=ForgeCode',
+                '-c',
+                'user.email=forgecode@local',
+                '-c',
+                'commit.gpgsign=false',
+                'commit',
+                '--quiet',
+                '--allow-empty',
+                '-m',
+                'ForgeCode workspace baseline',
+            ],
+            cwd=self.root,
+            timeout_seconds=30,
+        )
+        return baseline.exit_code == 0
 
     def watch_paths(self, paths: tuple[str, ...]) -> None:
         '''Capture task baselines for tool targets, including ignored files.'''

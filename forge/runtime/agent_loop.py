@@ -115,6 +115,7 @@ ACTION_RECOVERY_READ_TOOLS = frozenset(
 )
 ACTION_RECOVERY_EXCLUDED_WRITE_TOOLS = frozenset(
     {
+        'create_directory',
         'task_create',
         'task_claim',
         'task_complete',
@@ -1116,7 +1117,7 @@ class Conversation:
                             attempt=completion_blocks,
                             reasons=decision.reasons,
                         )
-                        if force_synthesis:
+                        if request_state.tool_free_recovery:
                             reasons = (
                                 'The agent stopped making progress before '
                                 'the task satisfied its completion checks.',
@@ -1281,6 +1282,16 @@ class Conversation:
                         previous_count + 1,
                         result.success,
                     )
+                if (
+                    run.executed
+                    and tool_call.name == 'create_directory'
+                    and result.success
+                ):
+                    tool_attempts = {
+                        attempted_signature: attempt
+                        for attempted_signature, attempt in tool_attempts.items()
+                        if attempt[1]
+                    }
                 if tool_call.name == 'finish_task' and result.success:
                     finish_reasons = await self.completion_checker.finish_rejection_reasons(
                         result,
@@ -1816,6 +1827,60 @@ class Conversation:
                         )
                     )
                     continue
+                if (
+                    self.workspace_tracker is not None
+                    and self.workspace_tracker.changed_paths
+                ):
+                    decision = await self.completion_checker.evaluate(
+                        latest_verification,
+                        mutation_attempted=mutation_attempted,
+                        reviewed_paths=completion_reviewed_paths,
+                    )
+                    if not decision.allowed:
+                        last_completion_reasons = decision.reasons
+                        completion_blocks += 1
+                        yield CompletionBlocked(
+                            attempt=completion_blocks,
+                            reasons=decision.reasons,
+                        )
+                        if completion_blocks >= self.max_completion_blocks:
+                            reason = (
+                                'ForgeCode stopped after repeated recovery '
+                                'requests did not satisfy the current '
+                                'completion checks.'
+                            )
+                            reasons = (reason, *decision.reasons)
+                            self.task_manager.stuck(reasons)
+                            self.messages[:] = request_messages
+                            yield TurnCompleted(
+                                result=TurnResult(
+                                    text=reason,
+                                    usage=completed_usage,
+                                    last_request_usage=request_usage,
+                                    model_calls=iteration,
+                                    tool_calls=tuple(all_tool_calls),
+                                    status='stuck',
+                                    changed_paths=(
+                                        self.workspace_tracker.changed_paths
+                                    ),
+                                    verification=latest_verification,
+                                    completion_reasons=reasons,
+                                )
+                            )
+                            return
+                        calls_without_progress = 0
+                        force_synthesis = False
+                        synthesis_retries = 0
+                        stagnation_final_recovery = False
+                        request_messages.append(
+                            build_completion_feedback(
+                                decision.reasons,
+                                task_context=(
+                                    self.task_manager.system_suffix()
+                                ),
+                            )
+                        )
+                        continue
                 if not stagnation_final_recovery:
                     stagnation_final_recovery = True
                     force_synthesis = True

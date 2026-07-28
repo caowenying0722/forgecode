@@ -1,6 +1,7 @@
 '''Tests for the Rich terminal presentation.'''
 
 from io import StringIO
+from pathlib import Path
 
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
@@ -14,6 +15,7 @@ from forge.runtime.state import (
     VerificationEvidence,
 )
 from forge.terminal import (
+    ForgePromptCompleter,
     SLASH_COMMAND_COMPLETER,
     TerminalUI,
     permission_answer_allows,
@@ -106,6 +108,87 @@ def test_slash_completion_filters_and_replaces_current_input() -> None:
 
 def test_normal_prompt_does_not_offer_slash_commands() -> None:
     assert completions_for('fix this bug') == []
+
+
+def workspace_completions_for(
+    root: Path,
+    text: str,
+) -> list[object]:
+    completer = ForgePromptCompleter(root)
+    return list(
+        completer.get_completions(
+            Document(text=text, cursor_position=len(text)),
+            CompleteEvent(completion_requested=True),
+        )
+    )
+
+
+def test_at_opens_protected_workspace_file_completion(tmp_path: Path) -> None:
+    (tmp_path / 'README.md').write_text('readme\n', encoding='utf-8')
+    source = tmp_path / 'src' / 'game'
+    source.mkdir(parents=True)
+    (source / 'player.ts').write_text('player\n', encoding='utf-8')
+    (tmp_path / '.env').write_text('SECRET=value\n', encoding='utf-8')
+    hidden = tmp_path / '.forge'
+    hidden.mkdir()
+    (hidden / 'session.json').write_text('{}\n', encoding='utf-8')
+    dependency = tmp_path / 'node_modules' / 'pkg'
+    dependency.mkdir(parents=True)
+    (dependency / 'index.js').write_text('module\n', encoding='utf-8')
+
+    completions = workspace_completions_for(tmp_path, 'Please inspect @')
+    paths = [completion.display_text for completion in completions]
+
+    assert paths == ['README.md', 'src/game/player.ts']
+    assert all(
+        completion.display_meta_text == 'workspace file'
+        for completion in completions
+    )
+
+
+def test_at_completion_fuzzy_filters_and_replaces_only_active_token(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / 'src' / 'game' / 'player_controller.ts'
+    target.parent.mkdir(parents=True)
+    target.write_text('player\n', encoding='utf-8')
+    (tmp_path / 'README.md').write_text('readme\n', encoding='utf-8')
+
+    completions = workspace_completions_for(
+        tmp_path,
+        'Compare @README.md with @sgpc',
+    )
+
+    assert [completion.text for completion in completions] == [
+        '@src/game/player_controller.ts '
+    ]
+    assert completions[0].start_position == -len('@sgpc')
+
+
+def test_at_completion_does_not_trigger_inside_email_address(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / 'mail.txt').write_text('mail\n', encoding='utf-8')
+
+    assert workspace_completions_for(tmp_path, 'email user@ma') == []
+
+
+def test_workspace_file_index_refreshes_between_prompts(tmp_path: Path) -> None:
+    completer = ForgePromptCompleter(tmp_path)
+    created = tmp_path / 'new-file.ts'
+    created.write_text('new\n', encoding='utf-8')
+
+    completer.refresh()
+    completions = list(
+        completer.get_completions(
+            Document(text='@new', cursor_position=4),
+            CompleteEvent(completion_requested=True),
+        )
+    )
+
+    assert [completion.display_text for completion in completions] == [
+        'new-file.ts'
+    ]
 
 
 def test_permission_answer_accepts_common_yes_values() -> None:
