@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from forge.runtime.state import (
+    AgentPhaseChanged,
     CompletionBlocked,
     ConversationEvent,
     ContextCompacted,
@@ -168,6 +169,16 @@ class TrajectoryRecorder:
             return
         if isinstance(event, CompletionBlocked):
             self._write('completion_blocked', asdict(event))
+            return
+        if isinstance(event, AgentPhaseChanged):
+            payload = asdict(event)
+            payload['phase'] = event.phase.value
+            payload['previous_phase'] = (
+                event.previous_phase.value
+                if event.previous_phase is not None
+                else None
+            )
+            self._write('agent_phase_changed', payload)
             return
         if isinstance(event, ContextCompacted):
             self._write('context_compacted', asdict(event))

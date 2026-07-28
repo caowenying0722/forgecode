@@ -7,6 +7,9 @@ from hashlib import sha256
 import os
 from pathlib import Path, PurePosixPath
 
+from forge.runtime.paths import normalize_workspace_path
+from forge.runtime.process import run_process
+
 DEFAULT_UNWATCHED_PARTS = frozenset(
     {
         '.cache',
@@ -71,7 +74,7 @@ class WorkspaceTracker:
                 relative = resolved.relative_to(self.root)
             except ValueError:
                 continue
-            normalized = normalize_path(str(relative))
+            normalized = normalize_workspace_path(str(relative))
             if normalized in self._watched_paths:
                 continue
             fingerprint = fingerprint_path(self.root, normalized)
@@ -103,10 +106,6 @@ class WorkspaceTracker:
         return changed_paths(self.baseline, self.current)
 
     async def _capture(self) -> WorkspaceSnapshot | None:
-        # Import lazily so WorkspaceTracker can be imported independently;
-        # forge.tools exports VerifyTool, which itself references this class.
-        from forge.tools.shell import run_process
-
         result = await run_process(
             [
                 'git',
@@ -158,16 +157,12 @@ def parse_porcelain_paths(output: str) -> tuple[str, ...]:
         if not record or len(record) < 4:
             continue
         status = record[:2]
-        paths.append(normalize_path(record[3:]))
+        paths.append(normalize_workspace_path(record[3:]))
         if 'R' in status or 'C' in status:
             if index < len(records) and records[index]:
-                paths.append(normalize_path(records[index]))
+                paths.append(normalize_workspace_path(records[index]))
                 index += 1
     return tuple(dict.fromkeys(paths))
-
-
-def normalize_path(path: str) -> str:
-    return PurePosixPath(path.replace('\\', '/')).as_posix()
 
 
 def should_skip_workspace_path(path: str) -> bool:

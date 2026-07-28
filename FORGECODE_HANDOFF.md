@@ -109,7 +109,7 @@ Several raw stuck behaviors were improved:
 
 Current per-turn token safety behavior:
 
-- default `max_turn_input_tokens = 500_000`
+- default `max_turn_input_tokens = 2_000_000`
 - this is per user turn, not whole session
 - when reached, ForgeCode makes one no-tool recovery request
 - the final response summarizes progress, remaining work, verification, and next step
@@ -316,7 +316,7 @@ Known limitation:
 
 ### Token Limit Strategy
 
-The 500,000 input-token limit is a per-turn safety fuse.
+The 2,000,000 input-token limit is a per-turn safety fuse.
 
 It is not:
 

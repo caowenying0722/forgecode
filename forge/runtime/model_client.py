@@ -206,7 +206,13 @@ class AnthropicModelClient:
             except (
                 APIConnectionError,
                 APIStatusError,
+                AssertionError,
             ) as error:
+                if (
+                    isinstance(error, AssertionError)
+                    and not is_incomplete_stream_assertion(error)
+                ):
+                    raise
                 reason, retryable = classify_provider_error(error)
                 can_retry = (
                     retryable
@@ -423,6 +429,13 @@ async def final_content_events(
 
 def classify_provider_error(error: Exception) -> tuple[str, bool]:
     '''Map Anthropic transport failures to stable ForgeCode reasons.'''
+    if is_incomplete_stream_assertion(error):
+        return 'incomplete_stream', True
+    details = str(error).lower()
+    if 'auth_unavailable' in details or 'no auth available' in details:
+        return 'authentication_unavailable', False
+    if 'server_is_overloaded' in details:
+        return 'overloaded', True
     if isinstance(error, RateLimitError):
         return 'rate_limit', True
     if isinstance(error, APITimeoutError):
@@ -434,7 +447,6 @@ def classify_provider_error(error: Exception) -> tuple[str, bool]:
             return 'overloaded', True
         return 'server_error', True
     if isinstance(error, APIStatusError):
-        details = str(error).lower()
         if error.status_code == 400 and any(
             marker in details
             for marker in (
@@ -462,7 +474,29 @@ def model_error_message(reason: str, response_started: bool) -> str:
             'The model stream was interrupted after output started; '
             'ForgeCode did not retry to avoid duplicate output.'
         )
+    if reason == 'incomplete_stream':
+        return (
+            'The Anthropic-compatible endpoint ended its event stream before '
+            'the SDK received a complete final message.'
+        )
+    if reason == 'authentication_unavailable':
+        return (
+            'The configured model proxy has no authenticated upstream account. '
+            'Open the proxy application and reconnect or sign in to a provider.'
+        )
     return f'Model request failed: {reason}.'
+
+
+def is_incomplete_stream_assertion(error: Exception) -> bool:
+    '''Recognize the Anthropic SDK's empty final-message snapshot assertion.'''
+    if not isinstance(error, AssertionError) or error.args:
+        return False
+    traceback = error.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_name == 'get_final_message':
+            return True
+        traceback = traceback.tb_next
+    return False
 
 
 def parse_tool_arguments(

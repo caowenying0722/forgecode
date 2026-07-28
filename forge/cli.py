@@ -10,6 +10,7 @@ from forge import __version__
 from forge.config import ConfigurationError, ForgeConfig
 from forge.runtime.agent_loop import Conversation
 from forge.runtime.state import (
+    AgentPhaseChanged,
     CompletionBlocked,
     ContextCompacted,
     ModelTextDelta,
@@ -348,6 +349,8 @@ async def render_streamed_turn(
                 recorder.record_event(event)
             if isinstance(event, ModelTextDelta):
                 response_view.append_text(event.text)
+            elif isinstance(event, AgentPhaseChanged):
+                response_view.update_phase(event.phase, event.reason)
             elif isinstance(event, ModelUsageUpdate):
                 response_view.update_usage(
                     event.usage,

@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Literal
 
 from forge.hooks.builtin import (
     PermissionApprover,
@@ -13,17 +12,14 @@ from forge.hooks.builtin import (
     PermissionMode,
     ToolLoggingHook,
     normalize_permission_mode,
-    permission_denied_result,
     render_permission_notice,
 )
 from forge.hooks.registry import HookRegistry
 from forge.hooks.state import HookContext
 from forge.runtime.state import ToolCall
+from forge.runtime.tool_targets import mutation_target_paths
 from forge.runtime.workspace import WorkspaceTracker
 from forge.tools.base import ToolEffect, ToolRegistry, ToolResult
-
-
-AutoCommitMode = Literal['off', 'ask', 'always']
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,11 +28,6 @@ class ToolExecutionRecord:
     effect: ToolEffect | None
     duration_seconds: float
     permission_mode: PermissionMode
-
-
-@dataclass(frozen=True, slots=True)
-class AutoCommitConfig:
-    mode: AutoCommitMode = 'off'
 
 
 PermissionMiddleware = PermissionHook
@@ -55,7 +46,6 @@ class ToolExecutor:
         permission: PermissionMiddleware | None = None,
         logger: ToolExecutionLogger | None = None,
         hooks: HookRegistry | None = None,
-        auto_commit: AutoCommitConfig | None = None,
     ) -> None:
         self.registry = registry
         self.root = root.resolve()
@@ -63,7 +53,6 @@ class ToolExecutor:
         self.permission = permission or PermissionMiddleware()
         self.logger = logger or ToolExecutionLogger(self.root)
         self.hooks = hooks or HookRegistry([self.permission, self.logger])
-        self.auto_commit = auto_commit or AutoCommitConfig()
 
     def effect(self, name: str) -> ToolEffect | None:
         return self.registry.effect(name)
@@ -113,17 +102,3 @@ class ToolExecutor:
             )
         )
         return record
-
-
-def mutation_target_paths(tool_call: ToolCall) -> tuple[str, ...]:
-    raw_paths: list[object] = []
-    arguments = tool_call.arguments
-    for key in ('path', 'target_path'):
-        if key in arguments:
-            raw_paths.append(arguments[key])
-    if tool_call.name == 'apply_patch':
-        for key in ('paths', 'changed_paths'):
-            value = arguments.get(key)
-            if isinstance(value, list):
-                raw_paths.extend(value)
-    return tuple(str(path) for path in raw_paths if str(path).strip())

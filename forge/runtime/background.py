@@ -7,7 +7,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 
-from forge.tools.shell import ProcessResult, process_metadata, render_process_output
+from forge.runtime.process import (
+    ProcessResult,
+    process_metadata,
+    render_process_output,
+    run_process,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,8 +48,6 @@ class BackgroundTaskManager:
         timeout_seconds: float,
         input_text: str | None,
     ) -> BackgroundCommand:
-        from forge.tools.shell import run_process
-
         self.directory.mkdir(parents=True, exist_ok=True)
         self._counter += 1
         background_id = f'bg-{self._counter:04d}'

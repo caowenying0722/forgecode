@@ -3,77 +3,51 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>金铲铲高还原度 Web 模拟界面</title>
-    <link rel="stylesheet" href="./src/styles.css" />
+    <title>无畏契约风格高还原度演示（2D）</title>
+    <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <div class="app-bg"></div>
-    <main class="game-wrap">
-      <header class="topbar">
-        <h1>Jing Camp</h1>
-        <div class="top-stat">
-          <span class="pill">当前回合 <strong id="round-label">1-1</strong></span>
-          <span class="pill">金币 <strong id="gold-label">50</strong></span>
-          <span class="pill">等级 <strong id="level-label">6</strong></span>
-          <span class="pill">经验 <strong id="xp-label">30 / 60</strong></span>
-          <span class="pill">战斗阶段 <strong id="phase-label">备战</strong></span>
+    <div id="gameWrap">
+      <canvas id="c"></canvas>
+      <div id="hud">
+        <div id="crosshair"></div>
+        <div id="panel">
+          <div class="row" style="margin-bottom:8px">
+            <div>
+              <strong>无畏契约 · 高还原度 2D 练手版</strong><br />
+              <span class="muted">WASD 移动、左键射击、右键瞄准、Q闪现、E短暂加速、R 换弹、空格翻滚</span>
+            </div>
+            <div style="text-align:right; min-width: 130px;">
+              <div>击杀 <span id="killCount">0</span></div>
+              <div>回合时间 <span id="timeText">0:00</span></div>
+            </div>
+          </div>
+
+          <div class="row" style="margin-bottom:6px">
+            <div style="display:flex; gap:10px; align-items:center; min-width:220px;">
+              <span>生命</span>
+              <div class="barWrap"><div id="hpBar" class="bar red"></div></div>
+            </div>
+            <div style="display:flex; gap:10px; align-items:center; min-width:220px;">
+              <span>护盾</span>
+              <div class="barWrap"><div id="shieldBar" class="bar"></div></div>
+            </div>
+          </div>
+
+          <div class="row" style="margin-bottom:8px">
+            <div style="display:flex; gap:10px; align-items:center;">
+              <span>弹匣</span>
+              <span id="ammoText">30/120</span>
+            </div>
+            <div id="ability"></div>
+          </div>
         </div>
-      </header>
+        <div id="fps">FPS: --</div>
+        <div id="tip">提示：这是「高还原度的演示工程」；可继续扩展为真实模型、音效、技能伤害判定与服务器同步版。</div>
+        <div id="miniMapWrap"><canvas id="miniMap"></canvas></div>
+      </div>
+    </div>
 
-      <section class="layout-grid">
-        <section class="left-col">
-          <article class="status-card health-card">
-            <div class="hp-head">我方生命</div>
-            <div class="hp-track"><i class="hp-fill" id="ally-hp-fill"></i></div>
-            <div class="hp-value" id="ally-hp-text">100 / 100</div>
-          </article>
-          <article class="status-card health-card enemy">
-            <div class="hp-head">敌方生命</div>
-            <div class="hp-track"><i class="hp-fill" id="enemy-hp-fill"></i></div>
-            <div class="hp-value" id="enemy-hp-text">100 / 100</div>
-          </article>
-
-          <article class="status-card controls">
-            <button id="btn-reroll">重新筛选 (-2 金币)</button>
-            <button id="btn-lock" class="warning">锁定商店</button>
-            <button id="btn-next">开始战斗</button>
-            <button id="btn-reset">重置示例局面</button>
-            <label class="toggle"><input type="checkbox" id="auto-battle" /> 自动战斗</label>
-          </article>
-        </section>
-
-        <section class="center-col">
-          <article class="board-card">
-            <div class="board-title">棋盘（7 × 4）</div>
-            <div class="board" id="board"></div>
-          </article>
-
-          <article class="bench-card">
-            <div class="board-title">后备阵容（9 格）</div>
-            <div class="bench" id="bench"></div>
-          </article>
-        </section>
-
-        <section class="right-col">
-          <article class="status-card shop-wrap">
-            <div class="board-title">商店</div>
-            <div class="shop" id="shop"></div>
-            <small class="hint">点击英雄图标购买，先放入空置后备位。</small>
-          </article>
-
-          <article class="status-card log-wrap">
-            <div class="board-title">战斗日志</div>
-            <ol id="battle-log"></ol>
-          </article>
-        </section>
-      </section>
-
-      <section class="detail-bar" id="detail-bar">
-        <span id="detail-name">点击一个单位查看详情</span>
-        <span id="detail-extra"></span>
-      </section>
-    </main>
-
-    <script src="./src/app.js" defer></script>
+    <script type="module" src="./main.js"></script>
   </body>
 </html>

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from forge.runtime.state import ToolCall
+from forge.runtime.tool_targets import mutation_target_paths
 from forge.runtime.tool_executor import (
     PermissionMiddleware,
     ToolExecutionLogger,
@@ -182,3 +183,25 @@ def test_memory_write_goes_through_permission_and_logging(
     assert log['event'] == 'permission_denied'
     assert log['tool'] == 'memory_write'
     assert log['permission_mode'] == 'readonly'
+
+
+def test_mutation_targets_are_shared_for_patch_tracking_and_recovery() -> None:
+    call = ToolCall(
+        0,
+        'toolu_patch',
+        'apply_patch',
+        {
+            'path': 'forge\\runtime\\agent_loop.py',
+            'patch': (
+                '*** Begin Patch\n'
+                '*** Update File: forge/runtime/agent_loop.py\n'
+                '*** Add File: forge/runtime/new_role.py\n'
+                '*** End Patch'
+            ),
+        },
+    )
+
+    assert mutation_target_paths(call) == (
+        'forge/runtime/agent_loop.py',
+        'forge/runtime/new_role.py',
+    )

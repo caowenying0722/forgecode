@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from functools import cache
 from itertools import count
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Literal
 
 from forge.context.compactor import CompactionConfig
@@ -19,26 +19,63 @@ from forge.hooks.registry import HookRegistry
 from forge.hooks.state import HookContext
 from forge.mcp.client import MCPConfigurationError, parse_mcp_config
 from forge.runtime.intent import infer_change_required
+from forge.runtime.agent_state import AgentPhase, AgentRunState
+from forge.runtime.agent_messages import (
+    append_notification_message,
+    build_assistant_message,
+    build_tool_result_message,
+)
+from forge.runtime.completion_checker import (
+    CompletionChecker,
+    build_completion_feedback,
+    build_finalization_recovery_feedback,
+    completion_review_paths,
+    render_completion_ready_context,
+    verification_from_result,
+)
+from forge.runtime.model_runner import ModelRunner, add_token_usage
+from forge.runtime.model_failure import (
+    ModelFailureAction,
+    ModelFailureHandler,
+)
+from forge.runtime.protocol_recovery import (
+    build_synthesis_retry_feedback,
+    build_tool_protocol_feedback,
+)
+from forge.runtime.request_builder import RequestBuilder, RequestState
+from forge.runtime.recovery_manager import RecoveryManager
+from forge.runtime.recovery_feedback import (
+    action_recovery_stuck_reason,
+    build_action_recovery_feedback,
+    build_mutation_recovery_feedback,
+    build_stagnation_feedback,
+    build_stagnation_final_recovery_feedback,
+    build_token_limit_recovery_feedback,
+    mutation_failure_record,
+    mutation_recovery_stuck_reason,
+    render_mutation_recovery_context,
+)
+from forge.runtime.session_manager import SessionManager
+from forge.runtime.tool_runner import (
+    ToolBatchState,
+    ToolRunner,
+    ToolRunPolicy,
+    is_tool_protocol_failure,
+)
 from forge.runtime.model_client import (
     AnthropicModelClient,
-    ModelCallError,
     ModelClient,
-    ModelOutputTruncatedError,
-    ModelProtocolError,
 )
 from forge.runtime.completion import CompletionGate, TaskPolicy
 from forge.runtime.background import BackgroundTaskManager
 from forge.runtime.team import MessageBus, render_team_notification
 from forge.runtime.state import (
+    AgentPhaseChanged,
     CompletionBlocked,
     ConversationEvent,
     ContextCompacted,
     ModelCallCompleted,
-    ModelCallFailed,
     ModelCallStarted,
-    ModelTextDelta,
-    ModelToolCallCompleted,
-    ModelUsageUpdate,
     TokenUsage,
     ToolExecutionCompleted,
     ToolExecutionStarted,
@@ -147,7 +184,7 @@ class Conversation:
         mutation_recovery_limit: int = 5,
         pre_mutation_limit: int = 8,
         action_recovery_limit: int = 3,
-        max_turn_input_tokens: int | None = 500_000,
+        max_turn_input_tokens: int | None = 2_000_000,
     ) -> None:
         if tools is not None and registry is not None:
             raise ValueError('Pass tools or registry, not both.')
@@ -220,10 +257,13 @@ class Conversation:
         self.task_manager = TaskManager(resolved_context_root)
         self.background_manager = BackgroundTaskManager(resolved_context_root)
         self.team_bus = MessageBus(resolved_context_root)
-        self.session_store = SessionStore(resolved_context_root)
+        self.session_manager = SessionManager(
+            SessionStore(resolved_context_root)
+        )
         self.session_id: str | None = None
         self.interaction_mode: InteractionMode = 'auto'
         self.working_state = WorkingState()
+        self.run_state = AgentRunState()
         if registry is not None:
             if 'task' in registry.names:
                 registry.replace(
@@ -268,7 +308,7 @@ class Conversation:
                 registry.register(
                     TodoWriteTool(resolved_context_root, self.todo_list)
                 )
-        self.tool_executor = (
+        tool_executor = (
             ToolExecutor(
                 registry,
                 root=resolved_context_root,
@@ -280,6 +320,13 @@ class Conversation:
             if registry is not None
             else None
         )
+        self.model_runner = ModelRunner(self.client)
+        self.model_failure_handler = ModelFailureHandler()
+        self.tool_runner = (
+            ToolRunner(tool_executor)
+            if tool_executor is not None
+            else None
+        )
         self.tools = registry.definitions if registry is not None else tools
         self.finish_protocol = (
             registry is not None and 'finish_task' in registry.names
@@ -289,10 +336,25 @@ class Conversation:
             resolved_context_root,
             context_config,
         )
-        self.completion_gate = (
+        completion_gate = (
             CompletionGate(tracker.root, task_policy)
             if tracker is not None
             else None
+        )
+        self.completion_checker = CompletionChecker(
+            tracker,
+            completion_gate,
+            self.task_manager,
+        )
+        self.recovery_manager = RecoveryManager(
+            self.tools,
+            self.tool_runner,
+            read_tools=ACTION_RECOVERY_READ_TOOLS,
+            excluded_write_tools=ACTION_RECOVERY_EXCLUDED_WRITE_TOOLS,
+        )
+        self.request_builder = RequestBuilder(
+            self.recovery_manager,
+            action_recovery_limit=action_recovery_limit,
         )
         self.max_completion_blocks = max_completion_blocks
         self.max_protocol_recoveries = max_protocol_recoveries
@@ -324,7 +386,58 @@ class Conversation:
             reserved_output_tokens=getattr(self.client, 'max_tokens', 0),
         )
 
+    def _transition(
+        self,
+        phase: AgentPhase,
+        *,
+        reason: str,
+        iteration: int,
+    ) -> AgentPhaseChanged | None:
+        transition = self.run_state.transition(
+            phase,
+            reason=reason,
+            iteration=iteration,
+        )
+        if transition is None:
+            return None
+        return AgentPhaseChanged(
+            phase=transition.current,
+            previous_phase=transition.previous,
+            reason=transition.reason,
+            iteration=transition.iteration,
+        )
+
     async def stream(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+        '''Expose lifecycle transitions around the internal turn engine.'''
+        try:
+            async for event in self._stream_turn(prompt):
+                if isinstance(event, TurnCompleted):
+                    phase_event = self._transition(
+                        (
+                            AgentPhase.COMPLETED
+                            if event.result.status == 'completed'
+                            else AgentPhase.FAILED
+                        ),
+                        reason=f'turn_{event.result.status}',
+                        iteration=self.run_state.iteration,
+                    )
+                    if phase_event is not None:
+                        yield phase_event
+                yield event
+        except Exception:
+            phase_event = self._transition(
+                AgentPhase.FAILED,
+                reason='unhandled_turn_error',
+                iteration=self.run_state.iteration,
+            )
+            if phase_event is not None:
+                yield phase_event
+            raise
+
+    async def _stream_turn(
+        self,
+        prompt: str,
+    ) -> AsyncIterator[ConversationEvent]:
         '''Run model-tool cycles until the model returns a final text answer.'''
         if not prompt.strip():
             raise ValueError('prompt must not be empty')
@@ -339,6 +452,7 @@ class Conversation:
         )
         self.task_manager.begin_turn(prompt)
         self.working_state = WorkingState()
+        self.run_state = AgentRunState()
         self._last_task_context = self.task_manager.system_suffix()
         user_message = {'role': 'user', 'content': prompt}
         request_messages = [*self.messages, user_message]
@@ -388,6 +502,28 @@ class Conversation:
             else range(1, self.max_iterations + 1)
         )
         for iteration in iterations:
+            is_recovering = (
+                action_recovery
+                or bool(mutation_failures)
+                or finalization_recovery
+                or stagnation_final_recovery
+                or token_limit_recovery
+            )
+            phase_event = self._transition(
+                (
+                    AgentPhase.RECOVERING
+                    if is_recovering
+                    else AgentPhase.THINKING
+                ),
+                reason=(
+                    'preparing_recovery_request'
+                    if is_recovering
+                    else 'preparing_model_request'
+                ),
+                iteration=iteration,
+            )
+            if phase_event is not None:
+                yield phase_event
             text_parts: list[str] = []
             tool_calls: list[ToolCall] = []
             request_usage: TokenUsage | None = None
@@ -395,7 +531,7 @@ class Conversation:
                 self.background_manager.collect_notifications()
             )
             if background_notifications:
-                append_background_notification_message(
+                append_notification_message(
                     request_messages,
                     background_notifications,
                 )
@@ -403,7 +539,7 @@ class Conversation:
                 self.team_bus.collect('lead')
             )
             if team_notifications:
-                append_team_notification_message(
+                append_notification_message(
                     request_messages,
                     team_notifications,
                 )
@@ -430,33 +566,11 @@ class Conversation:
                     )
                 )
 
-            if (
-                finalization_recovery
-                or stagnation_final_recovery
-                or token_limit_recovery
-            ):
-                request_tools = None
-            elif self.interaction_mode == 'plan':
-                request_tools = self._plan_mode_tools()
-            elif action_recovery:
-                request_tools = self._action_recovery_tools(
-                    read_available=not action_read_used
-                )
-            elif mutation_failures:
-                request_tools = self._mutation_recovery_tools(
-                    mutation_failures,
-                    read_available=not mutation_recovery_read_used,
-                    include_finish=False,
-                )
-            else:
-                request_tools = self.tools
-            request_tool_names = {
-                str(definition.get('name', ''))
-                for definition in request_tools or ()
-            }
-            request_system_prompt = self._request_system_prompt(
+            request_state = RequestState(
                 force_synthesis=force_synthesis,
                 mutation_recovery_context=mutation_recovery_context,
+                mutation_failures=tuple(mutation_failures),
+                mutation_read_used=mutation_recovery_read_used,
                 finalization_recovery=finalization_recovery,
                 stagnation_final_recovery=stagnation_final_recovery,
                 token_limit_recovery=token_limit_recovery,
@@ -467,6 +581,26 @@ class Conversation:
                 action_recovery_calls=action_recovery_calls,
                 action_read_used=action_read_used,
             )
+            request_spec = self.request_builder.build(
+                state=request_state,
+                interaction_mode=self.interaction_mode,
+                all_tools=self.tools,
+                plan_tools=self._plan_mode_tools(),
+                base_system_prompt=self._system_prompt_with_task(
+                    include_tool_availability=(
+                        not request_state.tool_free_recovery
+                    ),
+                ),
+                repository_context=self._last_repository_context,
+                changed_paths=(
+                    self.workspace_tracker.changed_paths
+                    if self.workspace_tracker is not None
+                    else ()
+                ),
+            )
+            request_tools = request_spec.tools
+            request_tool_names = request_spec.tool_names
+            request_system_prompt = request_spec.system_prompt
             compaction_report = await self.context.compact_history(
                 request_messages,
                 self.client,
@@ -496,78 +630,38 @@ class Conversation:
                     automatic=compaction_report.automatic,
                 )
             yield ModelCallStarted(iteration=iteration)
+            model_run = self.model_runner.run(
+                messages=self.context.prepare(request_messages),
+                tools=request_tools,
+                system=request_system_prompt,
+                completed_usage=completed_usage,
+                iteration=iteration,
+            )
+            text_parts = model_run.text_parts
+            tool_calls = model_run.tool_calls
             try:
-                async for event in self.client.stream(
-                    messages=self.context.prepare(request_messages),
-                    tools=request_tools,
-                    system=request_system_prompt,
-                ):
-                    if isinstance(event, ModelTextDelta):
-                        text_parts.append(event.text)
-                        yield event
-                    elif isinstance(event, ModelToolCallCompleted):
-                        tool_calls.append(event.tool_call)
-                        yield event
-                    elif isinstance(event, ModelUsageUpdate):
-                        request_usage = event.usage
-                        yield ModelUsageUpdate(
-                            usage=add_token_usage(
-                                completed_usage,
-                                request_usage,
-                            ),
-                            request_usage=request_usage,
-                            model_calls=iteration,
-                        )
-                    else:
-                        yield event
+                async for event in model_run:
+                    yield event
             except Exception as error:
                 partial_text = ''.join(text_parts)
-                if (
-                    isinstance(error, ModelOutputTruncatedError)
-                    and not error.tool_names
-                    and not tool_calls
-                    and partial_text.strip()
-                ):
-                    if (
-                        output_continuations
-                        < self.max_output_continuations
-                        and request_usage is not None
-                    ):
-                        output_continuations += 1
-                        completed_usage = add_token_usage(
-                            completed_usage,
-                            request_usage,
-                        )
-                        continued_text_parts.append(partial_text)
-                        request_messages.extend(
-                            [
-                                {
-                                    'role': 'assistant',
-                                    'content': partial_text,
-                                },
-                                build_output_continuation_feedback(
-                                    attempt=output_continuations,
-                                    maximum=self.max_output_continuations,
-                                ),
-                            ]
-                        )
-                        yield ModelCallFailed(
-                            iteration=iteration,
-                            reason=error.reason,
-                            retryable=True,
-                        )
-                        continue
-                    yield ModelCallFailed(
-                        iteration=iteration,
-                        reason=error.reason,
-                        retryable=False,
-                    )
-                    raise
-                if (
-                    isinstance(error, ModelCallError)
-                    and error.reason == 'context_overflow'
-                    and not reactive_compaction_attempted
-                ):
+                failure = self.model_failure_handler.classify(
+                    error,
+                    iteration=iteration,
+                    partial_text=partial_text,
+                    has_tool_calls=bool(tool_calls),
+                    request_usage=model_run.request_usage,
+                    output_continuations=output_continuations,
+                    max_output_continuations=(
+                        self.max_output_continuations
+                    ),
+                    reactive_compaction_attempted=(
+                        reactive_compaction_attempted
+                    ),
+                    protocol_recoveries=protocol_recoveries,
+                    max_protocol_recoveries=self.max_protocol_recoveries,
+                    available_tools=tuple(sorted(request_tool_names)),
+                )
+                if failure.action is ModelFailureAction.COMPACT_CONTEXT:
                     reactive_compaction_attempted = True
                     report = await self.context.compact_history(
                         request_messages,
@@ -576,49 +670,51 @@ class Conversation:
                     )
                     if report is not None and report.success:
                         continue
-                if (
-                    isinstance(error, ModelProtocolError)
-                    and protocol_recoveries < self.max_protocol_recoveries
-                ):
-                    protocol_recoveries += 1
-                    if request_usage is not None:
+                    yield failure.event
+                    raise
+                if failure.action is ModelFailureAction.CONTINUE_OUTPUT:
+                    output_continuations += 1
+                    if (
+                        failure.consume_usage
+                        and model_run.request_usage is None
+                    ):
+                        raise AssertionError(
+                            'Output continuation requires request usage.'
+                        )
+                    if model_run.request_usage is not None:
                         completed_usage = add_token_usage(
                             completed_usage,
-                            request_usage,
+                            model_run.request_usage,
                         )
-                    yield ModelCallFailed(
-                        iteration=iteration,
-                        reason=error.reason,
-                        retryable=True,
-                    )
+                    if failure.preserve_partial_text:
+                        continued_text_parts.append(partial_text)
                     request_messages.extend(
-                        build_protocol_recovery_feedback(
-                            error,
-                            attempt=protocol_recoveries,
-                            maximum=self.max_protocol_recoveries,
-                            available_tools=(
-                                tuple(sorted(request_tool_names))
-                            ),
-                        )
+                        [
+                            {
+                                'role': 'assistant',
+                                'content': partial_text,
+                            },
+                            *failure.feedback,
+                        ]
                     )
+                    yield failure.event
                     continue
-                yield ModelCallFailed(
-                    iteration=iteration,
-                    reason=(
-                        error.reason
-                        if isinstance(
-                            error,
-                            (ModelCallError, ModelProtocolError),
+                if failure.action is ModelFailureAction.RECOVER_PROTOCOL:
+                    protocol_recoveries += 1
+                    if (
+                        failure.consume_usage
+                        and model_run.request_usage is not None
+                    ):
+                        completed_usage = add_token_usage(
+                            completed_usage,
+                            model_run.request_usage,
                         )
-                        else type(error).__name__
-                    ),
-                    retryable=(
-                        error.retryable
-                        if isinstance(error, ModelCallError)
-                        else False
-                    ),
-                )
+                    yield failure.event
+                    request_messages.extend(failure.feedback)
+                    continue
+                yield failure.event
                 raise
+            request_usage = model_run.request_usage
             yield ModelCallCompleted(iteration=iteration)
 
             text = ''.join(text_parts).strip()
@@ -799,6 +895,13 @@ class Conversation:
                 return
 
             if not tool_calls:
+                phase_event = self._transition(
+                    AgentPhase.CHECKING_RESULT,
+                    reason='model_returned_final_text',
+                    iteration=iteration,
+                )
+                if phase_event is not None:
+                    yield phase_event
                 if token_limit_recovery:
                     reason = (
                         token_limit_reason
@@ -942,7 +1045,7 @@ class Conversation:
                     return
                 if (
                     self.workspace_tracker is not None
-                    and self.completion_gate is not None
+                    and self.completion_checker.available
                 ):
                     change = await self.workspace_tracker.refresh()
                     if change is not None:
@@ -954,8 +1057,7 @@ class Conversation:
                             revision=change.revision,
                             paths=change.paths,
                         )
-                    decision = await self.completion_gate.evaluate(
-                        self.workspace_tracker,
+                    decision = await self.completion_checker.evaluate(
                         latest_verification,
                         mutation_attempted=(
                             mutation_attempted or change_required
@@ -1046,25 +1148,24 @@ class Conversation:
                 raise ModelResponseError(
                     'Model requested tools, but no ToolRegistry is configured.'
                 )
-            if self.tool_executor is None:
+            if self.tool_runner is None:
                 raise ModelResponseError(
                     'Model requested tools, but no ToolExecutor is configured.'
                 )
 
+            phase_event = self._transition(
+                AgentPhase.PREPARING_TOOLS,
+                reason='model_requested_tool_calls',
+                iteration=iteration,
+            )
+            if phase_event is not None:
+                yield phase_event
+
             all_tool_calls.extend(tool_calls)
-            tool_results: list[tuple[ToolCall, ToolResult]] = []
-            last_workspace_change_position = -1
-            task_progressed = False
-            evidence_progressed = False
-            required_change_rejected = False
-            workspace_write_results: list[
-                tuple[int, ToolCall, ToolResult, bool]
-            ] = []
-            accepted_finish: ToolResult | None = None
-            terminal_finish_reasons: tuple[str, ...] = ()
+            batch = ToolBatchState()
             for tool_position, tool_call in enumerate(tool_calls):
                 finish_rejection: tuple[str, ...] = ()
-                tool_effect = self.tool_executor.effect(tool_call.name)
+                tool_effect = self.tool_runner.effect(tool_call.name)
                 if tool_effect == 'workspace_write':
                     mutation_attempted = True
                     change_required = True
@@ -1092,6 +1193,13 @@ class Conversation:
                 ):
                     mutation_recovery_read_used = True
                 yield ToolExecutionStarted(tool_call=tool_call)
+                phase_event = self._transition(
+                    AgentPhase.EXECUTING_TOOLS,
+                    reason=f'executing_tool:{tool_call.name}',
+                    iteration=iteration,
+                )
+                if phase_event is not None:
+                    yield phase_event
                 revision = (
                     self.workspace_tracker.revision
                     if self.workspace_tracker is not None
@@ -1102,81 +1210,35 @@ class Conversation:
                     signature,
                     (0, True),
                 )
-                should_block_repeat = (
-                    tool_call.name != 'finish_task'
-                    and (
-                        previous_count >= self.repeated_tool_limit
-                        or (previous_count >= 1 and not previous_success)
-                    )
-                )
-                finish_mixed = (
-                    tool_call.name == 'finish_task' and len(tool_calls) != 1
-                )
                 semantic_repeat = self.working_state.preflight(
                     tool_call,
                     revision,
                     signature,
                 )
-                if finish_mixed:
-                    result = ToolResult.fail(
-                        'finish_must_be_alone',
-                        'finish_task must be the only tool call in its model '
-                        'response. Complete other actions first, then declare '
-                        'the outcome in a separate response.',
-                    )
-                elif (
-                    action_recovery
-                    and tool_call.name not in request_tool_names
-                ):
-                    result = ToolResult.fail(
-                        'tool_not_available_in_phase',
-                        f'{tool_call.name} is not available during Action '
-                        'Recovery. Use one of the tools included with this '
-                        'request.',
-                        details={
-                            'available_tools': sorted(request_tool_names),
-                        },
-                    )
-                elif (
-                    mutation_failures
-                    and tool_call.name not in request_tool_names
-                ):
-                    result = ToolResult.fail(
-                        'tool_not_available_in_phase',
-                        f'{tool_call.name} is not available after the single '
-                        'Edit Recovery read has been used. Apply one corrected '
-                        'workspace edit using a tool included with this '
-                        'request.',
-                        details={
-                            'available_tools': sorted(request_tool_names),
-                        },
-                    )
-                elif action_read_exhausted:
-                    result = ToolResult.fail(
-                        'action_read_limit_reached',
-                        'Action Recovery permits only one targeted repository '
-                        'read or search. Use the existing evidence and make '
-                        'the workspace edit now.',
-                    )
-                elif semantic_repeat is not None:
-                    result = semantic_repeat
-                elif should_block_repeat:
-                    result = repeated_tool_result(
-                        tool_call,
-                        previous_count,
+                run = await self.tool_runner.execute_checked(
+                    tool_call,
+                    ToolRunPolicy(
+                        tool_count=len(tool_calls),
+                        available_tools=frozenset(request_tool_names),
+                        action_recovery=action_recovery,
+                        mutation_recovery=bool(mutation_failures),
+                        action_read_exhausted=action_read_exhausted,
+                        semantic_repeat=semantic_repeat,
+                        previous_count=previous_count,
                         previous_success=previous_success,
+                        repeated_limit=self.repeated_tool_limit,
+                    ),
+                )
+                result = run.result
+                if run.executed and tool_call.name != 'finish_task':
+                    tool_attempts[signature] = (
+                        previous_count + 1,
+                        result.success,
                     )
-                else:
-                    execution = await self.tool_executor.execute(tool_call)
-                    result = execution.result
-                    if tool_call.name != 'finish_task':
-                        tool_attempts[signature] = (
-                            previous_count + 1,
-                            result.success,
-                        )
                 if tool_call.name == 'finish_task' and result.success:
-                    finish_reasons = await self._finish_rejection_reasons(
+                    finish_reasons = await self.completion_checker.finish_rejection_reasons(
                         result,
+                        working_state=self.working_state,
                         mutation_attempted=mutation_attempted,
                         change_required=change_required,
                         verification=latest_verification,
@@ -1201,7 +1263,7 @@ class Conversation:
                             self._pending_required_change(change_required)
                         )
                         if pending_required_change:
-                            required_change_rejected = True
+                            batch.required_change_rejected = True
                             action_block_events += 1
                         else:
                             completion_blocks += 1
@@ -1218,19 +1280,19 @@ class Conversation:
                             and completion_blocks
                             >= self.max_completion_blocks
                         ):
-                            terminal_finish_reasons = finish_reasons
+                            batch.terminal_finish_reasons = finish_reasons
                     else:
-                        accepted_finish = result
-                evidence_progressed = (
+                        batch.accepted_finish = result
+                batch.evidence_progressed = (
                     self.working_state.observe(
                         tool_call,
                         result,
                         revision,
                         signature,
                     )
-                    or evidence_progressed
+                    or batch.evidence_progressed
                 )
-                tool_results.append((tool_call, result))
+                batch.results.append((tool_call, result))
                 yield ToolExecutionCompleted(
                     tool_call=tool_call,
                     result=result,
@@ -1239,7 +1301,7 @@ class Conversation:
                     reason = result.summary
                     self.task_manager.block((reason,))
                     request_messages.append(
-                        build_tool_result_message(tool_results)
+                        build_tool_result_message(batch.results)
                     )
                     self.messages[:] = request_messages
                     yield TurnCompleted(
@@ -1264,7 +1326,7 @@ class Conversation:
                     yield CompletionBlocked(
                         attempt=(
                             action_block_events
-                            if required_change_rejected
+                            if batch.required_change_rejected
                             else completion_blocks
                         ),
                         reasons=finish_rejection,
@@ -1274,7 +1336,7 @@ class Conversation:
                     change = await self.workspace_tracker.refresh()
                     if change is not None:
                         tool_changed_workspace = True
-                        last_workspace_change_position = tool_position
+                        batch.last_workspace_change_position = tool_position
                         self.working_state.advance_revision(
                             change.revision,
                             change.paths,
@@ -1287,9 +1349,9 @@ class Conversation:
                         )
                 elif tool_effect == 'workspace_write' and result.success:
                     tool_changed_workspace = True
-                    last_workspace_change_position = tool_position
+                    batch.last_workspace_change_position = tool_position
                 if tool_effect == 'workspace_write':
-                    workspace_write_results.append(
+                    batch.workspace_writes.append(
                         (
                             tool_position,
                             tool_call,
@@ -1304,11 +1366,11 @@ class Conversation:
                             evidence=latest_verification
                         )
                 if tool_call.name == 'task_update' and result.success:
-                    task_progressed = True
-            request_messages.append(build_tool_result_message(tool_results))
+                    batch.task_progressed = True
+            request_messages.append(build_tool_result_message(batch.results))
 
-            if terminal_finish_reasons:
-                self.task_manager.stuck(terminal_finish_reasons)
+            if batch.terminal_finish_reasons:
+                self.task_manager.stuck(batch.terminal_finish_reasons)
                 self.messages[:] = request_messages
                 yield TurnCompleted(
                     result=TurnResult(
@@ -1327,19 +1389,19 @@ class Conversation:
                             else ()
                         ),
                         verification=latest_verification,
-                        completion_reasons=terminal_finish_reasons,
+                        completion_reasons=batch.terminal_finish_reasons,
                     )
                 )
                 return
 
-            if accepted_finish is not None:
+            if batch.accepted_finish is not None:
                 declaration_status = str(
-                    accepted_finish.metadata['status']
+                    batch.accepted_finish.metadata['status']
                 )
-                summary = str(accepted_finish.metadata['summary'])
+                summary = str(batch.accepted_finish.metadata['summary'])
                 blocked_reasons = tuple(
                     str(reason)
-                    for reason in accepted_finish.metadata.get(
+                    for reason in batch.accepted_finish.metadata.get(
                         'blocked_reasons',
                         [],
                     )
@@ -1373,7 +1435,7 @@ class Conversation:
                 )
                 return
 
-            workspace_progressed = last_workspace_change_position >= 0
+            workspace_progressed = batch.workspace_progressed
             batch_reverted_to_baseline = (
                 workspace_progressed
                 and self.workspace_tracker is not None
@@ -1397,19 +1459,9 @@ class Conversation:
                 completion_decision_calls = 0
                 completion_ready_context = ''
                 completion_reviewed_paths.clear()
-            pending_write_results = [
-                (call, result)
-                for position, call, result, changed
-                in workspace_write_results
-                if (
-                    position > last_workspace_change_position
-                    and not changed
-                    and not is_tool_protocol_failure(result)
-                )
-            ]
-            if batch_reverted_to_baseline and workspace_write_results:
-                _, last_call, last_result, _ = workspace_write_results[-1]
-                pending_write_results = [(last_call, last_result)]
+            pending_write_results = batch.pending_write_results(
+                reverted_to_baseline=batch_reverted_to_baseline,
+            )
             if pending_write_results:
                 mutation_recovery_read_used = False
                 mutation_failure_count += len(pending_write_results)
@@ -1431,7 +1483,7 @@ class Conversation:
                         mutation_failure_count,
                     )
                 )
-                if workspace_write_results:
+                if batch.workspace_writes:
                     request_messages.append(
                         build_mutation_recovery_feedback(
                             mutation_failures,
@@ -1467,13 +1519,13 @@ class Conversation:
                         )
                     )
                     return
-            protocol_failure = bool(tool_results) and all(
+            protocol_failure = bool(batch.results) and all(
                 is_tool_protocol_failure(result)
-                for _, result in tool_results
+                for _, result in batch.results
             )
             if protocol_failure:
                 tool_protocol_failures += 1
-            elif any(result.success for _, result in tool_results):
+            elif any(result.success for _, result in batch.results):
                 tool_protocol_failures = 0
             pending_required_change = self._pending_required_change(
                 change_required
@@ -1486,7 +1538,7 @@ class Conversation:
                 entered_action_recovery = False
                 if action_recovery:
                     action_recovery_calls += 1
-                elif required_change_rejected:
+                elif batch.required_change_rejected:
                     action_recovery = True
                     action_recovery_calls = 0
                     action_read_used = False
@@ -1547,7 +1599,7 @@ class Conversation:
                     continue
             completion_ready = (
                 not protocol_failure
-                and await self._can_finalize_after_stagnation(
+                and await self.completion_checker.can_finalize_after_stagnation(
                     mutation_attempted=mutation_attempted,
                     verification=latest_verification,
                     mutation_failures=mutation_failures,
@@ -1568,7 +1620,7 @@ class Conversation:
                     synthesis_retries = 0
                     stagnation_final_recovery = False
                 reviewed_now = completion_review_paths(
-                    tool_results,
+                    batch.results,
                     self.workspace_tracker.changed_paths,
                 )
                 new_reviews = reviewed_now - completion_reviewed_paths
@@ -1602,7 +1654,11 @@ class Conversation:
             completion_decision_calls = 0
             completion_ready_context = ''
             completion_reviewed_paths.clear()
-            if workspace_progressed or task_progressed or evidence_progressed:
+            if (
+                workspace_progressed
+                or batch.task_progressed
+                or batch.evidence_progressed
+            ):
                 calls_without_progress = 0
                 force_synthesis = False
                 synthesis_retries = 0
@@ -1613,7 +1669,7 @@ class Conversation:
                     build_tool_protocol_feedback(
                         tool_protocol_failures,
                         self.task_manager.system_suffix(),
-                        tool_results,
+                        batch.results,
                     )
                 )
                 if (
@@ -1687,7 +1743,7 @@ class Conversation:
                         )
                     )
                     continue
-                if await self._can_finalize_after_stagnation(
+                if await self.completion_checker.can_finalize_after_stagnation(
                     mutation_attempted=mutation_attempted,
                     verification=latest_verification,
                     mutation_failures=mutation_failures,
@@ -1779,8 +1835,7 @@ class Conversation:
             return self.workspace_tracker is not None
         return bool(
             (
-                self.completion_gate is not None
-                and self.completion_gate.policy.require_changes
+                self.completion_checker.requires_changes
             )
             or (
                 self.workspace_tracker is not None
@@ -1805,255 +1860,6 @@ class Conversation:
             and getattr(tracker, 'available', True)
             and not tracker.changed_paths
         )
-
-    def _action_recovery_tools(
-        self,
-        *,
-        read_available: bool,
-        include_finish: bool = True,
-    ) -> list[dict[str, Any]] | None:
-        if self.registry is None or self.tools is None:
-            return self.tools
-        selected: list[dict[str, Any]] = []
-        for definition in self.tools:
-            name = str(definition.get('name', ''))
-            if (
-                (read_available and name in ACTION_RECOVERY_READ_TOOLS)
-                or (include_finish and name == 'finish_task')
-                or (
-                    self.tool_executor is not None
-                    and self.tool_executor.effect(name) == 'workspace_write'
-                    and name not in ACTION_RECOVERY_EXCLUDED_WRITE_TOOLS
-                )
-            ):
-                selected.append(definition)
-        return selected
-
-    def _mutation_recovery_tools(
-        self,
-        failures: list[dict[str, Any]],
-        *,
-        read_available: bool,
-        include_finish: bool = False,
-    ) -> list[dict[str, Any]] | None:
-        latest = failures[-1] if failures else {}
-        if latest.get('code') != 'parent_not_found':
-            return self._action_recovery_tools(
-                read_available=read_available,
-                include_finish=include_finish,
-            )
-        if self.registry is None or self.tools is None:
-            return self.tools
-        failed_write_tools = {
-            str(failure.get('tool', ''))
-            for failure in failures
-            if str(failure.get('code', '')) == 'parent_not_found'
-        }
-        allowed = {
-            'create_directory',
-            *(
-                failed_write_tools
-                & {'apply_patch', 'write_file', 'write_file_chunk'}
-            ),
-        }
-        if not allowed & {'apply_patch', 'write_file', 'write_file_chunk'}:
-            allowed.update({'write_file', 'write_file_chunk', 'apply_patch'})
-        if read_available:
-            allowed.add('list_directory')
-        return [
-            definition
-            for definition in self.tools
-            if str(definition.get('name', '')) in allowed
-        ]
-
-    async def _finish_rejection_reasons(
-        self,
-        result: ToolResult,
-        *,
-        mutation_attempted: bool,
-        change_required: bool,
-        verification: VerificationEvidence | None,
-    ) -> tuple[str, ...]:
-        metadata = result.metadata
-        if metadata.get('status') == 'blocked':
-            if self.working_state.has_external_blocker:
-                return ()
-            return (
-                'blocked is reserved for an external condition that requires '
-                'user action, permission, credentials, or an unavailable '
-                'dependency. Repeated reads, malformed arguments, lack of '
-                'progress, and ForgeCode recovery guidance are not blockers; '
-                'continue with the available tools.',
-            )
-        task_kind = str(metadata.get('task_kind', ''))
-        reasons: list[str] = []
-        changed_paths = (
-            self.workspace_tracker.changed_paths
-            if self.workspace_tracker is not None
-            else ()
-        )
-        if change_required and task_kind != 'change' and not changed_paths:
-            reasons.append(
-                'This turn requires a real task-local workspace change. '
-                'Inspection or answer completion cannot satisfy it while '
-                'the task-local Diff is empty.'
-            )
-        if task_kind == 'inspection' and not self.working_state.evidence_paths:
-            reasons.append(
-                'An inspection task requires repository evidence from '
-                'read_file, list_directory, grep, or find_files.'
-            )
-        if task_kind != 'change' and changed_paths:
-            reasons.append(
-                'The workspace changed during this turn; declare '
-                'task_kind=change and provide current verification evidence.'
-            )
-        if task_kind == 'change':
-            if self.workspace_tracker is None or self.completion_gate is None:
-                reasons.append(
-                    'Workspace tracking is unavailable, so a change outcome '
-                    'cannot be verified.'
-                )
-            else:
-                decision = await self.completion_gate.evaluate(
-                    self.workspace_tracker,
-                    verification,
-                    mutation_attempted=True,
-                )
-                reasons.extend(decision.reasons)
-        elif mutation_attempted and not changed_paths:
-            reasons.append(
-                'A workspace write was attempted but produced no final Diff; '
-                'continue or declare the task blocked.'
-            )
-        return tuple(dict.fromkeys(reasons))
-
-    def _request_system_prompt(
-        self,
-        *,
-        force_synthesis: bool = False,
-        mutation_recovery_context: str = '',
-        finalization_recovery: bool = False,
-        stagnation_final_recovery: bool = False,
-        token_limit_recovery: bool = False,
-        completion_ready_context: str = '',
-        change_required: bool = False,
-        mutation_attempted: bool = False,
-        action_recovery: bool = False,
-        action_recovery_calls: int = 0,
-        action_read_used: bool = False,
-    ) -> str:
-        prompt = self._system_prompt_with_task(
-            include_tool_availability=not (
-                finalization_recovery
-                or stagnation_final_recovery
-                or token_limit_recovery
-            ),
-        )
-        if self._last_repository_context:
-            prompt += '\n\n' + self._last_repository_context
-        if change_required:
-            prompt += '\n\n' + render_change_contract_context(
-                (
-                    self.workspace_tracker.changed_paths
-                    if self.workspace_tracker is not None
-                    else ()
-                ),
-                mutation_attempted=mutation_attempted,
-            )
-        if mutation_recovery_context:
-            prompt += '\n\n' + mutation_recovery_context
-        if completion_ready_context:
-            prompt += '\n\n' + completion_ready_context
-        if finalization_recovery:
-            prompt += (
-                '\n\n[ForgeCode Finalization Recovery]\n'
-                'The current workspace revision already has a real Diff and '
-                'current successful verification. This is a dedicated final '
-                'synthesis request, so no tools are included. Return one '
-                'concise final answer in the user\'s language based only on '
-                'the collected evidence. State what changed and the exact '
-                'verification performed. Be honest about anything that was '
-                'not semantically or visually verified. Do not request or '
-                'describe another tool call.'
-            )
-        elif stagnation_final_recovery:
-            prompt += (
-                '\n\n[ForgeCode Stagnation Final Recovery]\n'
-                'The previous tool-enabled attempts did not produce new '
-                'workspace, plan, or repository evidence. This is one '
-                'dedicated final recovery request with no tools included. '
-                'Return the best concise answer possible in the user\'s '
-                'language using only the existing conversation and repository '
-                'evidence. If the goal cannot be completed from the collected '
-                'evidence, state the blocker and the most specific next '
-                'action a future tool-enabled turn should take. Do not '
-                'request or describe another tool call.'
-            )
-        elif token_limit_recovery:
-            prompt += (
-                '\n\n[ForgeCode Token-Limit Recovery]\n'
-                'The current user turn reached its cumulative input-token '
-                'safety threshold. This is one dedicated final recovery '
-                'request with no tools included. Return a concise progress '
-                'summary in the user\'s language using only existing '
-                'conversation and repository evidence. State what was done, '
-                'what remains, any verification already performed, and the '
-                'specific next step a future turn should take. Do not request '
-                'or describe another tool call.'
-            )
-        elif action_recovery:
-            prompt += '\n\n' + render_action_recovery_context(
-                action_recovery_calls,
-                self.action_recovery_limit,
-                read_used=action_read_used,
-            )
-        elif force_synthesis:
-            prompt += (
-                '\n\n[ForgeCode Recovery Checkpoint]\n'
-                'Recent actions did not produce new evidence or workspace '
-                'changes. All listed tools remain available. Reassess the '
-                'root goal and existing evidence, then choose a materially '
-                'different action. Paths marked as fully covered already have '
-                'model-visible or replayable evidence, so do not re-read them '
-                'with different line ranges. If your judgment is that the '
-                'user goal requires a code change and the Diff is still empty, '
-                'use an editing tool once the relevant code is understood. '
-                'If exact evidence is missing, perform one targeted search. '
-                'If the goal is already satisfied, return a concise final '
-                'answer or call finish_task. Do not claim that ForgeCode '
-                'paused repository tools.'
-            )
-        return prompt
-
-    async def _can_finalize_after_stagnation(
-        self,
-        *,
-        mutation_attempted: bool,
-        verification: VerificationEvidence | None,
-        mutation_failures: list[dict[str, Any]],
-    ) -> bool:
-        '''Enter synthesis only for a mechanically complete current revision.'''
-        tracker = self.workspace_tracker
-        gate = self.completion_gate
-        if (
-            tracker is None
-            or gate is None
-            or not tracker.changed_paths
-            or mutation_failures
-        ):
-            return False
-        task = self.task_manager.active
-        if task is not None and task.planned and any(
-            step.status != 'completed' for step in task.steps
-        ):
-            return False
-        decision = await gate.evaluate(
-            tracker,
-            verification,
-            mutation_attempted=mutation_attempted,
-        )
-        return decision.allowed
 
     async def compact(self) -> CompactionReport:
         '''Manually summarize committed history for the /compact command.'''
@@ -2173,7 +1979,7 @@ class Conversation:
         )
 
     def save_session(self) -> str:
-        snapshot = self.session_store.save(
+        snapshot = self.session_manager.save(
             self.messages,
             session_id=self.session_id,
             active_task=self.task_manager.active,
@@ -2184,11 +1990,7 @@ class Conversation:
         return snapshot.id
 
     def resume_session(self, session_id: str | None = None) -> str:
-        snapshot = (
-            self.session_store.load(session_id)
-            if session_id is not None
-            else self.session_store.load_current()
-        )
+        snapshot = self.session_manager.load(session_id)
         self.messages[:] = snapshot.messages
         self.session_id = snapshot.id
         self.task_manager.active = snapshot.active_task
@@ -2206,194 +2008,7 @@ class Conversation:
         )
 
     def session_history(self) -> str:
-        sessions = self.session_store.list()
-        if not sessions:
-            return 'No saved sessions.'
-        lines = []
-        for snapshot in sessions[:20]:
-            task = (
-                snapshot.active_task.goal
-                if snapshot.active_task is not None
-                else ''
-            )
-            suffix = f' — {task[:80]}' if task else ''
-            lines.append(
-                f'- {snapshot.id} [{len(snapshot.messages)} messages] '
-                f'{snapshot.updated_at}{suffix}'
-            )
-        return '\n'.join(lines)
-
-
-def build_assistant_message(
-    text: str,
-    tool_calls: list[ToolCall],
-) -> dict[str, Any]:
-    '''Build model-visible assistant history from a completed response.'''
-    if not tool_calls:
-        return {'role': 'assistant', 'content': text}
-
-    content: list[dict[str, Any]] = []
-    if text:
-        content.append({'type': 'text', 'text': text})
-    content.extend(
-        {
-            'type': 'tool_use',
-            'id': call.id,
-            'name': call.name,
-            'input': call.arguments,
-        }
-        for call in sorted(tool_calls, key=lambda call: call.index)
-    )
-    return {'role': 'assistant', 'content': content}
-
-
-def build_tool_result_message(
-    tool_results: list[tuple[ToolCall, ToolResult]],
-) -> dict[str, Any]:
-    '''Build one user message containing ordered Anthropic tool results.'''
-    content: list[dict[str, Any]] = []
-    for tool_call, result in tool_results:
-        content.append(
-            {
-                'type': 'tool_result',
-                'tool_use_id': tool_call.id,
-                'content': serialize_tool_result(result),
-                'is_error': not result.success,
-            }
-        )
-    return {'role': 'user', 'content': content}
-
-
-def append_background_notification_message(
-    messages: list[dict[str, Any]],
-    notifications: tuple[str, ...],
-) -> None:
-    message = build_background_notification_message(notifications)
-    if not messages or messages[-1].get('role') != 'user':
-        messages.append(message)
-        return
-    existing = messages[-1].get('content')
-    if isinstance(existing, str):
-        messages[-1]['content'] = [
-            {'type': 'text', 'text': existing},
-            *message['content'],
-        ]
-        return
-    if isinstance(existing, list):
-        existing.extend(message['content'])
-        return
-    messages.append(message)
-
-
-def append_team_notification_message(
-    messages: list[dict[str, Any]],
-    notifications: tuple[str, ...],
-) -> None:
-    message = build_team_notification_message(notifications)
-    if not messages or messages[-1].get('role') != 'user':
-        messages.append(message)
-        return
-    existing = messages[-1].get('content')
-    if isinstance(existing, str):
-        messages[-1]['content'] = [
-            {'type': 'text', 'text': existing},
-            *message['content'],
-        ]
-        return
-    if isinstance(existing, list):
-        existing.extend(message['content'])
-        return
-    messages.append(message)
-
-
-def build_team_notification_message(
-    notifications: tuple[str, ...],
-) -> dict[str, Any]:
-    '''Build one user message containing collected team messages.'''
-    return {
-        'role': 'user',
-        'content': [
-            {'type': 'text', 'text': notification}
-            for notification in notifications
-        ],
-    }
-
-
-def build_background_notification_message(
-    notifications: tuple[str, ...],
-) -> dict[str, Any]:
-    '''Build one user message containing background completion notices.'''
-    return {
-        'role': 'user',
-        'content': [
-            {'type': 'text', 'text': notification}
-            for notification in notifications
-        ],
-    }
-
-
-def serialize_tool_result(result: ToolResult) -> str:
-    '''Serialize the stable ToolResult contract for model consumption.'''
-    error = None
-    if result.error is not None:
-        error = {
-            'code': result.error.code,
-            'message': result.error.message,
-            'details': result.error.details,
-        }
-    return json.dumps(
-        {
-            'success': result.success,
-            'summary': result.summary,
-            'content': result.content,
-            'error': error,
-            'metadata': result.metadata,
-        },
-        ensure_ascii=False,
-        default=str,
-    )
-
-
-def verification_from_result(
-    result: ToolResult,
-) -> VerificationEvidence | None:
-    '''Build stable evidence from one verify ToolResult metadata payload.'''
-    metadata = result.metadata
-    if metadata.get('verification') is not True:
-        return None
-    try:
-        return VerificationEvidence(
-            command=str(metadata['command']),
-            cwd=str(metadata['cwd']),
-            exit_code=int(metadata['exit_code']),
-            duration_seconds=float(metadata['duration_seconds']),
-            timed_out=bool(metadata['timed_out']),
-            workspace_revision=int(metadata['workspace_revision']),
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def build_completion_feedback(
-    reasons: tuple[str, ...],
-    *,
-    task_context: str = '',
-) -> dict[str, Any]:
-    '''Tell the model exactly why its final answer was not accepted.'''
-    details = '\n'.join(f'- {reason}' for reason in reasons)
-    return {
-        'role': 'user',
-        'content': (
-            f'{task_context}\n\n'
-            'ForgeCode completion check rejected the previous final answer.\n'
-            f'{details}\n'
-            'The tools are still available. Continue using them, then provide '
-            'a new final answer after every condition is satisfied. If '
-            'verification is missing, call verify with the relevant test or '
-            'build command; use git diff --check only when the project has no '
-            'more specific validation command.'
-        ),
-    }
+        return self.session_manager.history()
 
 
 def tool_call_signature(tool_call: ToolCall, revision: int) -> str:
@@ -2408,41 +2023,11 @@ def tool_call_signature(tool_call: ToolCall, revision: int) -> str:
     return f'{revision}:{tool_call.name}:{arguments}'
 
 
-def repeated_tool_result(
-    tool_call: ToolCall,
-    previous_count: int,
-    *,
-    previous_success: bool,
-) -> ToolResult:
-    '''Return actionable feedback without executing a known repeat.'''
-    cause = (
-        'the previous identical call failed'
-        if not previous_success
-        else f'it already ran {previous_count} times'
-    )
-    return ToolResult.fail(
-        'repeated_tool_call',
-        (
-            f'Skipped repeated {tool_call.name} call because {cause}. '
-            'Use the existing result, change the arguments, or choose a '
-            'different next action.'
-        ),
-        details={
-            'tool': tool_call.name,
-            'arguments': tool_call.arguments,
-            'previous_count': previous_count,
-            'previous_success': previous_success,
-        },
-    )
-
-
 def required_change_block_reason() -> str:
     return (
         'This turn requires a real task-local workspace change, but no file '
         'differs from the workspace snapshot captured when the turn began.'
     )
-
-
 def render_mcp_status(root: Path, tool_names: tuple[str, ...]) -> str:
     config_path = root / '.forge' / 'mcp.json'
     if not config_path.is_file():
@@ -2533,551 +2118,4 @@ def render_interaction_mode_context(mode: InteractionMode) -> str:
     )
 
 
-def render_change_contract_context(
-    changed_paths: tuple[str, ...],
-    *,
-    mutation_attempted: bool,
-) -> str:
-    paths = ', '.join(changed_paths) if changed_paths else 'none'
-    attempted = 'yes' if mutation_attempted else 'no'
-    return (
-        '[ForgeCode Turn Change Contract]\n'
-        'The user requested an implemented workspace change; an explanation '
-        'or inspection alone cannot complete this turn.\n'
-        f'- task-local changed paths: {paths}\n'
-        f'- workspace write attempted: {attempted}\n'
-        'Only a file revision after the turn baseline satisfies this '
-        'contract. Git HEAD changes or untracked files that already existed '
-        'when the turn began are background context, not work completed in '
-        'this turn.'
-    )
 
-
-def render_action_recovery_context(
-    recovery_calls: int,
-    maximum: int,
-    *,
-    read_used: bool,
-) -> str:
-    next_action = (
-        'The one targeted repository read/search has already been used. '
-        'Use the existing evidence and call a workspace editing tool now.'
-        if read_used
-        else (
-            'If one exact code location is still missing, you may use one '
-            'targeted read_file or grep call. Otherwise edit immediately.'
-        )
-    )
-    return (
-        '[ForgeCode Action Recovery]\n'
-        'Investigation has consumed its bounded budget while the task-local '
-        'Diff is still empty. This is a focused action phase. Use an editing '
-        'tool now if the relevant code is understood. '
-        f'{next_action} Broad diagnostics, process commands, Git inspection, '
-        'verification, and task planning '
-        'are intentionally unavailable until a real workspace revision is '
-        'created. A preexisting Git Diff does not satisfy this turn. '
-        'finish_task is valid only for a genuine external blocker.\n'
-        f'Focused calls used: {recovery_calls}/{maximum}.'
-    )
-
-
-def build_action_recovery_feedback(
-    task_context: str,
-    recovery_calls: int,
-    maximum: int,
-    *,
-    read_used: bool,
-) -> dict[str, Any]:
-    return {
-        'role': 'user',
-        'content': (
-            f'{task_context}\n\n'
-            f'{render_action_recovery_context(
-                recovery_calls,
-                maximum,
-                read_used=read_used,
-            )}'
-        ),
-    }
-
-
-def action_recovery_stuck_reason(recovery_calls: int) -> str:
-    return (
-        f'Action Recovery stopped after {recovery_calls} focused model calls '
-        'without a task-local workspace revision, although this turn '
-        'requires a change.'
-    )
-
-
-def build_stagnation_feedback(
-    calls_without_progress: int,
-    task_context: str,
-    working_context: str,
-) -> dict[str, Any]:
-    '''Remind the model to change strategy while preserving the active goal.'''
-    return {
-        'role': 'user',
-        'content': (
-            f'{task_context}\n\n{working_context}\n\n'
-            'ForgeCode progress check: '
-            f'{calls_without_progress} model calls have passed since the '
-            'last new workspace, task-plan, or repository evidence. All '
-            'tools remain available. Reassess the root goal, use existing '
-            'evidence, and choose a materially different next action. Do not '
-            're-read paths already marked as fully covered. If the task needs '
-            'a code change and the Diff is empty, edit the relevant code after '
-            'you understand it; otherwise perform one targeted search for the '
-            'specific missing fact. Do not repeat an unchanged failing action '
-            'or claim tools are paused.'
-        ),
-    }
-
-
-def build_stagnation_final_recovery_feedback(
-    task_context: str,
-    working_context: str,
-    calls_without_progress: int,
-) -> dict[str, Any]:
-    return {
-        'role': 'user',
-        'content': (
-            f'{task_context}\n\n{working_context}\n\n'
-            '[ForgeCode Stagnation Final Recovery]\n'
-            f'{calls_without_progress} model calls have passed without new '
-            'workspace, plan, or repository evidence. The next request will '
-            'include no tools. Return the best concise answer possible from '
-            'the evidence already in context. If the goal is not actually '
-            'complete, say what blocked completion and the exact next action '
-            'that should be taken in a future tool-enabled turn. Do not '
-            'request another tool call.'
-        ),
-    }
-
-
-def build_token_limit_recovery_feedback(
-    reason: str,
-    task_context: str,
-    working_context: str,
-) -> dict[str, Any]:
-    return {
-        'role': 'user',
-        'content': (
-            f'{task_context}\n\n{working_context}\n\n'
-            '[ForgeCode Token-Limit Recovery]\n'
-            f'{reason} The next request will include no tools. Return a '
-            'concise user-facing progress summary from the evidence already '
-            'in context. Include what was completed, what remains, any '
-            'verification already performed, and the exact next action for a '
-            'future tool-enabled turn. Do not request another tool call.'
-        ),
-    }
-
-
-def completion_review_paths(
-    tool_results: list[tuple[ToolCall, ToolResult]],
-    changed_paths: tuple[str, ...],
-) -> set[str]:
-    '''Return changed paths covered by a successful, non-empty Git Diff.'''
-    changed = {
-        path.replace('\\', '/')
-        for path in changed_paths
-    }
-    reviewed: set[str] = set()
-    for tool_call, result in tool_results:
-        if (
-            tool_call.name != 'git_diff'
-            or not result.success
-            or not result.content.strip()
-        ):
-            continue
-        path = result.metadata.get('path')
-        if path is None:
-            reviewed.update(changed)
-            continue
-        normalized = str(path).replace('\\', '/')
-        if normalized in changed:
-            reviewed.add(normalized)
-    return reviewed
-
-
-def render_completion_ready_context(
-    changed_paths: tuple[str, ...],
-    verification: VerificationEvidence | None,
-    decision_calls: int,
-    decision_limit: int,
-    reviewed_paths: set[str],
-) -> str:
-    '''Persist the mechanically complete revision and decision budget.'''
-    changed = ', '.join(changed_paths)
-    reviewed = ', '.join(sorted(reviewed_paths)) or 'none'
-    verification_status = (
-        f'{verification.command} @ revision {verification.workspace_revision}'
-        if verification is not None
-        else 'not required / not run'
-    )
-    remaining = max(decision_limit - decision_calls, 0)
-    return (
-        '[ForgeCode Completion Ready]\n'
-        f'changed paths: {changed}\n'
-        f'current verification: {verification_status}\n'
-        f'reviewed Diff paths: {reviewed}\n'
-        f'decision calls remaining: {remaining}\n'
-        'Deterministic completion checks pass for the current revision. '
-        'All tools listed in this request remain available, but open-ended '
-        'discovery is no longer useful. Decide whether the user goal is '
-        'satisfied. If it is, return the final answer or call finish_task '
-        'alone. If it is not, make one concrete workspace edit based on the '
-        'existing evidence, then verify the new revision. You may call one '
-        'scoped git_diff only for a changed path not already reviewed.'
-    )
-
-
-def build_finalization_recovery_feedback(
-    task_context: str,
-    working_context: str,
-    changed_paths: tuple[str, ...],
-    verification: VerificationEvidence | None,
-) -> dict[str, Any]:
-    '''Request one bounded, tool-free synthesis after a ready-state loop.'''
-    verification_status = (
-        f'{verification.command} @ revision {verification.workspace_revision}'
-        if verification is not None
-        else 'not required / not run'
-    )
-    changed = ', '.join(changed_paths)
-    return {
-        'role': 'user',
-        'content': (
-            f'{task_context}\n\n{working_context}\n\n'
-            '[ForgeCode Finalization Recovery]\n'
-            'The current revision passed every deterministic completion '
-            'check, but the trajectory continued diagnostics without another '
-            'workspace change. The next request is a dedicated final '
-            'synthesis with no tools. Return a concise final answer in the '
-            'user\'s language. Summarize the actual changed paths '
-            f'({changed}) and verification '
-            f'({verification_status}). State any semantic or visual '
-            'limitation honestly. Do not request another tool call.'
-        ),
-    }
-
-
-def mutation_failure_record(
-    tool_call: ToolCall,
-    result: ToolResult,
-) -> dict[str, Any]:
-    '''Keep bounded, actionable evidence for a write that changed nothing.'''
-    error_code = (
-        result.error.code
-        if result.error is not None
-        else 'no_workspace_change'
-    )
-    message = (
-        result.error.message
-        if result.error is not None
-        else (
-            'The tool reported success, but the task-local workspace '
-            'revision did not change.'
-        )
-    )
-    diagnostic = result.content.strip()
-    if len(diagnostic) > 2_000:
-        diagnostic = (
-            diagnostic[:1_000]
-            + '\n...[diagnostic shortened]...\n'
-            + diagnostic[-1_000:]
-        )
-    return {
-        'tool': tool_call.name,
-        'code': error_code,
-        'message': message,
-        'targets': list(mutation_target_paths(tool_call)),
-        'diagnostic': diagnostic,
-    }
-
-
-def mutation_target_paths(tool_call: ToolCall) -> tuple[str, ...]:
-    '''Extract only path evidence, never the potentially large write body.'''
-    paths: list[str] = []
-    direct_path = tool_call.arguments.get('path')
-    if isinstance(direct_path, str) and direct_path.strip():
-        paths.append(direct_path.strip().replace('\\', '/'))
-    patch = tool_call.arguments.get('patch')
-    if isinstance(patch, str):
-        prefixes = (
-            '*** Update File:',
-            '*** Add File:',
-            '*** Delete File:',
-            '*** Move to:',
-            '+++ b/',
-            '--- a/',
-        )
-        for line in patch.splitlines():
-            stripped = line.strip()
-            prefix = next(
-                (
-                    candidate
-                    for candidate in prefixes
-                    if stripped.startswith(candidate)
-                ),
-                None,
-            )
-            if prefix is None:
-                continue
-            path = stripped[len(prefix):].strip().replace('\\', '/')
-            if path and path != '/dev/null':
-                paths.append(path)
-    return tuple(dict.fromkeys(paths))[:5]
-
-
-def render_mutation_recovery_context(
-    failures: list[dict[str, Any]],
-    failure_count: int,
-) -> str:
-    '''Render durable failure state outside compactable chat history.'''
-    lines = [
-        '[Failed Mutation Recovery]',
-        f'failed workspace writes: {failure_count}',
-    ]
-    for failure in failures:
-        targets = ', '.join(failure['targets']) or 'unknown target'
-        tool = failure['tool']
-        code = failure['code']
-        message = failure['message']
-        lines.append(f'- {tool} [{code}] on {targets}: {message}')
-        diagnostic = str(failure.get('diagnostic', '')).strip()
-        if diagnostic:
-            lines.append(f'  diagnostic: {diagnostic}')
-    lines.append(
-        mutation_recovery_instruction(failures)
-    )
-    lines.append(
-        'apply_patch accepts unified diff and Begin Patch; use replace_text '
-        'for an exact change. Only a real workspace revision clears this.'
-    )
-    return '\n'.join(lines)
-
-
-def mutation_recovery_instruction(
-    failures: list[dict[str, Any]],
-) -> str:
-    latest = failures[-1] if failures else {}
-    if latest.get('code') == 'parent_not_found':
-        parents = parent_directories_from_failures(failures)
-        parent_text = ', '.join(parents) if parents else 'the missing parent'
-        return (
-            'The latest failure is parent_not_found. Do not retry another '
-            'file write first. Call create_directory for '
-            f'{parent_text}, then retry the original file write. Do not '
-            'restart broad discovery, use placeholder writes, or patch '
-            'unrelated files.'
-        )
-    return (
-        'All normal tools remain available. Do not restart broad discovery. '
-        'If the latest diagnostic includes Closest current text, copy it '
-        'verbatim as the next old_text and do not re-read that region. Only '
-        'when no exact candidate is supplied, make one targeted read before '
-        'retrying a smaller corrected edit.'
-    )
-
-
-def parent_directories_from_failures(
-    failures: list[dict[str, Any]],
-) -> tuple[str, ...]:
-    parents: list[str] = []
-    for failure in failures:
-        if failure.get('code') != 'parent_not_found':
-            continue
-        for target in failure.get('targets', []):
-            if not isinstance(target, str) or not target.strip():
-                continue
-            normalized = target.strip().replace('\\', '/')
-            parent = PurePosixPath(normalized).parent.as_posix()
-            if parent and parent != '.':
-                parents.append(parent)
-    return tuple(dict.fromkeys(parents))[:5]
-
-
-def build_mutation_recovery_feedback(
-    failures: list[dict[str, Any]],
-    failure_count: int,
-    task_context: str,
-) -> dict[str, Any]:
-    '''Put the recovery checkpoint after a failed write result.'''
-    context = render_mutation_recovery_context(
-        failures,
-        failure_count,
-    )
-    return {
-        'role': 'user',
-        'content': f'{task_context}\n\n{context}',
-    }
-
-
-def mutation_recovery_stuck_reason(
-    failures: list[dict[str, Any]],
-    failure_count: int,
-) -> str:
-    latest = failures[-1] if failures else {}
-    tool = str(latest.get('tool', 'workspace tool'))
-    code = str(latest.get('code', 'no_workspace_change'))
-    return (
-        f'Stopped after {failure_count} workspace-write attempt(s) failed '
-        'to change the task workspace; the Edit Recovery failure limit was '
-        f'reached. Latest failure: {tool} [{code}].'
-    )
-
-
-def is_tool_protocol_failure(result: ToolResult) -> bool:
-    '''Return whether every failure came from the tool-call protocol.'''
-    return (
-        not result.success
-        and result.error is not None
-        and result.error.code in {
-            'invalid_arguments',
-            'unknown_tool',
-            'finish_must_be_alone',
-            'unsupported_shell_syntax',
-            'invalid_pattern',
-            'patch_contains_read_line_numbers',
-            'git_diff_path_is_directory',
-            'tool_not_available_in_phase',
-            'action_read_limit_reached',
-            'todo_required',
-        }
-    )
-
-
-def build_tool_protocol_feedback(
-    failures: int,
-    task_context: str,
-    tool_results: list[tuple[ToolCall, ToolResult]] | None = None,
-) -> dict[str, Any]:
-    diagnostics: list[str] = []
-    for tool_call, result in tool_results or ():
-        if result.error is None:
-            continue
-        message = result.error.message
-        if len(message) > 1_500:
-            message = f'{message[:1_497]}...'
-        diagnostics.append(f'- {tool_call.name}: {message}')
-    rendered_diagnostics = (
-        '\nExact rejection(s):\n' + '\n'.join(diagnostics) + '\n'
-        if diagnostics
-        else ''
-    )
-    return {
-        'role': 'user',
-        'content': (
-            f'{task_context}\n\n'
-            'The previous tool request was rejected at the argument/schema '
-            'boundary. This does not mean the repository task is blocked. '
-            f'{rendered_diagnostics}'
-            'Follow the exact recovery instruction above, change the '
-            'arguments materially, and retry with valid JSON or choose '
-            'another tool. Do not repeat the rejected payload. '
-            f'Protocol recovery count: {failures}.'
-        ),
-    }
-
-
-def build_synthesis_retry_feedback(
-    task_context: str,
-    working_context: str,
-) -> dict[str, Any]:
-    return {
-        'role': 'user',
-        'content': (
-            f'{task_context}\n\n{working_context}\n\n'
-            'ForgeCode rejected the previous synthesis because it did not '
-            'reference collected repository evidence. All tools remain '
-            'available. Answer the current goal using the working evidence, '
-            'or gather genuinely missing evidence before answering.'
-        ),
-    }
-
-
-def build_output_continuation_feedback(
-    *,
-    attempt: int,
-    maximum: int,
-) -> dict[str, str]:
-    '''Ask the model to continue preserved text without repeating it.'''
-    return {
-        'role': 'user',
-        'content': (
-            'The previous response reached the output token limit. The text '
-            'already generated has been preserved. Continue directly from '
-            'where it stopped without repeating earlier content, and finish '
-            'concisely. If work remains, use the available tools instead of '
-            'printing large code blocks. '
-            f'Continuation attempt {attempt} of {maximum}.'
-        ),
-    }
-
-
-def build_protocol_recovery_feedback(
-    error: ModelProtocolError,
-    *,
-    attempt: int,
-    maximum: int,
-    available_tools: tuple[str, ...],
-) -> list[dict[str, Any]]:
-    '''Represent a rejected response and request one smaller valid retry.'''
-    tool = f' for tool {error.tool_name!r}' if error.tool_name else ''
-    if error.reason == 'output_truncated':
-        problem = 'The previous response reached the max_tokens limit.'
-    elif error.reason == 'unavailable_tool':
-        problem = f'The previous response requested unavailable tool{tool}.'
-    else:
-        problem = f'The previous tool call{tool} had invalid arguments.'
-    available = (
-        ', '.join(available_tools) if available_tools else 'none'
-    )
-    retry_limit = 4_000 if attempt == 1 else 2_000
-    retry_strategy = (
-        'Modify only one function or one file section.'
-        if attempt == 1
-        else (
-            'Create only a minimal skeleton. Keep HTML, CSS, and JavaScript '
-            'in separate tool calls.'
-        )
-    )
-    return [
-        {
-            'role': 'assistant',
-            'content': '[ForgeCode rejected an invalid model response.]',
-        },
-        {
-            'role': 'user',
-            'content': (
-                f'{problem}\nError: {error}\n'
-                'No tool was executed and no file was changed by that '
-                f'response. Available tools: {available}. For a small complete '
-                f'file, use write_file with at most {retry_limit} characters. '
-                'For a '
-                'focused exact change, use replace_text. For structured edits, '
-                f'use apply_patch with at most {retry_limit} characters. '
-                f'{retry_strategy} Split large '
-                'HTML, CSS, or JavaScript across multiple calls and do not '
-                'repeat the same invalid arguments.\n'
-                f'Recovery attempt {attempt} of {maximum}.'
-            ),
-        },
-    ]
-
-
-def add_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
-    '''Add exact usage from separate model requests in one user turn.'''
-    return TokenUsage(
-        input_tokens=left.input_tokens + right.input_tokens,
-        output_tokens=left.output_tokens + right.output_tokens,
-        cache_creation_input_tokens=(
-            left.cache_creation_input_tokens
-            + right.cache_creation_input_tokens
-        ),
-        cache_read_input_tokens=(
-            left.cache_read_input_tokens + right.cache_read_input_tokens
-        ),
-    )

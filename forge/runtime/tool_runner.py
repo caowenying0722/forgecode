@@ -1,0 +1,187 @@
+'''Tool execution role used by the Agent Loop orchestration layer.'''
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from forge.runtime.state import ToolCall
+from forge.runtime.tool_executor import ToolExecutionRecord, ToolExecutor
+from forge.tools.base import ToolResult
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRunPolicy:
+    tool_count: int
+    available_tools: frozenset[str]
+    action_recovery: bool = False
+    mutation_recovery: bool = False
+    action_read_exhausted: bool = False
+    semantic_repeat: ToolResult | None = None
+    previous_count: int = 0
+    previous_success: bool = True
+    repeated_limit: int = 2
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRunResult:
+    result: ToolResult
+    executed: bool
+
+
+@dataclass(slots=True)
+class ToolBatchState:
+    '''All mutable observations produced by one model tool-call batch.'''
+
+    results: list[tuple[ToolCall, ToolResult]] = field(default_factory=list)
+    workspace_writes: list[
+        tuple[int, ToolCall, ToolResult, bool]
+    ] = field(default_factory=list)
+    last_workspace_change_position: int = -1
+    task_progressed: bool = False
+    evidence_progressed: bool = False
+    required_change_rejected: bool = False
+    accepted_finish: ToolResult | None = None
+    terminal_finish_reasons: tuple[str, ...] = ()
+
+    @property
+    def workspace_progressed(self) -> bool:
+        return self.last_workspace_change_position >= 0
+
+    def pending_write_results(
+        self,
+        *,
+        reverted_to_baseline: bool,
+    ) -> list[tuple[ToolCall, ToolResult]]:
+        pending = [
+            (call, result)
+            for position, call, result, changed in self.workspace_writes
+            if (
+                position > self.last_workspace_change_position
+                and not changed
+                and not is_tool_protocol_failure(result)
+            )
+        ]
+        if reverted_to_baseline and self.workspace_writes:
+            _, call, result, _ = self.workspace_writes[-1]
+            return [(call, result)]
+        return pending
+
+
+class ToolRunner:
+    '''Run validated calls through the shared policy and logging boundary.'''
+
+    def __init__(self, executor: ToolExecutor) -> None:
+        self.executor = executor
+
+    def effect(self, name: str):
+        return self.executor.effect(name)
+
+    async def execute(self, tool_call: ToolCall) -> ToolExecutionRecord:
+        return await self.executor.execute(tool_call)
+
+    async def execute_checked(
+        self,
+        tool_call: ToolCall,
+        policy: ToolRunPolicy,
+    ) -> ToolRunResult:
+        '''Apply phase/repetition guards, then cross the execution boundary.'''
+        if tool_call.name == 'finish_task' and policy.tool_count != 1:
+            return synthetic_failure(
+                'finish_must_be_alone',
+                'finish_task must be the only tool call in its model response. '
+                'Complete other actions first, then declare the outcome in a '
+                'separate response.',
+            )
+        if (
+            policy.action_recovery
+            and tool_call.name not in policy.available_tools
+        ):
+            return unavailable_in_phase(tool_call, policy, 'Action Recovery')
+        if (
+            policy.mutation_recovery
+            and tool_call.name not in policy.available_tools
+        ):
+            return unavailable_in_phase(tool_call, policy, 'Edit Recovery')
+        if policy.action_read_exhausted:
+            return synthetic_failure(
+                'action_read_limit_reached',
+                'Action Recovery permits only one targeted repository read '
+                'or search. Use the existing evidence and make the workspace '
+                'edit now.',
+            )
+        if policy.semantic_repeat is not None:
+            return ToolRunResult(policy.semantic_repeat, executed=False)
+        should_block_repeat = (
+            tool_call.name != 'finish_task'
+            and (
+                policy.previous_count >= policy.repeated_limit
+                or (
+                    policy.previous_count >= 1
+                    and not policy.previous_success
+                )
+            )
+        )
+        if should_block_repeat:
+            cause = (
+                'the previous identical call failed'
+                if not policy.previous_success
+                else f'it already ran {policy.previous_count} times'
+            )
+            return synthetic_failure(
+                'repeated_tool_call',
+                f'Skipped repeated {tool_call.name} call because {cause}. '
+                'Use the existing result, change the arguments, or choose a '
+                'different next action.',
+                details={
+                    'tool': tool_call.name,
+                    'arguments': tool_call.arguments,
+                    'previous_count': policy.previous_count,
+                    'previous_success': policy.previous_success,
+                },
+            )
+        execution = await self.execute(tool_call)
+        return ToolRunResult(execution.result, executed=True)
+
+
+def synthetic_failure(
+    code: str,
+    message: str,
+    *,
+    details: dict[str, object] | None = None,
+) -> ToolRunResult:
+    return ToolRunResult(
+        ToolResult.fail(code, message, details=details or {}),
+        executed=False,
+    )
+
+
+def unavailable_in_phase(
+    tool_call: ToolCall,
+    policy: ToolRunPolicy,
+    phase: str,
+) -> ToolRunResult:
+    return synthetic_failure(
+        'tool_not_available_in_phase',
+        f'{tool_call.name} is not available during {phase}. Use one of the '
+        'tools included with this request.',
+        details={'available_tools': sorted(policy.available_tools)},
+    )
+
+
+def is_tool_protocol_failure(result: ToolResult) -> bool:
+    return (
+        not result.success
+        and result.error is not None
+        and result.error.code in {
+            'invalid_arguments',
+            'unknown_tool',
+            'finish_must_be_alone',
+            'unsupported_shell_syntax',
+            'invalid_pattern',
+            'patch_contains_read_line_numbers',
+            'git_diff_path_is_directory',
+            'tool_not_available_in_phase',
+            'action_read_limit_reached',
+            'todo_required',
+        }
+    )

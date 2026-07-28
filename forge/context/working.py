@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
 
+from forge.runtime.paths import normalize_workspace_path
 from forge.runtime.state import ToolCall
 from forge.tools.base import ToolResult
 
@@ -197,7 +198,7 @@ class WorkingState:
                 return self._observe_read(result, revision)
             return self._observe_signature(signature)
         if tool_call.name == 'list_directory':
-            path = normalize_path(
+            path = normalize_workspace_path(
                 str(result.metadata.get('path', '.'))
             )
             key = (revision, path)
@@ -223,7 +224,9 @@ class WorkingState:
         changed_paths: tuple[str, ...],
     ) -> None:
         '''Carry unchanged evidence forward and invalidate changed paths only.'''
-        changed = {normalize_path(path) for path in changed_paths}
+        changed = {
+            normalize_workspace_path(path) for path in changed_paths
+        }
         latest_files: dict[str, FileEvidence] = {}
         for evidence in self.files.values():
             previous = latest_files.get(evidence.path)
@@ -237,7 +240,7 @@ class WorkingState:
             self.files[(revision, path)] = evidence
 
         invalid_directories = {
-            normalize_path(str(PurePosixPath(path).parent))
+            normalize_workspace_path(str(PurePosixPath(path).parent))
             for path in changed
         }
         self.directories = {
@@ -355,7 +358,7 @@ class WorkingState:
         revision: int,
     ) -> bool:
         metadata = result.metadata
-        path = normalize_path(str(metadata['path']))
+        path = normalize_workspace_path(str(metadata['path']))
         total_lines = int(metadata['total_lines'])
         start_line = int(metadata['start_line'])
         end_line = int(metadata['end_line'])
@@ -378,7 +381,7 @@ class WorkingState:
         revision: int,
     ) -> ToolResult | None:
         arguments = tool_call.arguments
-        path = normalize_path(str(arguments.get('path', '')))
+        path = normalize_workspace_path(str(arguments.get('path', '')))
         evidence = self.files.get((revision, path))
         if evidence is None:
             return None
@@ -426,7 +429,7 @@ class WorkingState:
             parts = line.split(':', 2)
             if len(parts) < 3:
                 continue
-            path = normalize_path(parts[0])
+            path = normalize_workspace_path(parts[0])
             try:
                 line_number = int(parts[1])
             except ValueError:
@@ -446,7 +449,7 @@ class WorkingState:
     def _observe_find_files(self, result: ToolResult, revision: int) -> bool:
         progressed = False
         for line in result.content.splitlines():
-            path = normalize_path(line.strip())
+            path = normalize_workspace_path(line.strip())
             if not path or path == '.':
                 continue
             discovery = (revision, path)
@@ -456,10 +459,6 @@ class WorkingState:
                 self.discovered_files.add(discovery)
                 progressed = True
         return progressed
-
-
-def normalize_path(path: str) -> str:
-    return PurePosixPath(path.replace('\\', '/')).as_posix()
 
 
 def evidence_names(path: str) -> tuple[str, ...]:

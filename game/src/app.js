@@ -28,6 +28,7 @@
   };
 
   const MAX_MERGE_STAR = 3;
+  const MERGE_LOG_LIMIT = 3;
 
   const TRAIT_BONUS = {
     2: 1.15,
@@ -218,12 +219,9 @@
   }
 
   function cloneHeroAsBattleReady(unit) {
-    const bonus = Math.max(...traitsOnUnits([unit]).map((traitCounts) => getTraitMultiplier(traitCounts)), 1);
+    if (!unit) return null;
     return {
       ...unit,
-      atk: Math.round(unit.atk * bonus),
-      hp: Math.round(unit.hp * bonus),
-      def: Math.round(unit.def * bonus)
     };
   }
 
@@ -526,7 +524,6 @@
         state.gold -= hero.cost;
         setSlot(targetType, targetIndex, newHeroFrom(hero, hero.star));
         clearSlot('shop', source.index);
-        setSlot('shop', source.index, null);
         addLog(`购买了【${hero.name}】并放置至${targetType === 'board' ? '棋盘' : '后备'} ${targetIndex + 1}`);
         state.selected = null;
         refreshUi();
@@ -617,11 +614,13 @@
       return;
     }
 
-    const ally = state.board
-      .filter((u) => u)
-      .filter((u) => u.hp > 0)
-      .map((u) => ({ ...u }));
-    const enemy = makeEnemyTeam();
+    const ally = applyTraitBonuses(
+      state.board
+        .filter((u) => u)
+        .filter((u) => u.hp > 0)
+        .map((u) => cloneHeroAsBattleReady(u)),
+    );
+    const enemy = applyTraitBonuses(makeEnemyTeam());
 
     if (enemy.length === 0) {
       addLog('敌方未布阵，直接判定胜利。');
@@ -684,7 +683,7 @@
       const lose = 8 + Math.floor(allyAlive * 3);
       state.allyHp = Math.max(0, state.allyHp - lose);
       state.gold = Math.max(0, state.gold - 4);
-      addLog(`战斗失败！我方损失 ${lose} 生命，扣 ${lose} ？`);
+      addLog(`战斗失败！我方损失 ${lose} 生命，并扣除 4 金币。`);
     }
 
     state.fighting = false;
@@ -698,7 +697,7 @@
     if (state.allyHp <= 0) {
       addLog('我方主堡已被打穿，比赛结束；按重置可开始新局。');
       state.allyHp = state.allyMaxHp;
-      state.allyLevel = 1;
+      state.level = 1;
     }
 
     refreshUi();

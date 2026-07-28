@@ -25,6 +25,7 @@ from forge.runtime.model_client import (
     ModelProtocolError,
 )
 from forge.runtime.state import (
+    AgentPhaseChanged,
     ConversationEvent,
     ContextCompacted,
     ModelCallCompleted,
@@ -42,6 +43,7 @@ from forge.runtime.state import (
     TurnResult,
     ToolCall,
 )
+from forge.runtime.agent_state import AgentPhase
 from forge.tools.base import Tool, ToolInput, ToolRegistry, ToolResult
 from forge.tools import create_default_registry
 from forge.tools.filesystem import ReadFileTool
@@ -216,6 +218,12 @@ def tool_response(
     return events
 
 
+def test_conversation_defaults_to_two_million_turn_input_tokens() -> None:
+    conversation = Conversation(client=FakeModelClient())
+
+    assert conversation.max_turn_input_tokens == 2_000_000
+
+
 def test_conversation_forwards_stream_and_returns_final_result() -> None:
     client = FakeModelClient(streamed_response('RE', 'ADY'))
     conversation = Conversation(client=client)
@@ -223,6 +231,12 @@ def test_conversation_forwards_stream_and_returns_final_result() -> None:
     events = collect_turn(conversation, 'Only reply READY')
 
     assert events == [
+        AgentPhaseChanged(
+            phase=AgentPhase.THINKING,
+            previous_phase=None,
+            reason='preparing_model_request',
+            iteration=1,
+        ),
         ModelCallStarted(iteration=1),
         ModelUsageUpdate(
             usage=TokenUsage(input_tokens=10, output_tokens=0),
@@ -235,6 +249,18 @@ def test_conversation_forwards_stream_and_returns_final_result() -> None:
             request_usage=TokenUsage(input_tokens=10, output_tokens=2),
         ),
         ModelCallCompleted(iteration=1),
+        AgentPhaseChanged(
+            phase=AgentPhase.CHECKING_RESULT,
+            previous_phase=AgentPhase.THINKING,
+            reason='model_returned_final_text',
+            iteration=1,
+        ),
+        AgentPhaseChanged(
+            phase=AgentPhase.COMPLETED,
+            previous_phase=AgentPhase.CHECKING_RESULT,
+            reason='turn_completed',
+            iteration=1,
+        ),
         TurnCompleted(
             result=TurnResult(
                 text='READY',

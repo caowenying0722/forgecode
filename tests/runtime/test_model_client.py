@@ -45,9 +45,15 @@ def usage(
 
 
 class FakeStream:
-    def __init__(self, events: list[Any], final_message: Any) -> None:
+    def __init__(
+        self,
+        events: list[Any],
+        final_message: Any,
+        final_error: Exception | None = None,
+    ) -> None:
         self.events = events
         self.final_message = final_message
+        self.final_error = final_error
 
     async def __aenter__(self) -> FakeStream:
         return self
@@ -65,6 +71,8 @@ class FakeStream:
         return iterate()
 
     async def get_final_message(self) -> Any:
+        if self.final_error is not None:
+            raise self.final_error
         return self.final_message
 
 
@@ -73,6 +81,7 @@ class FakeMessages:
         self.calls: list[dict[str, Any]] = []
         self.events: list[Any] = []
         self.errors: list[Exception] = []
+        self.final_errors: list[Exception] = []
         self.final_message = SimpleNamespace(
             usage=usage(input_tokens=0, output_tokens=0),
             stop_reason='end_turn',
@@ -83,7 +92,8 @@ class FakeMessages:
         self.calls.append(kwargs)
         if self.errors:
             raise self.errors.pop(0)
-        return FakeStream(self.events, self.final_message)
+        final_error = self.final_errors.pop(0) if self.final_errors else None
+        return FakeStream(self.events, self.final_message, final_error)
 
 
 class FakeAnthropic:
@@ -716,6 +726,73 @@ def test_stream_retries_connection_error_before_output(
     )
     assert delays == [0.5]
     assert len(sdk.messages.calls) == 2
+
+
+def test_stream_retries_incomplete_sdk_final_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sdk = FakeAnthropic()
+    sdk.messages.final_errors.append(AssertionError())
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(model_client_module.asyncio, 'sleep', record_sleep)
+    monkeypatch.setattr(model_client_module.random, 'uniform', lambda *_: 0)
+    client = AnthropicModelClient(
+        model='claude-test',
+        max_retries=1,
+        client=sdk,
+    )
+
+    events = collect_stream(
+        client,
+        messages=[{'role': 'user', 'content': 'Hello'}],
+    )
+
+    assert events[0] == ModelRetryScheduled(
+        attempt=2,
+        reason='incomplete_stream',
+        delay_seconds=0.5,
+    )
+    assert delays == [0.5]
+    assert len(sdk.messages.calls) == 2
+
+
+def test_incomplete_sdk_stream_has_actionable_terminal_error() -> None:
+    sdk = FakeAnthropic()
+    sdk.messages.final_errors.append(AssertionError())
+    client = AnthropicModelClient(
+        model='claude-test',
+        max_retries=0,
+        client=sdk,
+    )
+
+    with pytest.raises(
+        model_client_module.ModelCallError,
+        match='complete final message',
+    ) as captured:
+        collect_stream(
+            client,
+            messages=[{'role': 'user', 'content': 'Hello'}],
+        )
+
+    assert captured.value.reason == 'incomplete_stream'
+    assert captured.value.retryable
+
+
+def test_proxy_auth_unavailable_is_not_retried() -> None:
+    error = RuntimeError('auth_unavailable: no auth available')
+
+    reason, retryable = model_client_module.classify_provider_error(error)
+
+    assert reason == 'authentication_unavailable'
+    assert retryable is False
+    assert 'reconnect or sign in' in model_client_module.model_error_message(
+        reason,
+        response_started=False,
+    )
 
 
 def test_stream_does_not_retry_after_text_started() -> None:

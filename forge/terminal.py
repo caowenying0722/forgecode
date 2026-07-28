@@ -20,6 +20,7 @@ from rich.table import Table
 from rich.text import Text
 
 from forge import __version__
+from forge.runtime.agent_state import AgentPhase
 from forge.runtime.state import ContextCompacted, TokenUsage, ToolCall, TurnResult
 from forge.context.manager import ContextStats
 from forge.context.manager import CompactionReport
@@ -311,6 +312,18 @@ class TerminalUI:
         self.console.print(escape(content))
 
 
+def phase_label(phase: AgentPhase) -> str:
+    return {
+        AgentPhase.THINKING: '正在思考',
+        AgentPhase.PREPARING_TOOLS: '准备调用工具',
+        AgentPhase.EXECUTING_TOOLS: '正在执行工具',
+        AgentPhase.CHECKING_RESULT: '检查结果',
+        AgentPhase.RECOVERING: '失败恢复',
+        AgentPhase.COMPLETED: '完成',
+        AgentPhase.FAILED: '失败',
+    }[phase]
+
+
 class StreamingResponseView:
     '''Update streamed Markdown and exact usage in place.'''
 
@@ -322,6 +335,8 @@ class StreamingResponseView:
         self.model_calls = 0
         self.completed = False
         self.result: TurnResult | None = None
+        self.phase: AgentPhase | None = None
+        self.phase_reason = ''
         self.live = Live(
             self._render(),
             console=console,
@@ -432,6 +447,12 @@ class StreamingResponseView:
         )
         self.live.update(self._render(), refresh=True)
 
+    def update_phase(self, phase: AgentPhase, reason: str) -> None:
+        '''Show the current orchestration phase without polluting the timeline.'''
+        self.phase = phase
+        self.phase_reason = reason
+        self.live.update(self._render(), refresh=True)
+
     def request_permission(self, tool_call: ToolCall, effect: object) -> bool:
         '''Pause live rendering and ask whether one sensitive tool may run.'''
         self.live.stop()
@@ -473,6 +494,13 @@ class StreamingResponseView:
     def _render(self) -> Group:
         content = self._render_timeline()
         renderables: list[object] = [content]
+        if not self.completed and self.phase is not None:
+            renderables.append(
+                Text(
+                    f'{phase_label(self.phase)} · {self.phase_reason}',
+                    style='dim bright_cyan',
+                )
+            )
         if self.result is not None and (
             self.result.changed_paths
             or self.result.verification is not None

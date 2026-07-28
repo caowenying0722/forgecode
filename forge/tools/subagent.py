@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -159,6 +158,11 @@ class ExploreSubagent:
         )
 
     async def run(self, arguments: ExploreSubagentInput) -> ToolResult:
+        from forge.runtime.agent_messages import (
+            build_assistant_message,
+            build_tool_result_message,
+        )
+        from forge.runtime.model_runner import add_token_usage
         from forge.runtime.state import (
             ModelTextDelta,
             ModelToolCallCompleted,
@@ -192,7 +196,7 @@ class ExploreSubagent:
                 elif isinstance(event, ModelUsageUpdate):
                     request_usage = event.usage
             if request_usage is not None:
-                total_usage = add_usage(total_usage, request_usage)
+                total_usage = add_token_usage(total_usage, request_usage)
             text = ''.join(text_parts).strip()
             if not requested:
                 final_text = text
@@ -295,75 +299,6 @@ def render_explore_task(arguments: ExploreSubagentInput) -> str:
         else ''
     )
     return f'Task:\n{arguments.task}{focus}'
-
-
-def build_assistant_message(
-    text: str,
-    tool_calls: list[Any],
-) -> dict[str, Any]:
-    content: list[dict[str, Any]] = []
-    if text:
-        content.append({'type': 'text', 'text': text})
-    content.extend(
-        {
-            'type': 'tool_use',
-            'id': call.id,
-            'name': call.name,
-            'input': call.arguments,
-        }
-        for call in sorted(tool_calls, key=lambda item: item.index)
-    )
-    return {'role': 'assistant', 'content': content}
-
-
-def build_tool_result_message(
-    results: list[tuple[Any, ToolResult]],
-) -> dict[str, Any]:
-    return {
-        'role': 'user',
-        'content': [
-            {
-                'type': 'tool_result',
-                'tool_use_id': call.id,
-                'is_error': not result.success,
-                'content': json.dumps(
-                    {
-                        'success': result.success,
-                        'summary': result.summary,
-                        'content': result.content,
-                        'error': (
-                            None
-                            if result.error is None
-                            else {
-                                'code': result.error.code,
-                                'message': result.error.message,
-                                'details': result.error.details,
-                            }
-                        ),
-                        'metadata': result.metadata,
-                    },
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            }
-            for call, result in results
-        ],
-    }
-
-
-def add_usage(left: Any, right: Any) -> Any:
-    from forge.runtime.state import TokenUsage
-
-    return TokenUsage(
-        input_tokens=left.input_tokens + right.input_tokens,
-        output_tokens=left.output_tokens + right.output_tokens,
-        cache_creation_input_tokens=(
-            left.cache_creation_input_tokens + right.cache_creation_input_tokens
-        ),
-        cache_read_input_tokens=(
-            left.cache_read_input_tokens + right.cache_read_input_tokens
-        ),
-    )
 
 
 def metadata(usage: Any, tool_calls: list[str]) -> dict[str, Any]:

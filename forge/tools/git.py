@@ -15,7 +15,7 @@ from forge.tools.base import (
     display_path,
     resolve_repository_path,
 )
-from forge.tools.shell import (
+from forge.runtime.process import (
     process_metadata,
     render_process_output,
     run_process,

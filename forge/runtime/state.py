@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from forge.runtime.agent_state import AgentPhase
 from forge.tools.base import ToolResult
 
 
@@ -175,6 +176,16 @@ class ModelCallFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentPhaseChanged:
+    '''The orchestration state machine entered a new phase.'''
+
+    phase: AgentPhase
+    previous_phase: AgentPhase | None
+    reason: str
+    iteration: int
+
+
+@dataclass(frozen=True, slots=True)
 class ToolExecutionStarted:
     '''The runtime started executing one completed model tool request.'''
 
@@ -243,6 +254,7 @@ type ConversationEvent = (
     | ModelCallStarted
     | ModelCallCompleted
     | ModelCallFailed
+    | AgentPhaseChanged
     | ToolExecutionStarted
     | ToolExecutionCompleted
     | WorkspaceChanged

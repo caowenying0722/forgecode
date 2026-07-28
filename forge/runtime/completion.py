@@ -8,7 +8,7 @@ from pathlib import Path
 
 from forge.runtime.state import VerificationEvidence
 from forge.runtime.workspace import WorkspaceTracker
-from forge.tools.shell import run_process
+from forge.runtime.process import run_process
 
 
 @dataclass(frozen=True, slots=True)

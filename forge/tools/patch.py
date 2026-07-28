@@ -23,7 +23,7 @@ from forge.tools.filesystem import (
     dominant_newline,
     read_text_preserving_newlines,
 )
-from forge.tools.shell import (
+from forge.runtime.process import (
     process_metadata,
     render_process_output,
     run_process,
