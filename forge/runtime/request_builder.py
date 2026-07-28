@@ -19,6 +19,9 @@ class RequestState:
     stagnation_final_recovery: bool = False
     token_limit_recovery: bool = False
     completion_ready_context: str = ''
+    verification_recovery: bool = False
+    verification_fix_recovery: bool = False
+    verification_read_used: bool = False
     change_required: bool = False
     mutation_attempted: bool = False
     action_recovery: bool = False
@@ -96,6 +99,11 @@ class RequestBuilder:
             return None
         if interaction_mode == 'plan':
             return plan_tools
+        if state.verification_recovery:
+            return self.recovery_manager.verification_tools(
+                fix_available=state.verification_fix_recovery,
+                read_available=not state.verification_read_used,
+            )
         if state.action_recovery:
             return self.recovery_manager.action_tools(
                 read_available=not state.action_read_used
@@ -202,6 +210,21 @@ def recovery_system_suffix(
             state.action_recovery_calls,
             action_recovery_limit,
             read_used=state.action_read_used,
+        )
+    if state.verification_recovery:
+        return (
+            '\n\n[ForgeCode Verification Recovery]\n'
+            'The workspace already has task-local changes. The current '
+            'completion blocker is missing, stale, insufficient, or failed '
+            'formal verification. Do not continue broad repository discovery '
+            'or repeat covered reads. If this request only exposes verify, '
+            'call it now with the most relevant test, build, lint, or '
+            'type-check command for the current project revision. If repair '
+            'tools are also exposed, the latest verification failed; use its '
+            'output directly to install missing dependencies, edit broken '
+            'files, or adjust project scripts, then call verify again in this '
+            'recovery phase. Verification repair permits at most one targeted '
+            'read/search before editing or running the concrete repair command.'
         )
     if state.force_synthesis:
         return (

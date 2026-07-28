@@ -19,6 +19,7 @@ from forge.runtime.intent import infer_change_required
         '按最高优先级 P0 进行修复',
         '把 world.js 改成六面渲染',
         '可以，开始吧',
+        '阅读当前目录下的任务文件task.md，明确任务后开始工作',
         'Fix the rendering bug.',
         'Please resolve the rendering bug.',
         'Inspect and fix the rendering bug.',

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
@@ -15,8 +15,11 @@ import sys
 from typing import Any, Protocol
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.shortcuts import CompleteStyle
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -33,6 +36,91 @@ from forge.context.manager import ContextStats
 from forge.context.manager import CompactionReport
 from forge.tools.base import ToolResult
 from forge.tools.search import iter_files
+
+
+PermissionSelector = Callable[[str], str | None]
+ApprovalSelector = Callable[[ToolCall, object], str]
+
+
+PERMISSION_CHOICES = (
+    (
+        'readonly',
+        'Read Only',
+        'Inspect files and repository state; block writes and commands.',
+    ),
+    (
+        'strict',
+        'Ask for approval',
+        'Ask before every write or process action.',
+    ),
+    (
+        'auto',
+        'Approve for me',
+        'Auto-approve workspace edits and low-risk local commands.',
+    ),
+    (
+        'trusted',
+        'Full Access',
+        'Run available tools without approval prompts.',
+    ),
+)
+
+APPROVAL_CHOICES = (
+    (
+        'allow_once',
+        'Allow once',
+        'Run only this operation.',
+    ),
+    (
+        'allow_session',
+        'Allow similar this session',
+        'Reuse approval for the same command or tool target.',
+    ),
+    (
+        'deny',
+        'Deny',
+        'Do not run this operation.',
+    ),
+)
+
+
+class InlineChoiceCompleter(Completer):
+    '''Render a small choice list using the normal terminal completion menu.'''
+
+    def __init__(
+        self,
+        choices: tuple[tuple[str, str, str], ...],
+        *,
+        current: str | None = None,
+    ) -> None:
+        self.choices = choices
+        self.current = current
+
+    def get_completions(
+        self,
+        document: Document,
+        complete_event: object,
+    ):
+        del complete_event
+        query = document.text_before_cursor.casefold()
+        for value, label, description in self.choices:
+            if query and query not in value.casefold() and query not in label.casefold():
+                continue
+            marker = '\u25cf ' if value == self.current else '  '
+            yield Completion(
+                value,
+                start_position=-len(document.text_before_cursor),
+                display=f'{marker}{label}',
+                display_meta=description,
+            )
+
+
+INLINE_CHOICE_KEY_BINDINGS = KeyBindings()
+
+
+@INLINE_CHOICE_KEY_BINDINGS.add('escape', eager=True)
+def _cancel_inline_choice(event: object) -> None:
+    event.app.exit(result='')
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,11 +157,10 @@ SLASH_COMMANDS = (
     ),
     SlashCommandSpec('/plan', '/plan', '切换到只读计划模式'),
     SlashCommandSpec('/code', '/code', '切换到代码执行模式'),
-    SlashCommandSpec('/permission', '/permission', '查看当前权限模式'),
     SlashCommandSpec(
-        '/permission ',
-        '/permission trusted|strict|readonly',
-        '切换工具权限模式',
+        '/permissions',
+        '/permissions',
+        '打开权限模式内联菜单',
     ),
     SlashCommandSpec('/mcp', '/mcp', '查看 MCP 服务器与工具状态'),
     SlashCommandSpec('/hooks', '/hooks', '查看当前 Hook 注册列表'),
@@ -270,7 +357,7 @@ type _TimelineBlock = _TextTimelineBlock | _ToolTimelineBlock | _NoticeTimelineB
 
 
 class _InteractivePrompt(Protocol):
-    def prompt(self, message: Any = '') -> str:
+    def prompt(self, message: Any = '', **kwargs: Any) -> str:
         ...
 
 
@@ -282,11 +369,15 @@ class TerminalUI:
         console: Console | None = None,
         prompt_session: _InteractivePrompt | None = None,
         workspace_root: Path | None = None,
+        permission_selector: PermissionSelector | None = None,
+        approval_selector: ApprovalSelector | None = None,
     ) -> None:
         self.console = console if console is not None else Console()
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.prompt_completer = ForgePromptCompleter(self.workspace_root)
         self.prompt_session = prompt_session
+        self.permission_selector = permission_selector
+        self.approval_selector = approval_selector
         if self.prompt_session is None and self.console.is_terminal:
             self.prompt_session = PromptSession(
                 completer=self.prompt_completer,
@@ -339,11 +430,94 @@ class TerminalUI:
             return self.prompt_session.prompt(
                 [('ansibrightcyan bold', '\u276f ')]
             )
-        return self.console.input('[bold bright_cyan]\u276f[/] ')
+        return self.console.input('[bold bright_cyan]>[/] ')
 
     def stream_response(self) -> StreamingResponseView:
         '''Create a live view for one streaming model response.'''
-        return StreamingResponseView(self.console)
+        return StreamingResponseView(
+            self.console,
+            approval_selector=(
+                self.approval_selector or self.select_tool_approval
+            ),
+        )
+
+    def select_permission_mode(self, current: str) -> str | None:
+        '''Open a keyboard-first permission preset picker.'''
+        if self.permission_selector is not None:
+            return self.permission_selector(current)
+        if self.console.is_terminal:
+            return self._select_inline(
+                'Permissions \u276f ',
+                PERMISSION_CHOICES,
+                current=current,
+            )
+        self.console.print('[bold]ForgeCode Permissions[/]')
+        for index, (_, label, description) in enumerate(
+            PERMISSION_CHOICES,
+            start=1,
+        ):
+            self.console.print(f'{index}. {label} — {description}')
+        answer = self.console.input('Select 1-4 (blank to cancel): ').strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(PERMISSION_CHOICES):
+            return PERMISSION_CHOICES[int(answer) - 1][0]
+        return None
+
+    def select_tool_approval(
+        self,
+        tool_call: ToolCall,
+        effect: object,
+    ) -> str:
+        '''Ask for one tool approval in an inline terminal completion menu.'''
+        details = permission_request_details(tool_call, effect)
+        if self.console.is_terminal:
+            self.console.print('[bold yellow]Approval required[/]')
+            self.console.print(Text(details))
+            return self._select_inline(
+                'Approval \u276f ',
+                APPROVAL_CHOICES,
+                current='deny',
+            ) or 'deny'
+        self.console.print('[bold yellow]Permission required[/]')
+        self.console.print(Text(details))
+        self.console.print('1. Allow once')
+        self.console.print('2. Allow similar actions this session')
+        self.console.print('3. Deny')
+        answer = self.console.input('Select 1-3 (default 3): ')
+        return {
+            '1': 'allow_once',
+            '2': 'allow_session',
+            'y': 'allow_once',
+            'yes': 'allow_once',
+        }.get(answer.strip().casefold(), 'deny')
+
+    def _select_inline(
+        self,
+        message: str,
+        choices: tuple[tuple[str, str, str], ...],
+        *,
+        current: str | None = None,
+    ) -> str | None:
+        if self.prompt_session is None:
+            return None
+
+        def open_menu() -> None:
+            get_app().current_buffer.start_completion(select_first=False)
+
+        try:
+            answer = self.prompt_session.prompt(
+                [('ansibrightcyan bold', message)],
+                completer=InlineChoiceCompleter(choices, current=current),
+                complete_while_typing=True,
+                complete_style=CompleteStyle.COLUMN,
+                reserve_space_for_menu=len(choices) + 1,
+                bottom_toolbar='\u2191/\u2193 select  Enter confirm  Esc cancel',
+                key_bindings=INLINE_CHOICE_KEY_BINDINGS,
+                pre_run=open_menu,
+            ).strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        allowed = {value for value, _, _ in choices}
+        return answer if answer in allowed else None
 
     async def wait_for_interrupt(self) -> None:
         '''Wait until Esc is pressed while a response is running.'''
@@ -466,8 +640,14 @@ def phase_label(phase: AgentPhase) -> str:
 class StreamingResponseView:
     '''Update streamed Markdown and exact usage in place.'''
 
-    def __init__(self, console: Console) -> None:
+    def __init__(
+        self,
+        console: Console,
+        *,
+        approval_selector: ApprovalSelector | None = None,
+    ) -> None:
         self.console = console
+        self.approval_selector = approval_selector
         self.timeline: list[_TimelineBlock] = []
         self.usage: TokenUsage | None = None
         self.request_usage: TokenUsage | None = None
@@ -606,19 +786,27 @@ class StreamingResponseView:
         self.phase_reason = reason
         self.live.update(self._render(), refresh=True)
 
-    def request_permission(self, tool_call: ToolCall, effect: object) -> bool:
+    def request_permission(self, tool_call: ToolCall, effect: object) -> str:
         '''Pause live rendering and ask whether one sensitive tool may run.'''
         self.live.stop()
         try:
+            if self.approval_selector is not None:
+                return self.approval_selector(tool_call, effect)
+            details = permission_request_details(tool_call, effect)
             self.console.print('[bold yellow]Permission required[/]')
-            self.console.print(
-                f'[dim]Tool:[/] {escape(tool_call.name)}  '
-                f'[dim]effect:[/] {escape(str(effect))}'
-            )
+            self.console.print(Text(details))
+            self.console.print('1. Allow once')
+            self.console.print('2. Allow similar actions this session')
+            self.console.print('3. Deny')
             answer = self.console.input(
-                'Allow this tool call? (y/N, yes/no) '
+                'Select 1-3 (default 3): '
             )
-            return permission_answer_allows(answer)
+            return {
+                '1': 'allow_once',
+                '2': 'allow_session',
+                'y': 'allow_once',
+                'yes': 'allow_once',
+            }.get(answer.strip().casefold(), 'deny')
         finally:
             self.live.start(refresh=True)
 
@@ -904,6 +1092,23 @@ def permission_answer_allows(answer: str) -> bool:
         'approve',
         'allow',
     }
+
+
+def permission_request_details(tool_call: ToolCall, effect: object) -> str:
+    arguments = json.dumps(
+        tool_call.arguments,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
+    if len(arguments) > 3_000:
+        arguments = arguments[:2_997] + '...'
+    return (
+        f'Tool: {tool_call.name}\n'
+        f'Effect: {effect}\n\n'
+        f'Arguments:\n{arguments}\n\n'
+        'Allow this operation?'
+    )
 
 
 def token_usage_summary(

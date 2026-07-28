@@ -12,6 +12,21 @@ from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolResult
 
 
+VERIFICATION_BLOCKER_MARKERS = (
+    'has not been verified with the verify tool',
+    'latest verification failed',
+    'changed after verification',
+    'verification command does not run',
+)
+
+
+def only_verification_blocked(reasons: tuple[str, ...]) -> bool:
+    return bool(reasons) and all(
+        any(marker in reason for marker in VERIFICATION_BLOCKER_MARKERS)
+        for reason in reasons
+    )
+
+
 class CompletionChecker:
     '''Evaluate finish declarations and stagnation finalization.'''
 

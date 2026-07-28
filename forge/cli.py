@@ -283,22 +283,26 @@ def run_interactive_chat(
             )
             continue
 
-        if prompt.strip() == '/permission':
-            resolved_terminal.show_notice(
-                'Permission',
-                resolved_session.permission_show(),
+        if prompt.strip() == '/permissions':
+            current_mode = getattr(
+                getattr(resolved_session, 'permission', None),
+                'mode',
+                'trusted',
             )
-            continue
-
-        if prompt.strip().startswith('/permission '):
-            mode = prompt.strip()[len('/permission '):].strip()
-            try:
+            selected = resolved_terminal.select_permission_mode(current_mode)
+            if selected is None:
                 resolved_terminal.show_notice(
-                    'Permission',
-                    resolved_session.permission_set(mode),
+                    'Permissions',
+                    'Permission selection cancelled.',
                 )
-            except ValueError as error:
-                resolved_terminal.show_error(error)
+            else:
+                try:
+                    resolved_terminal.show_notice(
+                        'Permissions',
+                        resolved_session.permission_set(selected),
+                    )
+                except ValueError as error:
+                    resolved_terminal.show_error(error)
             continue
 
         if prompt.strip() == '/mode':

@@ -10,17 +10,22 @@ from typing import Callable, Literal
 
 from forge.hooks.state import HookContext, HookResult
 from forge.runtime.state import ToolCall
+from forge.runtime.tool_targets import mutation_target_paths
 from forge.tools.base import ToolEffect, ToolResult
 
 
-PermissionMode = Literal['trusted', 'strict', 'readonly']
-PermissionApprover = Callable[[ToolCall, ToolEffect | None], bool]
+PermissionMode = Literal['trusted', 'auto', 'strict', 'readonly']
+ApprovalDecision = Literal['allow_once', 'allow_session', 'deny']
+PermissionApprover = Callable[
+    [ToolCall, ToolEffect | None],
+    ApprovalDecision | bool,
+]
 
 
 class PermissionHook:
     name = 'permission'
     events = ('pre_tool_use',)
-    description = 'Enforce trusted, strict, or readonly tool permission policy.'
+    description = 'Enforce full, auto, ask, or read-only tool permissions.'
 
     def __init__(
         self,
@@ -32,6 +37,7 @@ class PermissionHook:
         self.mode = mode
         self.approver = approver
         self.enabled = enabled
+        self.session_approvals: set[str] = set()
 
     async def handle(self, context: HookContext) -> HookResult:
         tool_call = require_tool_call(context)
@@ -47,19 +53,59 @@ class PermissionHook:
                     'readonly mode allows only read-only tools',
                 )
             )
-        if self.mode == 'strict' and effect in {'workspace_write', 'process'}:
-            if self.approver is not None and self.approver(tool_call, effect):
-                return HookResult(metadata={'permission_approved': True})
+        if self.mode == 'auto' and auto_approval_allowed(tool_call, effect):
+            return HookResult(metadata={'permission_auto_approved': True})
+        if self.mode in {'strict', 'auto'} and effect in {
+            'workspace_write',
+            'process',
+        }:
+            return self._request_approval(tool_call, effect)
+        return HookResult()
+
+    def _request_approval(
+        self,
+        tool_call: ToolCall,
+        effect: ToolEffect | None,
+    ) -> HookResult:
+        key = approval_scope_key(tool_call)
+        if key in self.session_approvals:
+            return HookResult(metadata={'permission_session_approved': True})
+        if self.approver is None:
             return HookResult(
                 tool_result=permission_denied_result(
                     tool_call,
                     self.mode,
                     effect,
-                    'user did not approve this tool call',
+                    'interactive approval is unavailable',
                     terminal=True,
                 )
             )
-        return HookResult()
+        decision = normalize_approval_decision(
+            self.approver(tool_call, effect)
+        )
+        if decision == 'allow_session':
+            self.session_approvals.add(key)
+        if decision in {'allow_once', 'allow_session'}:
+            return HookResult(
+                metadata={
+                    'permission_approved': True,
+                    'approval_decision': decision,
+                }
+            )
+        return HookResult(
+            tool_result=permission_denied_result(
+                tool_call,
+                self.mode,
+                effect,
+                'user denied this tool call',
+                terminal=False,
+            )
+        )
+
+    def set_mode(self, mode: PermissionMode) -> None:
+        if mode != self.mode:
+            self.session_approvals.clear()
+        self.mode = mode
 
 
 class ToolLoggingHook:
@@ -190,9 +236,21 @@ def should_require_todo_plan(prompt: str) -> bool:
 
 def normalize_permission_mode(mode: str) -> PermissionMode:
     normalized = mode.strip().casefold()
-    if normalized not in {'trusted', 'strict', 'readonly'}:
+    aliases = {
+        'read only': 'readonly',
+        'read-only': 'readonly',
+        'ask': 'strict',
+        'ask for approval': 'strict',
+        'approve': 'auto',
+        'approve for me': 'auto',
+        'full': 'trusted',
+        'full access': 'trusted',
+        'full-access': 'trusted',
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {'trusted', 'auto', 'strict', 'readonly'}:
         raise ValueError(
-            'Permission mode must be one of: trusted, strict, readonly.'
+            'Permission mode must be one of: readonly, strict, auto, trusted.'
         )
     return normalized  # type: ignore[return-value]
 
@@ -200,18 +258,79 @@ def normalize_permission_mode(mode: str) -> PermissionMode:
 def render_permission_notice(mode: PermissionMode) -> str:
     if mode == 'trusted':
         return (
-            'Permission: trusted. Read, write, and process tools may run '
-            'without runtime permission blocking.'
+            'Permission: Full Access. All available tools may run without '
+            'approval prompts; workspace boundaries and tool safety checks '
+            'still apply.'
+        )
+    if mode == 'auto':
+        return (
+            'Permission: Approve for me. Workspace edits and low-risk local '
+            'commands are approved automatically; risky or external actions '
+            'still ask.'
         )
     if mode == 'readonly':
         return (
-            'Permission: readonly. Only read-only tools may run; write and '
+            'Permission: Read Only. Only read-only tools may run; write and '
             'process tools are blocked.'
         )
     return (
-        'Permission: strict. Read-only tools may run directly; write and '
-        'process tools ask for confirmation before execution.'
+        'Permission: Ask for approval. Read-only tools may run directly; '
+        'write and process tools ask for confirmation before execution.'
     )
+
+
+def normalize_approval_decision(
+    decision: ApprovalDecision | bool,
+) -> ApprovalDecision:
+    if decision is True:
+        return 'allow_once'
+    if decision is False:
+        return 'deny'
+    if decision not in {'allow_once', 'allow_session', 'deny'}:
+        return 'deny'
+    return decision
+
+
+def approval_scope_key(tool_call: ToolCall) -> str:
+    if tool_call.name == 'run_command':
+        command = str(tool_call.arguments.get('command', '')).strip()
+        return f'run_command:{command}'
+    if tool_call.name.startswith('mcp_'):
+        return tool_call.name
+    targets = mutation_target_paths(tool_call)
+    if targets:
+        return f'{tool_call.name}:{"|".join(targets)}'
+    return tool_call.name
+
+
+RISKY_COMMAND_PATTERN = re.compile(
+    r'(?i)(?:'
+    r'\b(?:rm|rmdir|del|remove-item|format|shutdown|reboot)\b|'
+    r'\bgit\s+(?:push|clean|reset|checkout|restore)\b|'
+    r'\b(?:curl|wget|ssh|scp|ftp)\b|'
+    r'\b(?:npm|pnpm|yarn|pip|uv)\s+(?:install|uninstall|publish)\b|'
+    r'\b(?:docker|kubectl|terraform|ansible)\b|'
+    r'\b(?:deploy|publish)\b'
+    r')'
+)
+
+
+def auto_approval_allowed(
+    tool_call: ToolCall,
+    effect: ToolEffect | None,
+) -> bool:
+    if tool_call.name.startswith('mcp_'):
+        return effect == 'read_only'
+    if effect == 'workspace_write':
+        return True
+    if effect != 'process':
+        return True
+    if tool_call.name == 'task':
+        return True
+    if tool_call.name not in {'run_command', 'verify'}:
+        return False
+    command = str(tool_call.arguments.get('command', ''))
+    return RISKY_COMMAND_PATTERN.search(command) is None
 
 
 def permission_denied_result(

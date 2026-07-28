@@ -16,6 +16,7 @@ class ToolRunPolicy:
     action_recovery: bool = False
     mutation_recovery: bool = False
     action_read_exhausted: bool = False
+    verification_read_exhausted: bool = False
     semantic_repeat: ToolResult | None = None
     previous_count: int = 0
     previous_success: bool = True
@@ -59,12 +60,21 @@ class ToolBatchState:
                 position > self.last_workspace_change_position
                 and not changed
                 and not is_tool_protocol_failure(result)
+                and not is_permission_denial(result)
             )
         ]
         if reverted_to_baseline and self.workspace_writes:
             _, call, result, _ = self.workspace_writes[-1]
             return [(call, result)]
         return pending
+
+
+def is_permission_denial(result: ToolResult) -> bool:
+    '''Do not treat a deliberate approval denial as a failed edit attempt.'''
+    return bool(
+        result.error is not None
+        and result.error.code == 'permission_denied'
+    )
 
 
 class ToolRunner:
@@ -108,6 +118,14 @@ class ToolRunner:
                 'Action Recovery permits only one targeted repository read '
                 'or search. Use the existing evidence and make the workspace '
                 'edit now.',
+            )
+        if policy.verification_read_exhausted:
+            return synthetic_failure(
+                'verification_read_limit_reached',
+                'Verification Recovery permits only one targeted repository '
+                'read or search after a failed verify result. Use the latest '
+                'verification output and existing evidence to repair the '
+                'workspace, run the concrete repair command, or call verify.',
             )
         if policy.semantic_repeat is not None:
             return ToolRunResult(policy.semantic_repeat, executed=False)
@@ -182,6 +200,7 @@ def is_tool_protocol_failure(result: ToolResult) -> bool:
             'git_diff_path_is_directory',
             'tool_not_available_in_phase',
             'action_read_limit_reached',
+            'verification_read_limit_reached',
             'todo_required',
         }
     )

@@ -32,6 +32,7 @@ from forge.runtime.completion_checker import (
     build_completion_feedback,
     build_finalization_recovery_feedback,
     completion_review_paths,
+    only_verification_blocked,
     render_completion_ready_context,
     verification_from_result,
 )
@@ -112,6 +113,9 @@ from forge.tools.todo import TodoList, TodoWriteTool
 
 ACTION_RECOVERY_READ_TOOLS = frozenset(
     {'read_file', 'grep'}
+)
+VERIFICATION_RECOVERY_READ_TOOLS = frozenset(
+    {'find_files', 'grep', 'read_file'}
 )
 ACTION_RECOVERY_EXCLUDED_WRITE_TOOLS = frozenset(
     {
@@ -199,7 +203,7 @@ class Conversation:
         mutation_recovery_limit: int = 5,
         pre_mutation_limit: int = 8,
         action_recovery_limit: int = 3,
-        max_turn_input_tokens: int | None = 2_000_000,
+        max_turn_input_tokens: int | None = None,
     ) -> None:
         if tools is not None and registry is not None:
             raise ValueError('Pass tools or registry, not both.')
@@ -525,6 +529,10 @@ class Conversation:
         last_completion_reasons: tuple[str, ...] = ()
         finalization_recovery = False
         stagnation_final_recovery = False
+        verification_recovery = False
+        verification_fix_recovery = False
+        verification_read_used = False
+        verification_recovery_calls = 0
         token_limit_recovery = False
         token_limit_reason = ''
         completion_ready_revision: int | None = None
@@ -619,6 +627,9 @@ class Conversation:
                 mutation_read_used=mutation_recovery_read_used,
                 finalization_recovery=finalization_recovery,
                 stagnation_final_recovery=stagnation_final_recovery,
+                verification_recovery=verification_recovery,
+                verification_fix_recovery=verification_fix_recovery,
+                verification_read_used=verification_read_used,
                 token_limit_recovery=token_limit_recovery,
                 completion_ready_context=completion_ready_context,
                 change_required=change_required,
@@ -1142,6 +1153,48 @@ class Conversation:
                                 )
                             )
                             return
+                        if only_verification_blocked(decision.reasons):
+                            verification_recovery_calls += 1
+                            if (
+                                verification_recovery_calls
+                                > self.action_recovery_limit
+                            ):
+                                self.task_manager.stuck(decision.reasons)
+                                self.messages[:] = request_messages
+                                self.context.capture_explicit_memory(prompt)
+                                yield TurnCompleted(
+                                    result=TurnResult(
+                                        text=complete_text,
+                                        usage=completed_usage,
+                                        last_request_usage=request_usage,
+                                        model_calls=iteration,
+                                        tool_calls=tuple(all_tool_calls),
+                                        status='stuck',
+                                        changed_paths=(
+                                            self.workspace_tracker.changed_paths
+                                        ),
+                                        verification=latest_verification,
+                                        completion_reasons=decision.reasons,
+                                    )
+                                )
+                                return
+                            verification_recovery = True
+                            verification_fix_recovery = any(
+                                'latest verification failed' in reason
+                                for reason in decision.reasons
+                            )
+                            force_synthesis = False
+                            synthesis_retries = 0
+                            stagnation_final_recovery = False
+                            request_messages.append(
+                                build_completion_feedback(
+                                    decision.reasons,
+                                    task_context=(
+                                        self.task_manager.system_suffix()
+                                    ),
+                                )
+                            )
+                            continue
                         if completion_blocks < self.max_completion_blocks:
                             request_messages.append(
                                 build_completion_feedback(
@@ -1239,6 +1292,16 @@ class Conversation:
                     and not mutation_recovery_read_used
                 ):
                     mutation_recovery_read_used = True
+                verification_read_call = (
+                    verification_recovery
+                    and verification_fix_recovery
+                    and tool_call.name in VERIFICATION_RECOVERY_READ_TOOLS
+                )
+                verification_read_exhausted = (
+                    verification_read_call and verification_read_used
+                )
+                if verification_read_call and not verification_read_used:
+                    verification_read_used = True
                 yield ToolExecutionStarted(tool_call=tool_call)
                 phase_event = self._transition(
                     AgentPhase.EXECUTING_TOOLS,
@@ -1270,6 +1333,9 @@ class Conversation:
                         action_recovery=action_recovery,
                         mutation_recovery=bool(mutation_failures),
                         action_read_exhausted=action_read_exhausted,
+                        verification_read_exhausted=(
+                            verification_read_exhausted
+                        ),
                         semantic_repeat=semantic_repeat,
                         previous_count=previous_count,
                         previous_success=previous_success,
@@ -1424,6 +1490,17 @@ class Conversation:
                     )
                 if tool_call.name == 'verify':
                     latest_verification = verification_from_result(result)
+                    verification_recovery = (
+                        latest_verification is not None
+                        and not latest_verification.success
+                    )
+                    verification_fix_recovery = verification_recovery
+                    if not verification_recovery:
+                        verification_fix_recovery = False
+                        verification_read_used = False
+                        verification_recovery_calls = 0
+                    else:
+                        verification_read_used = False
                     if latest_verification is not None:
                         yield VerificationCompleted(
                             evidence=latest_verification
@@ -1518,6 +1595,10 @@ class Conversation:
                 force_synthesis = False
                 synthesis_retries = 0
                 stagnation_final_recovery = False
+                verification_recovery = False
+                verification_fix_recovery = False
+                verification_read_used = False
+                verification_recovery_calls = 0
                 completion_ready_revision = None
                 completion_decision_calls = 0
                 completion_ready_context = ''
@@ -1844,6 +1925,54 @@ class Conversation:
                             reasons=decision.reasons,
                         )
                         if completion_blocks >= self.max_completion_blocks:
+                            if only_verification_blocked(decision.reasons):
+                                verification_recovery_calls += 1
+                                if (
+                                    verification_recovery_calls
+                                    > self.action_recovery_limit
+                                ):
+                                    reason = (
+                                        'ForgeCode stopped after repeated '
+                                        'verification recovery requests did '
+                                        'not produce current verify evidence.'
+                                    )
+                                    reasons = (reason, *decision.reasons)
+                                    self.task_manager.stuck(reasons)
+                                    self.messages[:] = request_messages
+                                    yield TurnCompleted(
+                                        result=TurnResult(
+                                            text=reason,
+                                            usage=completed_usage,
+                                            last_request_usage=request_usage,
+                                            model_calls=iteration,
+                                            tool_calls=tuple(all_tool_calls),
+                                            status='stuck',
+                                            changed_paths=(
+                                                self.workspace_tracker.changed_paths
+                                            ),
+                                            verification=latest_verification,
+                                            completion_reasons=reasons,
+                                        )
+                                    )
+                                    return
+                                verification_recovery = True
+                                verification_fix_recovery = any(
+                                    'latest verification failed' in reason
+                                    for reason in decision.reasons
+                                )
+                                calls_without_progress = 0
+                                force_synthesis = False
+                                synthesis_retries = 0
+                                stagnation_final_recovery = False
+                                request_messages.append(
+                                    build_completion_feedback(
+                                        decision.reasons,
+                                        task_context=(
+                                            self.task_manager.system_suffix()
+                                        ),
+                                    )
+                                )
+                                continue
                             reason = (
                                 'ForgeCode stopped after repeated recovery '
                                 'requests did not satisfy the current '
@@ -2084,7 +2213,7 @@ class Conversation:
 
     def permission_set(self, mode: str) -> str:
         normalized = normalize_permission_mode(mode)
-        self.permission.mode = normalized
+        self.permission.set_mode(normalized)
         return render_permission_notice(normalized)
 
     def set_permission_approver(self, approver: Any | None) -> None:
@@ -2142,8 +2271,8 @@ class Conversation:
         self.interaction_mode = normalize_interaction_mode(
             snapshot.interaction_mode
         )
-        self.permission.mode = normalize_permission_mode(
-            snapshot.permission_mode
+        self.permission.set_mode(
+            normalize_permission_mode(snapshot.permission_mode)
         )
         self._last_task_context = self.task_manager.system_suffix()
         self._last_repository_context = self.context.repository.system_suffix('')

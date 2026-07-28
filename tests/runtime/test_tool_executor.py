@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from forge.runtime.state import ToolCall
+from forge.runtime.tool_runner import ToolBatchState
 from forge.runtime.tool_targets import mutation_target_paths
 from forge.runtime.tool_executor import (
     PermissionMiddleware,
@@ -44,6 +45,24 @@ class WriteTool(Tool[EmptyInput]):
         del arguments
         (self.root / 'sample.txt').write_text('changed', encoding='utf-8')
         return ToolResult.ok('Wrote sample.')
+
+
+class CommandInput(ToolInput):
+    command: str
+
+
+class CommandTool(Tool[CommandInput]):
+    name = 'run_command'
+    description = 'Run command.'
+    input_model = CommandInput
+    effect = 'process'
+
+    async def execute(self, arguments: CommandInput) -> ToolResult:
+        return ToolResult.ok(f'Ran {arguments.command}.')
+
+
+class VerifyLikeTool(CommandTool):
+    name = 'verify'
 
 
 def run(coro):
@@ -115,6 +134,175 @@ def test_strict_permission_runs_workspace_write_when_approved(
 
     assert record.result.success is True
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'changed'
+
+
+def test_strict_session_approval_reuses_tool_scope(tmp_path: Path) -> None:
+    approvals: list[str] = []
+
+    def approve(*_):
+        approvals.append('asked')
+        return 'allow_session'
+
+    registry = ToolRegistry([WriteTool(tmp_path)])
+    executor = ToolExecutor(
+        registry,
+        root=tmp_path,
+        permission=PermissionMiddleware('strict', approver=approve),
+        logger=ToolExecutionLogger(tmp_path),
+    )
+
+    first = run(
+        executor.execute(ToolCall(0, 'toolu_write_1', 'write_sample', {}))
+    )
+    second = run(
+        executor.execute(ToolCall(0, 'toolu_write_2', 'write_sample', {}))
+    )
+
+    assert first.result.success is True
+    assert second.result.success is True
+    assert approvals == ['asked']
+
+
+def test_switching_permission_mode_clears_session_approvals(
+    tmp_path: Path,
+) -> None:
+    approvals: list[str] = []
+
+    def approve(*_):
+        approvals.append('asked')
+        return 'allow_session'
+
+    permission = PermissionMiddleware('strict', approver=approve)
+    executor = ToolExecutor(
+        ToolRegistry([WriteTool(tmp_path)]),
+        root=tmp_path,
+        permission=permission,
+        logger=ToolExecutionLogger(tmp_path),
+    )
+    call = ToolCall(0, 'toolu_write_1', 'write_sample', {})
+
+    first = run(executor.execute(call))
+    permission.set_mode('trusted')
+    permission.set_mode('strict')
+    second = run(
+        executor.execute(ToolCall(0, 'toolu_write_2', 'write_sample', {}))
+    )
+
+    assert first.result.success is True
+    assert second.result.success is True
+    assert approvals == ['asked', 'asked']
+
+
+def test_user_denial_is_recoverable_when_prompt_was_available(
+    tmp_path: Path,
+) -> None:
+    executor = ToolExecutor(
+        ToolRegistry([WriteTool(tmp_path)]),
+        root=tmp_path,
+        permission=PermissionMiddleware(
+            'strict', approver=lambda *_: 'deny'
+        ),
+        logger=ToolExecutionLogger(tmp_path),
+    )
+
+    record = run(
+        executor.execute(ToolCall(0, 'toolu_deny', 'write_sample', {}))
+    )
+
+    assert record.result.success is False
+    assert record.result.metadata['permission_terminal'] is False
+
+
+def test_user_denial_does_not_count_as_failed_workspace_edit() -> None:
+    call = ToolCall(0, 'toolu_deny', 'write_sample', {})
+    denial = ToolResult.fail(
+        'permission_denied',
+        'User denied this tool call.',
+        metadata={
+            'permission_denied': True,
+            'permission_terminal': False,
+        },
+    )
+    batch = ToolBatchState(
+        workspace_writes=[(0, call, denial, False)],
+    )
+
+    assert batch.pending_write_results(reverted_to_baseline=False) == []
+
+
+def test_auto_mode_approves_workspace_write_without_prompt(
+    tmp_path: Path,
+) -> None:
+    executor = ToolExecutor(
+        ToolRegistry([WriteTool(tmp_path)]),
+        root=tmp_path,
+        permission=PermissionMiddleware('auto'),
+        logger=ToolExecutionLogger(tmp_path),
+    )
+
+    record = run(
+        executor.execute(ToolCall(0, 'toolu_auto', 'write_sample', {}))
+    )
+
+    assert record.result.success is True
+
+
+def test_auto_mode_prompts_for_risky_process_command(tmp_path: Path) -> None:
+    asked: list[str] = []
+    executor = ToolExecutor(
+        ToolRegistry([CommandTool(tmp_path)]),
+        root=tmp_path,
+        permission=PermissionMiddleware(
+            'auto',
+            approver=lambda call, _effect: (
+                asked.append(str(call.arguments['command'])) or 'allow_once'
+            ),
+        ),
+        logger=ToolExecutionLogger(tmp_path),
+    )
+
+    record = run(
+        executor.execute(
+            ToolCall(
+                0,
+                'toolu_risky',
+                'run_command',
+                {'command': 'git push origin main'},
+            )
+        )
+    )
+
+    assert record.result.success is True
+    assert asked == ['git push origin main']
+
+
+def test_auto_mode_checks_verify_command_for_risk(tmp_path: Path) -> None:
+    asked: list[str] = []
+    executor = ToolExecutor(
+        ToolRegistry([VerifyLikeTool(tmp_path)]),
+        root=tmp_path,
+        permission=PermissionMiddleware(
+            'auto',
+            approver=lambda call, _effect: (
+                asked.append(str(call.arguments['command'])) or 'deny'
+            ),
+        ),
+        logger=ToolExecutionLogger(tmp_path),
+    )
+
+    record = run(
+        executor.execute(
+            ToolCall(
+                0,
+                'toolu_verify_risky',
+                'verify',
+                {'command': 'git push origin main'},
+            )
+        )
+    )
+
+    assert record.result.success is False
+    assert asked == ['git push origin main']
 
 
 def test_todo_planning_hook_blocks_complex_write_before_todo(

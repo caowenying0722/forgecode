@@ -33,6 +33,11 @@ _EXECUTE_PLAN_ZH = re.compile(
     r'(?:按|按照).{0,40}(?:方案|计划|上述|刚才).{0,20}'
     r'(?:执行|实施|实现|落地)'
 )
+_START_TASK_WORK_ZH = re.compile(
+    r'(?:阅读|读取|查看|明确|理解).{0,40}(?:任务|task\.md|需求)'
+    r'.{0,30}(?:后|并|然后|开始).{0,20}'
+    r'(?:开始工作|开始实现|执行|实施|实现|落地|完成)'
+)
 _NEGATED_CHANGE_ZH = re.compile(
     rf'(?:不要|别|无需|不用|暂时不|先不|禁止)'
     rf'[^，。；！？\n]{{0,30}}(?:{_CHANGE_VERBS_ZH})'
@@ -134,6 +139,7 @@ def infer_change_required(prompt: str) -> bool:
             or _COMBINED_CHANGE_EN.search(clause)
             or _PRIORITY_FIX_ZH.search(clause)
             or _EXECUTE_PLAN_ZH.search(clause)
+            or _START_TASK_WORK_ZH.search(clause)
         ):
             return True
         if _READ_ONLY_ZH.search(clause) or _READ_ONLY_EN.search(clause):

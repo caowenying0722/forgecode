@@ -5,6 +5,9 @@ from pathlib import Path
 
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
+from prompt_toolkit import PromptSession
 from rich.console import Console
 
 from forge.runtime.state import (
@@ -83,8 +86,8 @@ def test_slash_opens_command_completion_menu() -> None:
     assert '/mode auto|plan|code' in usages
     assert '/plan' in usages
     assert '/code' in usages
-    assert '/permission' in usages
-    assert '/permission trusted|strict|readonly' in usages
+    assert '/permissions' in usages
+    assert '/permission' not in usages
     assert '/mcp' in usages
     assert '/hooks' in usages
     assert '/todo' in usages
@@ -199,6 +202,61 @@ def test_permission_answer_accepts_common_yes_values() -> None:
     assert permission_answer_allows('allow')
     assert not permission_answer_allows('')
     assert not permission_answer_allows('no')
+
+
+def test_permission_picker_uses_injected_selector() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=100)
+    terminal = TerminalUI(
+        console=console,
+        permission_selector=lambda current: (
+            'auto' if current == 'strict' else None
+        ),
+    )
+
+    assert terminal.select_permission_mode('strict') == 'auto'
+
+
+def test_permission_picker_uses_inline_completion_menu() -> None:
+    output = StringIO()
+    console = Console(
+        file=output,
+        force_terminal=True,
+        width=100,
+    )
+    with create_pipe_input() as pipe_input:
+        prompt_session = PromptSession(
+            input=pipe_input,
+            output=DummyOutput(),
+        )
+        terminal = TerminalUI(
+            console=console,
+            prompt_session=prompt_session,
+        )
+        pipe_input.send_text('\x1b[B\r')
+
+        selected = terminal.select_permission_mode('strict')
+
+    assert selected == 'readonly'
+
+
+def test_approval_dialog_uses_injected_selector() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=100)
+    observed: list[tuple[str, object]] = []
+
+    def approve(tool_call: ToolCall, effect: object) -> str:
+        observed.append((tool_call.name, effect))
+        return 'allow_session'
+
+    terminal = TerminalUI(console=console, approval_selector=approve)
+    call = ToolCall(0, 'toolu_command', 'run_command', {'command': 'pytest'})
+
+    with terminal.stream_response() as response:
+        decision = response.request_permission(call, 'process')
+
+    assert decision == 'allow_session'
+    assert observed == [('run_command', 'process')]
 
 
 def test_terminal_renders_session_header_and_markdown_response() -> None:

@@ -77,6 +77,8 @@ class FakeConversation:
             stored_tool_result_characters=457_675,
         )
         self.rollout_enabled = False
+        self.permission_mode = 'trusted'
+        self.permission_modes: list[str] = []
 
     def enable_rollout_persistence(self) -> None:
         self.rollout_enabled = True
@@ -147,9 +149,11 @@ class FakeConversation:
         return '- [in_progress] (high) plan: Plan the work'
 
     def permission_show(self) -> str:
-        return 'Permission: trusted.'
+        return f'Permission: {self.permission_mode}.'
 
     def permission_set(self, mode: str) -> str:
+        self.permission_mode = mode
+        self.permission_modes.append(mode)
         return f'Permission: {mode}.'
 
 
@@ -614,7 +618,7 @@ def test_todo_command_does_not_call_model(
     assert conversation.prompts == []
 
 
-def test_permission_commands_do_not_call_model(
+def test_permissions_picker_switches_mode_without_calling_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conversation = FakeConversation()
@@ -624,15 +628,13 @@ def test_permission_commands_do_not_call_model(
         lambda **_kwargs: conversation,
     )
 
-    result = runner.invoke(
-        app,
-        input='/permission\n/permission strict\n/permission readonly\n',
-    )
+    result = runner.invoke(app, input='/permissions\n3\n')
 
     assert result.exit_code == 0
-    assert 'Permission: trusted.' in result.output
-    assert 'Permission: strict.' in result.output
-    assert 'Permission: readonly.' in result.output
+    assert 'ForgeCode Permissions' in result.output
+    assert 'Approve for me' in result.output
+    assert 'Permission: auto.' in result.output
+    assert conversation.permission_modes == ['auto']
     assert conversation.prompts == []
 
 

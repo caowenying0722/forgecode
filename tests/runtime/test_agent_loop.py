@@ -218,10 +218,10 @@ def tool_response(
     return events
 
 
-def test_conversation_defaults_to_two_million_turn_input_tokens() -> None:
+def test_conversation_defaults_to_no_turn_input_token_limit() -> None:
     conversation = Conversation(client=FakeModelClient())
 
-    assert conversation.max_turn_input_tokens == 2_000_000
+    assert conversation.max_turn_input_tokens is None
 
 
 def test_conversation_forwards_stream_and_returns_final_result() -> None:

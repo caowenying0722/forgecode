@@ -81,3 +81,33 @@ class RecoveryManager:
             for definition in self.tools
             if str(definition.get('name', '')) in allowed
         ]
+
+    def verification_tools(
+        self,
+        *,
+        fix_available: bool,
+        read_available: bool,
+    ) -> list[dict[str, Any]] | None:
+        if self.tools is None:
+            return None
+        allowed = {'verify'}
+        if fix_available:
+            allowed.add('run_command')
+            if read_available:
+                allowed.update({'find_files', 'grep', 'read_file'})
+        return [
+            definition
+            for definition in self.tools
+            if (
+                str(definition.get('name', '')) in allowed
+                or (
+                    fix_available
+                    and
+                    self.tool_runner is not None
+                    and self.tool_runner.effect(str(definition.get('name', '')))
+                    == 'workspace_write'
+                    and str(definition.get('name', ''))
+                    not in self.excluded_write_tools
+                )
+            )
+        ]

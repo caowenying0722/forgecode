@@ -1527,6 +1527,253 @@ def test_stagnation_limit_keeps_tools_for_incomplete_change_recovery(
     )
 
 
+def test_missing_verification_recovery_focuses_verify_after_package_change(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'package-edit',
+        'write_file',
+        {
+            'path': 'package.json',
+            'content': '{"scripts":{"build":"echo ok"}}\n',
+        },
+    )
+    empty_src_search = ToolCall(
+        0,
+        'empty-src-search',
+        'find_files',
+        {'path': '.', 'pattern': 'src/**/*.ts', 'max_results': 200},
+    )
+    verify = ToolCall(
+        0,
+        'package-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    summary = 'Created package.json and verified the diff.'
+    client = FakeModelClient(
+        response_with_tool(edit),
+        text_response('Created package.json.'),
+        response_with_tool(empty_src_search),
+        text_response('No source files found.'),
+        response_with_tool(verify),
+        finish_response(
+            'package-finish',
+            task_kind='change',
+            summary=summary,
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        max_completion_blocks=2,
+        stagnation_warning=1,
+        stagnation_limit=2,
+    )
+
+    events = collect_turn(conversation, 'Create the project baseline')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert completed.result.changed_paths == ('package.json',)
+    assert completed.result.verification is not None
+    assert completed.result.verification.success is True
+    verify_recovery_request = client.calls[2]
+    verify_recovery_tool_names = {
+        definition['name'] for definition in verify_recovery_request['tools']
+    }
+    assert verify_recovery_tool_names == {'verify'}
+    assert '[ForgeCode Verification Recovery]' in (
+        verify_recovery_request['system'] or ''
+    )
+
+
+def test_failed_verification_recovery_allows_fix_before_verify(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'broken-edit',
+        'write_file',
+        {
+            'path': 'package.json',
+            'content': '{"scripts":{"build":"missing-command"}}\n',
+        },
+    )
+    failed_verify = ToolCall(
+        0,
+        'broken-verify',
+        'verify',
+        {'command': 'git diff --check --definitely-invalid'},
+    )
+    fix = ToolCall(
+        0,
+        'fix-package-script',
+        'write_file',
+        {
+            'path': 'package.json',
+            'content': '{"scripts":{"build":"echo ok"}}\n',
+        },
+    )
+    passed_verify = ToolCall(
+        0,
+        'fixed-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    summary = 'Fixed package.json and verified git diff --check.'
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(failed_verify),
+        text_response('Build failed.'),
+        response_with_tool(fix),
+        response_with_tool(passed_verify),
+        finish_response(
+            'fixed-finish',
+            task_kind='change',
+            summary=summary,
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        max_completion_blocks=2,
+        stagnation_warning=1,
+        stagnation_limit=2,
+    )
+
+    events = collect_turn(conversation, 'Create and verify the project')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert completed.result.verification is not None
+    assert completed.result.verification.success is True
+    failed_recovery_request = client.calls[2]
+    failed_recovery_tool_names = {
+        definition['name'] for definition in failed_recovery_request['tools']
+    }
+    assert 'verify' in failed_recovery_tool_names
+    assert 'run_command' in failed_recovery_tool_names
+    assert 'write_file' in failed_recovery_tool_names
+    assert 'list_directory' not in failed_recovery_tool_names
+    assert '[ForgeCode Verification Recovery]' in (
+        failed_recovery_request['system'] or ''
+    )
+
+
+def test_failed_verification_recovery_limits_reads_then_forces_repair(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'complex-package-edit',
+        'write_file',
+        {
+            'path': 'package.json',
+            'content': '{"scripts":{"build":"echo ok"}}\n',
+        },
+    )
+    failed_verify = ToolCall(
+        0,
+        'missing-tsconfig-verify',
+        'verify',
+        {'command': 'git diff --check --definitely-invalid'},
+    )
+    one_read = ToolCall(
+        0,
+        'look-for-tsconfig',
+        'find_files',
+        {'path': '.', 'pattern': 'tsconfig*.json', 'max_results': 20},
+    )
+    rejected_second_read = ToolCall(
+        0,
+        'repeat-tsconfig-search',
+        'find_files',
+        {'path': '.', 'pattern': 'tsconfig*.json', 'max_results': 20},
+    )
+    repair = ToolCall(
+        0,
+        'create-tsconfig',
+        'write_file',
+        {
+            'path': 'tsconfig.json',
+            'content': '{"compilerOptions":{"strict":true}}\n',
+        },
+    )
+    passed_verify = ToolCall(
+        0,
+        'complex-pass-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    summary = 'Created project config and verified the complex baseline.'
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(failed_verify),
+        response_with_tool(one_read),
+        response_with_tools(rejected_second_read, repair),
+        response_with_tool(passed_verify),
+        finish_response(
+            'complex-finish',
+            task_kind='change',
+            summary=summary,
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        max_completion_blocks=2,
+        stagnation_warning=1,
+        stagnation_limit=2,
+    )
+
+    events = collect_turn(
+        conversation,
+        '阅读当前目录下的任务文件task.md，明确任务后开始工作',
+    )
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert completed.result.changed_paths == (
+        'package.json',
+        'tsconfig.json',
+    )
+    assert completed.result.verification is not None
+    assert completed.result.verification.success is True
+
+    first_repair_tools = {
+        definition['name'] for definition in client.calls[2]['tools']
+    }
+    assert {'find_files', 'read_file', 'grep'} <= first_repair_tools
+    second_repair_tools = {
+        definition['name'] for definition in client.calls[3]['tools']
+    }
+    assert 'find_files' not in second_repair_tools
+    assert 'read_file' not in second_repair_tools
+    assert 'grep' not in second_repair_tools
+    assert {'write_file', 'run_command', 'verify'} <= second_repair_tools
+    rejected_results = [
+        event.result
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.tool_call.id == 'repeat-tsconfig-search'
+    ]
+    assert rejected_results
+    assert rejected_results[0].success is False
+    assert rejected_results[0].error is not None
+    assert rejected_results[0].error.code == 'verification_read_limit_reached'
+
+
 def test_verified_change_stagnation_allows_final_summary_recovery(
     tmp_path: Path,
 ) -> None:
