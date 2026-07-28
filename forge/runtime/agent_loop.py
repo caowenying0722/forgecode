@@ -533,6 +533,7 @@ class Conversation:
         verification_fix_recovery = False
         verification_read_used = False
         verification_recovery_calls = 0
+        last_verification_failure_signature = ''
         token_limit_recovery = False
         token_limit_reason = ''
         completion_ready_revision: int | None = None
@@ -1180,7 +1181,12 @@ class Conversation:
                                 return
                             verification_recovery = True
                             verification_fix_recovery = any(
-                                'latest verification failed' in reason
+                                marker in reason
+                                for marker in (
+                                    'latest verification failed',
+                                    'latest verification timed out',
+                                    'latest verification command was invalid',
+                                )
                                 for reason in decision.reasons
                             )
                             force_synthesis = False
@@ -1489,6 +1495,36 @@ class Conversation:
                         )
                     )
                 if tool_call.name == 'verify':
+                    if (
+                        result.error is not None
+                        and result.error.code == 'repeated_tool_call'
+                        and latest_verification is not None
+                        and not latest_verification.success
+                    ):
+                        reason = (
+                            'Verification Recovery stopped after the same '
+                            'verification failure repeated.'
+                        )
+                        self.task_manager.stuck((reason,))
+                        self.messages[:] = request_messages
+                        yield TurnCompleted(
+                            result=TurnResult(
+                                text=reason,
+                                usage=completed_usage,
+                                last_request_usage=request_usage,
+                                model_calls=iteration,
+                                tool_calls=tuple(all_tool_calls),
+                                status='stuck',
+                                changed_paths=(
+                                    self.workspace_tracker.changed_paths
+                                    if self.workspace_tracker is not None
+                                    else ()
+                                ),
+                                verification=latest_verification,
+                                completion_reasons=(reason,),
+                            )
+                        )
+                        return
                     latest_verification = verification_from_result(result)
                     verification_recovery = (
                         latest_verification is not None
@@ -1499,7 +1535,43 @@ class Conversation:
                         verification_fix_recovery = False
                         verification_read_used = False
                         verification_recovery_calls = 0
+                        last_verification_failure_signature = ''
                     else:
+                        if (
+                            latest_verification is not None
+                            and latest_verification.failure_signature
+                            and latest_verification.failure_signature
+                            == last_verification_failure_signature
+                        ):
+                            reason = (
+                                'Verification Recovery stopped after the '
+                                'same verification failure repeated.'
+                            )
+                            self.task_manager.stuck((reason,))
+                            self.messages[:] = request_messages
+                            yield TurnCompleted(
+                                result=TurnResult(
+                                    text=reason,
+                                    usage=completed_usage,
+                                    last_request_usage=request_usage,
+                                    model_calls=iteration,
+                                    tool_calls=tuple(all_tool_calls),
+                                    status='stuck',
+                                    changed_paths=(
+                                        self.workspace_tracker.changed_paths
+                                        if self.workspace_tracker is not None
+                                        else ()
+                                    ),
+                                    verification=latest_verification,
+                                    completion_reasons=(reason,),
+                                )
+                            )
+                            return
+                        last_verification_failure_signature = (
+                            latest_verification.failure_signature
+                            if latest_verification is not None
+                            else ''
+                        )
                         verification_read_used = False
                     if latest_verification is not None:
                         yield VerificationCompleted(
@@ -1957,7 +2029,12 @@ class Conversation:
                                     return
                                 verification_recovery = True
                                 verification_fix_recovery = any(
-                                    'latest verification failed' in reason
+                                    marker in reason
+                                    for marker in (
+                                        'latest verification failed',
+                                        'latest verification timed out',
+                                        'latest verification command was invalid',
+                                    )
                                     for reason in decision.reasons
                                 )
                                 calls_without_progress = 0

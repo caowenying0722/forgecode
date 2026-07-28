@@ -53,10 +53,13 @@ class VerificationEvidence:
     duration_seconds: float
     timed_out: bool
     workspace_revision: int
+    status: str = 'passed'
+    command_id: str = ''
+    failure_signature: str = ''
 
     @property
     def success(self) -> bool:
-        return not self.timed_out and self.exit_code == 0
+        return self.status == 'passed' and not self.timed_out and self.exit_code == 0
 
 
 TaskStatus = Literal['completed', 'blocked', 'stuck', 'failed']

@@ -428,7 +428,11 @@ class TerminalUI:
         if self.prompt_session is not None:
             self.prompt_completer.refresh()
             return self.prompt_session.prompt(
-                [('ansibrightcyan bold', '\u276f ')]
+                [('ansibrightcyan bold', '\u276f ')],
+                completer=self.prompt_completer,
+                complete_while_typing=True,
+                complete_style=CompleteStyle.COLUMN,
+                reserve_space_for_menu=8,
             )
         return self.console.input('[bold bright_cyan]>[/] ')
 
@@ -1052,8 +1056,15 @@ async def wait_for_escape_key() -> None:
 
         while True:
             while msvcrt.kbhit():
-                if msvcrt.getwch() == '\x1b':
+                character = msvcrt.getwch()
+                if character == '\x1b':
                     return
+                try:
+                    msvcrt.ungetwch(character)
+                except OSError:
+                    pass
+                await asyncio.Future()
+                return
             await asyncio.sleep(0.05)
 
     file_descriptor = sys.stdin.fileno()

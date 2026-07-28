@@ -32,9 +32,11 @@ class FakePromptSession:
     def __init__(self, response: str) -> None:
         self.response = response
         self.messages: list[object] = []
+        self.kwargs: list[dict[str, object]] = []
 
-    def prompt(self, message: object = '') -> str:
+    def prompt(self, message: object = '', **kwargs: object) -> str:
         self.messages.append(message)
+        self.kwargs.append(kwargs)
         return self.response
 
 
@@ -61,6 +63,39 @@ def test_terminal_preserves_multiline_prompt_from_interactive_session() -> None:
 
     assert prompt == 'first line\nsecond line\nthird line'
     assert len(prompt_session.messages) == 1
+    assert prompt_session.kwargs[0]['completer'] is terminal.prompt_completer
+    assert prompt_session.kwargs[0]['complete_while_typing'] is True
+
+
+def test_terminal_rebinds_completion_on_every_prompt(tmp_path: Path) -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=True, width=100)
+    prompt_session = FakePromptSession('ok')
+    terminal = TerminalUI(
+        console=console,
+        prompt_session=prompt_session,
+        workspace_root=tmp_path,
+    )
+
+    terminal.read_prompt()
+    created = tmp_path / 'later.ts'
+    created.write_text('later\n', encoding='utf-8')
+    terminal.read_prompt()
+
+    assert len(prompt_session.kwargs) == 2
+    assert all(
+        kwargs['completer'] is terminal.prompt_completer
+        for kwargs in prompt_session.kwargs
+    )
+    completions = list(
+        terminal.prompt_completer.get_completions(
+            Document(text='@lat', cursor_position=4),
+            CompleteEvent(completion_requested=True),
+        )
+    )
+    assert [completion.display_text for completion in completions] == [
+        'later.ts'
+    ]
 
 
 def completions_for(text: str) -> list[object]:

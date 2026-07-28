@@ -183,7 +183,7 @@ def test_run_case_passes_with_fake_agent_and_independent_hidden_test(
         index=0,
         id='toolu_verify',
         name='verify',
-        arguments={'command': case.test_command},
+        arguments={'target': 'diff'},
     )
     client = FakeModelClient(
         tool_response(edit),

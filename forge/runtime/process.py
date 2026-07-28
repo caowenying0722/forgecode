@@ -26,6 +26,7 @@ async def run_process(
     timeout_seconds: float,
     input_text: str | None = None,
     shell: bool = False,
+    env: dict[str, str] | None = None,
 ) -> ProcessResult:
     started = perf_counter()
     stdin = asyncio.subprocess.PIPE if input_text is not None else None
@@ -34,6 +35,7 @@ async def run_process(
         if os.name == 'nt'
         else {'start_new_session': True}
     )
+    process_env = None if env is None else {**os.environ, **env}
     if shell:
         if not isinstance(command, str):
             raise TypeError('Shell commands must be strings.')
@@ -43,6 +45,7 @@ async def run_process(
             stdin=stdin,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=process_env,
             **process_group,
         )
     else:
@@ -54,6 +57,7 @@ async def run_process(
             stdin=stdin,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=process_env,
             **process_group,
         )
     try:

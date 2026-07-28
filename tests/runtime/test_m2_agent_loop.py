@@ -1774,6 +1774,49 @@ def test_failed_verification_recovery_limits_reads_then_forces_repair(
     assert rejected_results[0].error.code == 'verification_read_limit_reached'
 
 
+def test_repeated_verification_failure_stops_with_specific_report(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'whitespace-edit',
+        'write_file',
+        {'path': 'sample.txt', 'content': 'bad whitespace  \n'},
+    )
+    verify = ToolCall(0, 'first-failing-verify', 'verify', {'target': 'diff'})
+    repeat = ToolCall(
+        0,
+        'second-failing-verify',
+        'verify',
+        {'target': 'diff'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(verify),
+        response_with_tool(repeat),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        max_completion_blocks=2,
+        stagnation_warning=1,
+        stagnation_limit=2,
+    )
+
+    events = collect_turn(conversation, 'Create and verify package metadata')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'stuck'
+    assert completed.result.text == (
+        'Verification Recovery stopped after the same verification failure '
+        'repeated.'
+    )
+    assert completed.result.verification is not None
+    assert completed.result.verification.status == 'failed'
+
+
 def test_verified_change_stagnation_allows_final_summary_recovery(
     tmp_path: Path,
 ) -> None:

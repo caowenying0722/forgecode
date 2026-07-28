@@ -121,10 +121,25 @@ class CompletionGate:
                     'The current code has not been verified with the verify tool.'
                 )
             elif not verification.success:
-                reasons.append(
-                    f'The latest verification failed with exit code '
-                    f'{verification.exit_code}.'
-                )
+                if verification.status == 'invalid':
+                    reasons.append(
+                        'The latest verification command was invalid; use a '
+                        'discovered non-interactive project validation command.'
+                    )
+                elif verification.status == 'unavailable':
+                    reasons.append(
+                        'Project verification is unavailable for the current '
+                        'workspace.'
+                    )
+                elif verification.status == 'timed_out':
+                    reasons.append(
+                        'The latest verification timed out.'
+                    )
+                else:
+                    reasons.append(
+                        f'The latest verification failed with exit code '
+                        f'{verification.exit_code}.'
+                    )
             elif verification.workspace_revision != tracker.revision:
                 reasons.append(
                     'The code changed after verification; run verify again for '
@@ -145,8 +160,8 @@ class CompletionGate:
             and not verification.success
         ):
             reasons.append(
-                f'The latest verification failed with exit code '
-                f'{verification.exit_code}.'
+                f'The latest verification failed with status '
+                f'{verification.status}.'
             )
 
         if (

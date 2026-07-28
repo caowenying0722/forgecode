@@ -196,31 +196,41 @@ def test_verify_returns_revision_bound_evidence(tmp_path: Path) -> None:
     initialize_git_repository(tmp_path)
     tracker = WorkspaceTracker(tmp_path)
     asyncio.run(tracker.begin_turn())
-    script = 'print(' + repr('verified') + ')'
-    command = subprocess.list2cmdline([sys.executable, '-c', script])
 
-    result = run(VerifyTool(tmp_path, tracker).run({'command': command}))
+    result = run(VerifyTool(tmp_path, tracker).run({'target': 'diff'}))
 
     assert result.success is True
     assert result.metadata['verification'] is True
     assert result.metadata['workspace_revision'] == 0
     assert result.metadata['exit_code'] == 0
-    assert 'verified' in result.content
+    assert result.metadata['command'] == 'git diff --check'
+
+
+def test_verify_rejects_non_validation_command(tmp_path: Path) -> None:
+    tracker = WorkspaceTracker(tmp_path)
+    asyncio.run(tracker.begin_turn())
+
+    result = run(VerifyTool(tmp_path, tracker).run({'command': 'pwd'}))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'verification_command_invalid'
+    assert result.metadata['verification_status'] == 'invalid'
 
 
 def test_verify_failure_is_structured(tmp_path: Path) -> None:
+    initialize_git_repository(tmp_path)
+    (tmp_path / 'sample.txt').write_text('bad whitespace  \n', encoding='utf-8')
     tracker = WorkspaceTracker(tmp_path)
     asyncio.run(tracker.begin_turn())
-    command = subprocess.list2cmdline(
-        [sys.executable, '-c', 'raise SystemExit(3)']
-    )
 
-    result = run(VerifyTool(tmp_path, tracker).run({'command': command}))
+    result = run(VerifyTool(tmp_path, tracker).run({'target': 'diff'}))
 
     assert result.success is False
     assert result.error is not None
     assert result.error.code == 'verification_failed'
-    assert result.metadata['exit_code'] == 3
+    assert result.metadata['verification_status'] == 'failed'
+    assert result.metadata['exit_code'] != 0
 
 
 def test_git_status_and_diff_return_real_working_tree_state(

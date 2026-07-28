@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import hashlib
 
 from forge.context.working import WorkingState
 from forge.runtime.completion import CompletionDecision, CompletionGate
@@ -15,6 +16,9 @@ from forge.tools.base import ToolResult
 VERIFICATION_BLOCKER_MARKERS = (
     'has not been verified with the verify tool',
     'latest verification failed',
+    'latest verification timed out',
+    'latest verification command was invalid',
+    'Project verification is unavailable',
     'changed after verification',
     'verification command does not run',
 )
@@ -166,11 +170,13 @@ def build_completion_feedback(
             f'{task_context}\n\n'
             'ForgeCode completion check rejected the previous final answer.\n'
             f'{details}\n'
-            'The tools are still available. Continue using them, then provide '
-            'a new final answer after every condition is satisfied. If '
-            'verification is missing, call verify with the relevant test or '
-            'build command; use git diff --check only when the project has no '
-            'more specific validation command.'
+            'Follow the verification state machine. If verification is '
+            'missing or stale, call verify now using target=auto or a '
+            'discovered command_id. If the latest verification failed, use '
+            'the failure output to repair the relevant code or configuration, '
+            'then call verify again. If the verification command was invalid, '
+            'do not repeat it; use a discovered non-interactive project '
+            'validation command.'
         ),
     }
 
@@ -181,6 +187,16 @@ def verification_from_result(
     metadata = result.metadata
     if metadata.get('verification') is not True:
         return None
+    status = str(metadata.get('verification_status', ''))
+    if not status:
+        timed_out = bool(metadata.get('timed_out', False))
+        exit_code = int(metadata.get('exit_code', 0))
+        status = 'timed_out' if timed_out else (
+            'passed' if exit_code == 0 else 'failed'
+        )
+    signature_text = '\n'.join(
+        str(metadata.get(key, '')) for key in ('command', 'exit_code', 'stderr')
+    )
     try:
         return VerificationEvidence(
             command=str(metadata['command']),
@@ -189,6 +205,13 @@ def verification_from_result(
             duration_seconds=float(metadata['duration_seconds']),
             timed_out=bool(metadata['timed_out']),
             workspace_revision=int(metadata['workspace_revision']),
+            status=status,
+            command_id=str(metadata.get('command_id', '')),
+            failure_signature=(
+                hashlib.sha256(signature_text.encode('utf-8')).hexdigest()
+                if status != 'passed'
+                else ''
+            ),
         )
     except (KeyError, TypeError, ValueError):
         return None
