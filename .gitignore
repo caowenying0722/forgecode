@@ -14,6 +14,7 @@ target/
 **/.forge/evals/
 **/.forge/context/
 **/.forge/sessions/
+**/.forge/worktrees/
 **/.forge/tasks/
 **/.forge/mcp.json
 fixtures/

@@ -292,7 +292,7 @@ def test_system_prompt_defines_forgecode_identity() -> None:
     assert 'call `verify`' in prompt
     assert 'Task and execution boundaries:' in prompt
     assert '`task_plan` and `task_update` are for the current active goal' in prompt
-    assert '`task_create`, `task_list`, `task_graph_get`, `task_claim`, and' in prompt
+    assert '`task_create`, `task_list`, `task_graph_get`, `task_graph_plan`, `task_claim`,' in prompt
     assert 'Do not create\n  task-graph items for ordinary bug fixes' in prompt
     assert '`run_in_background=true` only for slow commands' in prompt
 
@@ -402,10 +402,10 @@ def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(
         'git_status',
         'task_list',
         'task_graph_get',
+        'task_graph_plan',
         'memory_list',
         'memory_read',
         'task',
-        'explore_subagent',
         'todo_write',
     }
 
@@ -420,10 +420,8 @@ def test_subagent_delegate_tools_share_conversation_permission(
     )
 
     task_tool = registry._tools['task']
-    explore_tool = registry._tools['explore_subagent']
 
     assert task_tool.permission is conversation.permission
-    assert explore_tool.permission is conversation.permission
 
 
 def test_code_mode_requires_diff_even_for_plan_like_prompt(
@@ -645,7 +643,7 @@ def test_team_messages_are_injected_before_model_request(
         registry=ToolRegistry([RecordingReadFileTool(tmp_path)]),
     )
     conversation.team_bus.send(
-        sender='explore_subagent',
+        sender='task_subagent',
         recipient='lead',
         message_type='status',
         content='I found the relevant files.',
@@ -661,7 +659,7 @@ def test_team_messages_are_injected_before_model_request(
         'text': 'Continue',
     }
     assert '<team_message>' in first_message['content'][1]['text']
-    assert '<from>explore_subagent</from>' in first_message['content'][1]['text']
+    assert '<from>task_subagent</from>' in first_message['content'][1]['text']
     assert 'I found the relevant files.' in first_message['content'][1]['text']
 
 

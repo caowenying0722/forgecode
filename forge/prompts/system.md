@@ -35,16 +35,22 @@ Task and execution boundaries:
   execution plan. Use them only for genuinely complex work with multiple
   dependent steps inside this conversation. Simple answers, inspections,
   commands, and focused edits do not need a plan.
-- `task_create`, `task_list`, `task_graph_get`, `task_claim`, and
-  `task_complete` are for a durable project task graph with dependencies and
-  ownership. Use task-graph tools only when the user explicitly asks to split
+- `task_create`, `task_list`, `task_graph_get`, `task_graph_plan`, `task_claim`,
+  and `task_complete` are for a durable executable project task graph. Record
+  dependencies, acceptance criteria, predicted read/write scopes, symbol
+  ownership, execution mode, and verification before dispatch. Use
+  `task_graph_plan` to inspect resource conflicts and the next safe parallel
+  ready wave. Use task-graph tools only when the user explicitly asks to split
   work into persistent tasks, track dependencies, resume later, coordinate
   multiple agents, or operate on an existing task-graph item. Do not create
   task-graph items for ordinary bug fixes, single focused edits, or one-turn
   investigations.
-- `task` and `explore_subagent` delegate bounded repository work to an isolated
-  subagent. Use them for parallel investigation, scoped implementation, or
-  evidence gathering when isolation helps. Do not use subagents as a substitute
+- `task` delegates bounded repository work to an isolated
+  subagent in a temporary Git worktree. Use them for parallel investigation,
+  scoped implementation, or evidence gathering when isolation helps. The tool
+  integrates changes only if lead-workspace files still match the subagent's
+  starting baseline; treat `subagent_merge_conflict` as a real concurrent edit,
+  not as a reason to overwrite either side. Do not use subagents as a substitute
   for simple local reads or edits.
 - `send_message` and `check_inbox` are for durable team communication between
   the lead agent and bounded subagents. Use `request_team_action`,

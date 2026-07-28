@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 
@@ -11,17 +12,30 @@ from forge.tasks.graph import GraphTask, TaskGraphStore
 from forge.tools.base import Tool, ToolExecutionError, ToolInput, ToolResult
 
 
+class TaskScopeInput(ToolInput):
+    path: str = Field(min_length=1, max_length=1_000)
+    symbols: list[str] = Field(default_factory=list, max_length=50)
+    logical_area: str = Field(default='', max_length=500)
+
+
 class TaskCreateInput(ToolInput):
     subject: str = Field(min_length=1, max_length=500)
     description: str = Field(default='', max_length=10_000)
     blocked_by: list[str] = Field(default_factory=list, max_length=50)
+    acceptance_criteria: list[str] = Field(default_factory=list, max_length=50)
+    read_scope: list[TaskScopeInput] = Field(default_factory=list, max_length=50)
+    write_scope: list[TaskScopeInput] = Field(default_factory=list, max_length=50)
+    execution: Literal['parallel', 'cautious', 'serial'] = 'parallel'
+    verification: list[str] = Field(default_factory=list, max_length=50)
 
 
 class TaskCreateTool(Tool[TaskCreateInput]):
     name = 'task_create'
     description = (
-        'Create one persistent task-graph item with optional blocked_by '
-        'dependencies. Use only for durable multi-step work queues when the '
+        'Create one executable task-graph item with dependencies, acceptance '
+        'criteria, predicted read/write scopes, symbol ownership, execution '
+        'mode, and verification requirements. Use only for durable multi-step '
+        'work queues when the '
         'user explicitly asks to split work into persistent tasks, track '
         'dependencies, resume later, or coordinate multiple agents. Do not '
         'use for ordinary bug fixes, single focused edits, one-turn '
@@ -41,6 +55,11 @@ class TaskCreateTool(Tool[TaskCreateInput]):
                 arguments.subject,
                 description=arguments.description,
                 blocked_by=arguments.blocked_by,
+                acceptance_criteria=arguments.acceptance_criteria,
+                read_scope=[item.model_dump() for item in arguments.read_scope],
+                write_scope=[item.model_dump() for item in arguments.write_scope],
+                execution=arguments.execution,
+                verification=arguments.verification,
             )
         except ValueError as error:
             raise ToolExecutionError('task_create_rejected', str(error)) from error
@@ -111,6 +130,38 @@ class TaskGraphGetTool(Tool[TaskGraphGetInput]):
         )
 
 
+class TaskGraphPlanInput(ToolInput):
+    include_completed: bool = True
+
+
+class TaskGraphPlanTool(Tool[TaskGraphPlanInput]):
+    name = 'task_graph_plan'
+    description = (
+        'Analyze the complete executable task graph. Returns dependency edges, '
+        'resource conflicts, and the next safe parallel ready wave. Use before '
+        'dispatching multiple task-graph workers.'
+    )
+    input_model = TaskGraphPlanInput
+
+    def __init__(self, root: Path, store: TaskGraphStore | None = None) -> None:
+        super().__init__(root)
+        self.store = store or TaskGraphStore(root)
+
+    async def execute(self, arguments: TaskGraphPlanInput) -> ToolResult:
+        analysis = self.store.analysis(
+            include_completed=arguments.include_completed
+        )
+        return ToolResult.ok(
+            'Analyzed executable task graph.',
+            content=json.dumps(analysis, ensure_ascii=False, indent=2),
+            metadata={
+                'task_count': len(analysis['nodes']),
+                'ready_task_ids': analysis['ready_wave'],
+                'conflict_count': len(analysis['resource_conflicts']),
+            },
+        )
+
+
 class TaskClaimInput(ToolInput):
     task_id: str = Field(min_length=1)
     owner: str = Field(default='agent', min_length=1, max_length=200)
@@ -119,7 +170,7 @@ class TaskClaimInput(ToolInput):
 class TaskClaimTool(Tool[TaskClaimInput]):
     name = 'task_claim'
     description = (
-        'Claim one pending unblocked task-graph item. This sets owner and '
+        'Claim one dependency-ready, resource-safe task-graph item. This sets owner and '
         'moves status from pending to in_progress. Use only for durable '
         'task-graph workflows, not for the current active-goal plan.'
     )
@@ -195,6 +246,7 @@ def create_task_graph_tools(
     TaskCreateTool,
     TaskListTool,
     TaskGraphGetTool,
+    TaskGraphPlanTool,
     TaskClaimTool,
     TaskCompleteTool,
 ]:
@@ -203,6 +255,7 @@ def create_task_graph_tools(
         TaskCreateTool(root, shared),
         TaskListTool(root, shared),
         TaskGraphGetTool(root, shared),
+        TaskGraphPlanTool(root, shared),
         TaskClaimTool(root, shared),
         TaskCompleteTool(root, shared),
     )
@@ -215,7 +268,15 @@ def render_task_line(task: GraphTask) -> str:
         if task.blocked_by
         else ''
     )
-    return f'- {task.id} [{task.status}]{owner}{dependencies}: {task.subject}'
+    scopes = (
+        f' writes=[{", ".join(item.path for item in task.write_scope)}]'
+        if task.write_scope
+        else ''
+    )
+    return (
+        f'- {task.id} [{task.status}] mode={task.execution}'
+        f'{owner}{dependencies}{scopes}: {task.subject}'
+    )
 
 
 def render_task_json(task: GraphTask) -> str:

@@ -102,7 +102,7 @@ from forge.sessions.store import SessionStore
 from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolRegistry, ToolResult
 from forge.tools.shell import RunCommandTool
-from forge.tools.subagent import ExploreSubagentTool, TaskSubagentTool
+from forge.tools.subagent import TaskSubagentTool
 from forge.tools.task import create_task_tools
 from forge.tools.team import create_team_tools
 from forge.tools.todo import TodoList, TodoWriteTool
@@ -138,9 +138,9 @@ PLAN_MODE_TOOLS = frozenset(
         'memory_list',
         'memory_read',
         'task',
-        'explore_subagent',
         'task_list',
         'task_graph_get',
+        'task_graph_plan',
         'todo_write',
     }
 )
@@ -282,15 +282,6 @@ class Conversation:
             if 'task' in registry.names:
                 registry.replace(
                     TaskSubagentTool(
-                        resolved_context_root,
-                        permission=self.permission,
-                        workspace_tracker=tracker,
-                        team_bus=self.team_bus,
-                    )
-                )
-            if 'explore_subagent' in registry.names:
-                registry.replace(
-                    ExploreSubagentTool(
                         resolved_context_root,
                         permission=self.permission,
                         workspace_tracker=tracker,
@@ -2100,6 +2091,11 @@ class Conversation:
 
     def session_history(self) -> str:
         return self.session_manager.history()
+
+    def subagent_worktrees(self) -> str:
+        from forge.runtime.worktree import SubagentWorktreeManager
+
+        return SubagentWorktreeManager(self.task_manager.root).describe()
 
 
 def tool_call_signature(tool_call: ToolCall, revision: int) -> str:

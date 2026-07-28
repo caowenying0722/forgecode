@@ -18,12 +18,12 @@ if TYPE_CHECKING:
     from forge.hooks.registry import HookRegistry
     from forge.runtime.team import MessageBus
     from forge.runtime.workspace import WorkspaceTracker
+    from forge.runtime.worktree import SubagentWorktreeManager
 
 
 SUBAGENT_EXCLUDED_TOOLS = frozenset(
     {
         'task',
-        'explore_subagent',
         'task_create',
         'task_claim',
         'task_get',
@@ -35,8 +35,9 @@ SUBAGENT_EXCLUDED_TOOLS = frozenset(
 )
 
 
-EXPLORE_SUBAGENT_SYSTEM = '''You are ForgeCode Explore Subagent.
-You perform bounded repository work for the main agent in an isolated context.
+SUBAGENT_SYSTEM = '''You are a ForgeCode Task Subagent.
+You perform bounded repository work for the main agent in an isolated Git
+worktree and context. Other agents cannot see your unintegrated file edits.
 Use the provided tools to inspect, edit, run commands, and verify when needed.
 You cannot spawn recursive subagents or manage the main task plan. Do not claim
 completion of the user's whole task. Return a concise structured report with:
@@ -59,24 +60,28 @@ class SubagentModelClient(Protocol):
         ...
 
 
-class ExploreSubagentInput(ToolInput):
+class TaskSubagentInput(ToolInput):
     task: str = Field(min_length=1, max_length=2_000)
     focus_paths: list[str] = Field(default_factory=list, max_length=10)
     max_rounds: int = Field(default=4, ge=1, le=6)
 
 
-class ExploreSubagentTool(Tool[ExploreSubagentInput]):
-    name = 'explore_subagent'
+class TaskSubagentTool(Tool[TaskSubagentInput]):
+    name = 'task'
+    effect = 'process'
     description = (
-        'Delegate bounded repository work to an isolated '
-        'subagent. Use this to locate relevant files, gather evidence, and '
+        'Delegate bounded repository work to a subagent with an isolated Git '
+        'worktree and context. Use this to locate relevant files, gather '
+        'evidence, and '
         'make scoped edits when isolation or parallel investigation helps. '
         'Do not use for simple local reads or small focused edits. The '
         'subagent cannot spawn recursive agents or manage task-plan tools; '
-        'its calls still pass through permissions, hooks, and logging. It '
-        'returns a structured report for the main agent.'
+        'its calls still pass through permissions, hooks, and logging. '
+        'Changes are integrated only when the lead files still match the '
+        'subagent start baseline; conflicts preserve the worktree. It returns '
+        'a structured report for the main agent.'
     )
-    input_model = ExploreSubagentInput
+    input_model = TaskSubagentInput
 
     def __init__(
         self,
@@ -86,42 +91,94 @@ class ExploreSubagentTool(Tool[ExploreSubagentInput]):
         permission: 'PermissionHook | None' = None,
         workspace_tracker: 'WorkspaceTracker | None' = None,
         team_bus: 'MessageBus | None' = None,
+        worktree_manager: 'SubagentWorktreeManager | None' = None,
     ) -> None:
         super().__init__(root)
         self.client = client
         self.permission = permission
         self.workspace_tracker = workspace_tracker
         self.team_bus = team_bus
+        self.worktree_manager = worktree_manager
 
-    async def execute(self, arguments: ExploreSubagentInput) -> ToolResult:
+    async def execute(self, arguments: TaskSubagentInput) -> ToolResult:
         from forge.runtime.model_client import AnthropicModelClient
+        from forge.runtime.worktree import (
+            SubagentWorktreeManager,
+            WorktreeError,
+        )
 
         client = self.client or AnthropicModelClient.from_config()
-        subagent = ExploreSubagent(
-            self.root,
+        manager = self.worktree_manager or SubagentWorktreeManager(self.root)
+        try:
+            lease = manager.create(self.name)
+        except WorktreeError as error:
+            return ToolResult.fail(
+                error.code,
+                str(error),
+                details={'isolation': 'worktree'},
+            )
+        subagent = TaskSubagent(
+            lease.path,
             client,
             permission=self.permission,
-            workspace_tracker=self.workspace_tracker,
             team_bus=self.team_bus,
+            control_root=self.root,
+            agent_id=lease.id,
         )
-        return await subagent.run(arguments)
+        result = await subagent.run(arguments)
+        try:
+            integration = manager.integrate(
+                lease,
+                apply=result.success,
+            )
+        except WorktreeError as error:
+            return ToolResult.fail(
+                error.code,
+                str(error),
+                content=result.content,
+                details={
+                    'isolation': 'worktree',
+                    'worktree_path': str(lease.path),
+                },
+                metadata={**result.metadata, 'worktree_path': str(lease.path)},
+            )
+        integration_metadata = {
+            'isolation': 'worktree',
+            'worktree_id': lease.id,
+            'base_head': lease.base_head,
+            'changed_paths': list(integration.changed_paths),
+            'integrated_paths': list(integration.integrated_paths),
+            'conflicts': list(integration.conflicts),
+            'worktree_path': integration.worktree_path,
+            'worktree_cleaned_up': integration.cleaned_up,
+        }
+        if integration.conflicts:
+            paths = ', '.join(integration.conflicts)
+            return ToolResult.fail(
+                'subagent_merge_conflict',
+                'Subagent changes were not integrated because the lead '
+                f'workspace also changed: {paths}. The isolated worktree '
+                'was preserved for review.',
+                content=result.content,
+                details=integration_metadata,
+                metadata={**result.metadata, **integration_metadata},
+            )
+        if not result.success:
+            return ToolResult(
+                success=False,
+                summary=result.summary,
+                content=result.content,
+                error=result.error,
+                metadata={**result.metadata, **integration_metadata},
+            )
+        return ToolResult.ok(
+            result.summary,
+            content=result.content,
+            metadata={**result.metadata, **integration_metadata},
+        )
 
 
-class TaskSubagentTool(ExploreSubagentTool):
-    name = 'task'
-    description = (
-        'Delegate bounded repository work to an isolated '
-        'subagent with a clean context. Use this to split off investigation '
-        'or implementation work when isolation, parallelism, or focused '
-        'evidence gathering helps. Do not use for simple local reads or small '
-        'focused edits. The subagent has normal tools except task, subagent, '
-        'and task-plan control tools, so it cannot recursively spawn agents. '
-        'Its calls still pass through ForgeCode hooks, permissions, and tool '
-        'logging.'
-    )
-
-
-class ExploreSubagent:
+class TaskSubagent:
     '''A small isolated model loop without recursive task/subagent tools.'''
 
     def __init__(
@@ -133,20 +190,26 @@ class ExploreSubagent:
         hooks: 'HookRegistry | None' = None,
         workspace_tracker: 'WorkspaceTracker | None' = None,
         team_bus: 'MessageBus | None' = None,
+        control_root: Path | None = None,
+        agent_id: str = 'task_subagent',
     ) -> None:
         from forge.hooks.builtin import PermissionHook, ToolLoggingHook
         from forge.hooks.registry import HookRegistry
         from forge.runtime.tool_executor import ToolExecutor
 
         self.root = root
+        self.control_root = (control_root or root).resolve()
+        self.agent_id = agent_id
         self.client = client
         self.registry = create_subagent_registry(
             root,
             workspace_tracker,
             team_bus=team_bus,
+            agent_id=agent_id,
+            control_root=self.control_root,
         )
         self.permission = permission or PermissionHook('trusted')
-        self.logger = ToolLoggingHook(root, agent='explore_subagent')
+        self.logger = ToolLoggingHook(self.control_root, agent=agent_id)
         self.hooks = hooks or HookRegistry([self.permission, self.logger])
         self.executor = ToolExecutor(
             self.registry,
@@ -157,7 +220,7 @@ class ExploreSubagent:
             hooks=self.hooks,
         )
 
-    async def run(self, arguments: ExploreSubagentInput) -> ToolResult:
+    async def run(self, arguments: TaskSubagentInput) -> ToolResult:
         from forge.runtime.agent_messages import (
             build_assistant_message,
             build_tool_result_message,
@@ -173,7 +236,7 @@ class ExploreSubagent:
         messages: list[dict[str, Any]] = [
             {
                 'role': 'user',
-                'content': render_explore_task(arguments),
+                'content': render_subagent_task(arguments),
             }
         ]
         total_usage = TokenUsage(input_tokens=0, output_tokens=0)
@@ -187,7 +250,7 @@ class ExploreSubagent:
             async for event in self.client.stream(
                 messages,
                 tools=self.registry.definitions,
-                system=EXPLORE_SUBAGENT_SYSTEM,
+                system=SUBAGENT_SYSTEM,
             ):
                 if isinstance(event, ModelTextDelta):
                     text_parts.append(event.text)
@@ -221,14 +284,14 @@ class ExploreSubagent:
                 )
 
         if not final_text:
-            final_text = 'Explore subagent reached its round limit without a report.'
+            final_text = 'Task subagent reached its round limit without a report.'
             return ToolResult.fail(
                 'subagent_no_report',
                 final_text,
                 metadata=metadata(total_usage, tool_calls),
             )
         return ToolResult.ok(
-            'Explore subagent returned a structured report.',
+            'Task subagent returned a structured report.',
             content=final_text,
             metadata=metadata(total_usage, tool_calls),
         )
@@ -239,6 +302,8 @@ def create_subagent_registry(
     workspace_tracker: 'WorkspaceTracker | None' = None,
     *,
     team_bus: 'MessageBus | None' = None,
+    agent_id: str = 'task_subagent',
+    control_root: Path | None = None,
 ) -> ToolRegistry:
     from forge.mcp import MCPClientManager
     from forge.tools.filesystem import (
@@ -258,8 +323,9 @@ def create_subagent_registry(
     from forge.runtime.workspace import WorkspaceTracker
 
     tracker = workspace_tracker or WorkspaceTracker(root)
+    state_root = (control_root or root).resolve()
     bus = team_bus
-    mcp_manager = MCPClientManager.from_config_file(root)
+    mcp_manager = MCPClientManager.from_config_file(state_root)
     tools = [
         ListDirectoryTool(root),
         FindFilesTool(root),
@@ -274,9 +340,9 @@ def create_subagent_registry(
         VerifyTool(root, tracker),
         GitStatusTool(root),
         GitDiffTool(root),
-        *create_task_graph_tools(root),
-        *create_memory_tools(root),
-        *create_team_tools(root, bus=bus, agent_id='explore_subagent'),
+        *create_task_graph_tools(state_root),
+        *create_memory_tools(state_root),
+        *create_team_tools(state_root, bus=bus, agent_id=agent_id),
         *[
             MCPTool(root, remote_tool)
             for remote_tool in mcp_manager.list_tools()
@@ -292,7 +358,7 @@ def create_subagent_registry(
     )
 
 
-def render_explore_task(arguments: ExploreSubagentInput) -> str:
+def render_subagent_task(arguments: TaskSubagentInput) -> str:
     focus = (
         '\nFocus paths:\n' + '\n'.join(f'- {path}' for path in arguments.focus_paths)
         if arguments.focus_paths
@@ -303,7 +369,7 @@ def render_explore_task(arguments: ExploreSubagentInput) -> str:
 
 def metadata(usage: Any, tool_calls: list[str]) -> dict[str, Any]:
     return {
-        'subagent': 'explore',
+        'subagent': 'task',
         'input_tokens': usage.total_input_tokens,
         'output_tokens': usage.output_tokens,
         'tool_calls': tool_calls,

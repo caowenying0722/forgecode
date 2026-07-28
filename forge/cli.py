@@ -198,6 +198,13 @@ def run_interactive_chat(
             )
             continue
 
+        if prompt.strip() == '/worktrees':
+            resolved_terminal.show_notice(
+                'Subagent worktrees',
+                resolved_session.subagent_worktrees(),
+            )
+            continue
+
         if prompt.strip() == '/mcp':
             resolved_terminal.show_notice('MCP', resolved_session.mcp_status())
             continue

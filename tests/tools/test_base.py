@@ -33,6 +33,7 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'task_create',
         'task_list',
         'task_graph_get',
+        'task_graph_plan',
         'task_claim',
         'task_complete',
         'memory_list',
@@ -47,7 +48,6 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
         'list_team_requests',
         'claim_next_task',
         'task',
-        'explore_subagent',
         'finish_task',
     )
     assert [definition['name'] for definition in registry.definitions] == list(
@@ -64,9 +64,11 @@ def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
     assert registry.effect('replace_text') == 'workspace_write'
     assert registry.effect('apply_patch') == 'workspace_write'
     assert registry.effect('run_command') == 'process'
+    assert registry.effect('task') == 'process'
     assert registry.effect('task_create') == 'workspace_write'
     assert registry.effect('task_list') == 'read_only'
     assert registry.effect('task_graph_get') == 'read_only'
+    assert registry.effect('task_graph_plan') == 'read_only'
     assert registry.effect('task_claim') == 'workspace_write'
     assert registry.effect('task_complete') == 'workspace_write'
     assert registry.effect('send_message') == 'read_only'

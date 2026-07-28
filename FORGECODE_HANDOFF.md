@@ -38,7 +38,6 @@ Plan mode allows read/context tools such as:
 - `memory_list`
 - `memory_read`
 - `task`
-- `explore_subagent`
 - `todo_write`
 
 ### Context Management
@@ -167,6 +166,18 @@ Commands:
 
 Strict mode uses an interactive confirmation flow. Denials are treated as permission outcomes, not edit failures.
 
+### Subagent Worktree Isolation
+
+`task` executes in a detached Git worktree under
+`.forge/worktrees/`. ForgeCode overlays the lead checkout's current tracked and
+untracked non-ignored state onto the worktree, then fingerprints that state as
+the optimistic merge baseline. On completion, changed files are integrated only
+when the lead copy still matches the baseline. Overlapping edits return
+`subagent_merge_conflict`, leave the lead checkout untouched, and preserve the
+worktree path for review. Integrations use a shared Git-directory lock; clean or
+successfully integrated worktrees are removed automatically. There is no
+shared-directory fallback when Git isolation cannot be created.
+
 ### Todo Planning
 
 `todo_write` was added as a planning tool.
@@ -207,8 +218,7 @@ ForgeCode now has a minimal supervised worker subagent model.
 
 Main tools:
 
-- `task`: preferred delegation tool
-- `explore_subagent`: compatibility alias
+- `task`: the single delegation tool
 
 Subagent behavior:
 
@@ -233,7 +243,6 @@ It has normal repository tools, including:
 It does not have recursive/control tools:
 
 - `task`
-- `explore_subagent`
 - `task_get`
 - `task_plan`
 - `task_update`

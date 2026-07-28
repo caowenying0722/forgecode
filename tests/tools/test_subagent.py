@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 import json
+from pathlib import Path
+import subprocess
 from typing import Any
 
 from forge.hooks.builtin import PermissionHook
@@ -18,8 +20,9 @@ from forge.runtime.state import (
     ToolCall,
 )
 from forge.tools.subagent import (
-    ExploreSubagent,
-    ExploreSubagentInput,
+    TaskSubagent,
+    TaskSubagentInput,
+    TaskSubagentTool,
     SUBAGENT_EXCLUDED_TOOLS,
     create_subagent_registry,
 )
@@ -47,7 +50,7 @@ class FakeSubagentClient:
             yield event
 
 
-def test_explore_subagent_uses_main_tools_except_task_controls_and_reports(
+def test_task_subagent_uses_main_tools_except_task_controls_and_reports(
     tmp_path,
 ) -> None:
     (tmp_path / 'sample.txt').write_text('old value\n', encoding='utf-8')
@@ -75,17 +78,17 @@ def test_explore_subagent_uses_main_tools_except_task_controls_and_reports(
             ModelUsageUpdate(usage=TokenUsage(input_tokens=20, output_tokens=8)),
         ],
     )
-    subagent = ExploreSubagent(tmp_path, client)
+    subagent = TaskSubagent(tmp_path, client)
 
     result = asyncio.run(
         subagent.run(
-            ExploreSubagentInput(task='Inspect sample', max_rounds=2)
+            TaskSubagentInput(task='Inspect sample', max_rounds=2)
         )
     )
 
     assert result.success is True
     assert 'sample.txt contains old value' in result.content
-    assert result.metadata['subagent'] == 'explore'
+    assert result.metadata['subagent'] == 'task'
     assert result.metadata['tool_calls'] == ['read_file']
     tool_names = {tool['name'] for tool in client.calls[0]['tools']}
     assert {
@@ -118,10 +121,10 @@ def test_explore_subagent_uses_main_tools_except_task_controls_and_reports(
         'claim_next_task',
     }.issubset(tool_names)
     assert tool_names.isdisjoint(SUBAGENT_EXCLUDED_TOOLS)
-    assert 'Explore Subagent' in client.calls[0]['system']
+    assert 'Task Subagent' in client.calls[0]['system']
 
 
-def test_explore_subagent_tool_calls_go_through_permission_hooks(
+def test_task_subagent_tool_calls_go_through_permission_hooks(
     tmp_path,
 ) -> None:
     write = ToolCall(
@@ -142,7 +145,7 @@ def test_explore_subagent_tool_calls_go_through_permission_hooks(
             ModelUsageUpdate(usage=TokenUsage(input_tokens=20, output_tokens=8)),
         ],
     )
-    subagent = ExploreSubagent(
+    subagent = TaskSubagent(
         tmp_path,
         client,
         permission=PermissionHook('readonly'),
@@ -150,7 +153,7 @@ def test_explore_subagent_tool_calls_go_through_permission_hooks(
 
     result = asyncio.run(
         subagent.run(
-            ExploreSubagentInput(task='Try unsafe write', max_rounds=2)
+            TaskSubagentInput(task='Try unsafe write', max_rounds=2)
         )
     )
 
@@ -161,12 +164,12 @@ def test_explore_subagent_tool_calls_go_through_permission_hooks(
             encoding='utf-8'
         ).splitlines()[0]
     )
-    assert log['agent'] == 'explore_subagent'
+    assert log['agent'] == 'task_subagent'
     assert log['tool'] == 'write_file'
     assert log['error_code'] == 'permission_denied'
 
 
-def test_explore_subagent_can_send_team_message_to_lead(tmp_path) -> None:
+def test_task_subagent_can_send_team_message_to_lead(tmp_path) -> None:
     send = ToolCall(
         index=0,
         id='toolu_send',
@@ -190,11 +193,11 @@ def test_explore_subagent_can_send_team_message_to_lead(tmp_path) -> None:
         ],
     )
     bus = MessageBus(tmp_path)
-    subagent = ExploreSubagent(tmp_path, client, team_bus=bus)
+    subagent = TaskSubagent(tmp_path, client, team_bus=bus)
 
     result = asyncio.run(
         subagent.run(
-            ExploreSubagentInput(task='Report progress', max_rounds=2)
+            TaskSubagentInput(task='Report progress', max_rounds=2)
         )
     )
     messages = bus.collect('lead')
@@ -202,13 +205,13 @@ def test_explore_subagent_can_send_team_message_to_lead(tmp_path) -> None:
     assert result.success is True
     assert result.metadata['tool_calls'] == ['send_message']
     assert len(messages) == 1
-    assert messages[0].sender == 'explore_subagent'
+    assert messages[0].sender == 'task_subagent'
     assert messages[0].recipient == 'lead'
     assert messages[0].type == 'status'
     assert messages[0].content == 'Inspected sample.txt.'
 
 
-def test_explore_subagent_can_write_when_permission_allows(
+def test_task_subagent_can_write_when_permission_allows(
     tmp_path,
 ) -> None:
     write = ToolCall(
@@ -231,7 +234,7 @@ def test_explore_subagent_can_write_when_permission_allows(
             ModelUsageUpdate(usage=TokenUsage(input_tokens=20, output_tokens=8)),
         ],
     )
-    subagent = ExploreSubagent(
+    subagent = TaskSubagent(
         tmp_path,
         client,
         permission=PermissionHook('trusted'),
@@ -239,7 +242,7 @@ def test_explore_subagent_can_write_when_permission_allows(
 
     result = asyncio.run(
         subagent.run(
-            ExploreSubagentInput(task='Write a file', max_rounds=2)
+            TaskSubagentInput(task='Write a file', max_rounds=2)
         )
     )
 
@@ -267,3 +270,102 @@ def test_create_subagent_registry_excludes_recursive_control_tools(
     assert 'verify' in registry.names
     assert 'memory_write' in registry.names
     assert set(registry.names).isdisjoint(SUBAGENT_EXCLUDED_TOOLS)
+
+
+def test_subagent_tool_isolates_and_integrates_worktree_changes(
+    tmp_path: Path,
+) -> None:
+    repository = create_git_repository(tmp_path)
+    write = ToolCall(
+        index=0,
+        id='toolu_write',
+        name='write_file',
+        arguments={'path': 'sample.txt', 'content': 'isolated change\n'},
+    )
+    client = FakeSubagentClient(
+        [
+            ModelUsageUpdate(usage=TokenUsage(input_tokens=10, output_tokens=0)),
+            ModelToolCallCompleted(tool_call=write),
+            ModelUsageUpdate(usage=TokenUsage(input_tokens=10, output_tokens=2)),
+        ],
+        [
+            ModelUsageUpdate(usage=TokenUsage(input_tokens=20, output_tokens=0)),
+            ModelTextDelta(text='changes_made: sample.txt'),
+            ModelUsageUpdate(usage=TokenUsage(input_tokens=20, output_tokens=4)),
+        ],
+    )
+    tool = TaskSubagentTool(
+        repository,
+        client=client,
+        permission=PermissionHook('trusted'),
+    )
+
+    result = asyncio.run(
+        tool.run({'task': 'Update sample.txt', 'max_rounds': 2})
+    )
+
+    assert result.success is True
+    assert result.metadata['isolation'] == 'worktree'
+    assert result.metadata['integrated_paths'] == ['sample.txt']
+    assert result.metadata['worktree_cleaned_up'] is True
+    assert (repository / 'sample.txt').read_text(
+        encoding='utf-8'
+    ) == 'isolated change\n'
+    worktrees = subprocess.run(
+        ['git', 'worktree', 'list', '--porcelain'],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert worktrees.count('worktree ') == 1
+
+
+def test_subagent_tool_refuses_shared_fallback_without_git(
+    tmp_path: Path,
+) -> None:
+    tool = TaskSubagentTool(
+        tmp_path,
+        client=FakeSubagentClient([]),
+    )
+
+    result = asyncio.run(tool.run({'task': 'Write sample.txt'}))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code in {
+        'subagent_worktree_unavailable',
+        'subagent_worktree_root_mismatch',
+    }
+    assert not (tmp_path / 'sample.txt').exists()
+
+
+def create_git_repository(root: Path) -> Path:
+    subprocess.run(['git', 'init'], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'forge@example.com'],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'Forge Test'],
+        cwd=root,
+        check=True,
+    )
+    (root / '.gitignore').write_text(
+        '**/.forge/worktrees/\n',
+        encoding='utf-8',
+    )
+    (root / 'sample.txt').write_text('base\n', encoding='utf-8')
+    subprocess.run(
+        ['git', 'add', '.gitignore', 'sample.txt'],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'commit', '-m', 'initial'],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return root

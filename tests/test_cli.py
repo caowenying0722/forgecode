@@ -128,6 +128,9 @@ class FakeConversation:
     def session_history(self) -> str:
         return '- session-123456789abc [2 messages]'
 
+    def subagent_worktrees(self) -> str:
+        return '- task-abcd\n  path: .forge/worktrees/task-abcd'
+
     def mode_show(self) -> str:
         return 'Mode: auto.'
 
@@ -414,7 +417,7 @@ def test_session_commands_do_not_call_model(
         app,
         input=(
             '/sessions\n/resume\n/resume session-123456789abc\n'
-            '/fork\n/fork session-123456789abc\n'
+            '/fork\n/fork session-123456789abc\n/worktrees\n'
         ),
     )
 
@@ -424,6 +427,7 @@ def test_session_commands_do_not_call_model(
     assert 'Resumed session session-123456789abc' in result.output
     assert 'Forked session latest' in result.output
     assert 'Forked session session-123456789abc' in result.output
+    assert 'task-abcd' in result.output
     assert conversation.rollout_enabled is True
     assert conversation.prompts == []
 

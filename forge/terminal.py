@@ -52,6 +52,7 @@ SLASH_COMMANDS = (
         '分叉指定保存会话',
     ),
     SlashCommandSpec('/sessions', '/sessions', '列出已保存会话'),
+    SlashCommandSpec('/worktrees', '/worktrees', '列出保留的子 Agent worktree'),
     SlashCommandSpec('/mode', '/mode', '查看当前交互模式'),
     SlashCommandSpec(
         '/mode ',

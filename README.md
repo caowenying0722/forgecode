@@ -674,6 +674,7 @@ ForgeCode 在交互终端中提供 Slash Command，用于执行不需要交给�
 | `/fork` | 从最近保存的会话创建独立分叉 | 否 |
 | `/fork session-id` | 从指定会话创建独立分叉 | 否 |
 | `/sessions` | 列出最近保存的会话 | 否 |
+| `/worktrees` | 列出因冲突或失败而保留的子 Agent worktree | 否 |
 | `/task` | 查看当前目标、状态和可选计划进度 | 否 |
 | `/task history` | 列出 `.forge/tasks/` 中保存的复杂任务 | 否 |
 | `/task resume task-id` | 恢复一个已保存的复杂任务 | 否 |
@@ -768,15 +769,48 @@ MCP stdio server 必须使用 `Content-Length` JSON-RPC 帧，支持
 
 ### 6.3 Task Subagent
 
-首个子 Agent 是受监督的 worker，可使用主 Agent 的常规仓库工具，包括读取、搜索、写文件、补丁、命令执行、验证、Git 和 MCP 工具。主 Agent 通过 `task` 工具委派工作，`explore_subagent` 作为兼容别名保留。子 Agent 使用独立消息上下文，但不会获得 `task`、`explore_subagent`、`task_plan`、`task_update`、`task_get`、`todo_write`、`finish_task` 这类任务控制工具，避免递归创建新的子 Agent。
+首个子 Agent 是受监督的 worker，可使用主 Agent 的常规仓库工具，包括读取、搜索、写文件、补丁、命令执行、验证、Git 和 MCP 工具。主 Agent 统一通过 `task` 工具委派工作。每次委派都会从当前 `HEAD` 创建 `.forge/worktrees/` 下的 detached Git worktree，并把主目录当时已有的 tracked 修改、删除和未跟踪文件同步进去，因此子 Agent 能看到当前开发状态，同时不会直接写入主目录。子 Agent 使用独立消息上下文，但不会获得 `task`、`task_plan`、`task_update`、`task_get`、`todo_write`、`finish_task` 这类任务控制工具，避免递归创建新的子 Agent。
+
+子 Agent 结束时，ForgeCode 比较启动基线、子 Agent 最终状态和主目录当前状态。只有主文件仍等于启动基线时才自动集成；如果主 Agent、用户或另一个子 Agent同时修改了相同文件，整批集成会以 `subagent_merge_conflict` 失败，主目录保持不变，冲突 worktree 被保留并通过工具 metadata 返回路径，也可以用 `/worktrees` 查看。不同子 Agent 的集成使用共享 Git 锁串行化，避免检查与写回之间的竞态。无改动或成功集成的 worktree 自动清理；Git ignored 文件和 `.forge/` 控制面不会复制或回写，依赖和密钥需要在 worktree 中单独准备。
 
 - [x] 使用独立上下文和独立 Token 统计；
 - [x] 设置最大执行轮数；
 - [x] 拥有常规仓库工具，但不拥有递归 spawn 和任务图管理工具；
 - [x] 子 Agent 工具调用仍经过 `ToolExecutor`、权限 Hook 和工具日志；
+- [x] 每个写入型委派使用独立 Git worktree，并在回写时检测并发冲突；
+- [x] 无改动或成功集成后自动清理，冲突时保留 worktree 供人工检查；
 - [x] 返回相关文件、证据、修改内容、验证结果、剩余风险和不确定问题的结构化摘要；
 - [x] 由主 Agent 决定是否采纳结论；
 - [ ] 比较启用前后的主 Agent 上下文消耗。
+
+### 6.4 可执行任务规划图
+
+持久任务图不再只记录 `blocked_by`。每个任务节点还可以记录验收标准、预计读取范围、预计写入范围、符号所有权、执行方式和验证要求。`task_graph_plan` 会同时生成两种关系：
+
+```text
+用户目标
+   ↓
+只读探索
+   ↓
+依赖 DAG：A 完成后 B 才能开始
+   +
+资源冲突图：哪些任务不能同时写
+   ↓
+Ready Wave：当前可以安全并行领取的任务
+   ↓
+独立 Worktree 执行 → 验证证据 → 集成
+```
+
+资源范围使用仓库相对路径。单个文件写成 `forge/tasks/graph.py`，子树写成 `forge/tasks/**`；`symbols` 表示该文件内预计拥有的函数、类或其他符号，`logical_area` 用于标记跨文件但属于同一逻辑区域的修改。
+
+- 只有读取范围重叠：正常并行；
+- 写入范围不重叠：正常并行；
+- 同文件、不同符号：两个任务都显式使用 `cautious` 才允许谨慎并行；
+- 写入范围相同、读写相撞或 `logical_area` 相同：进入不同 Ready Wave，串行执行；
+- `serial` 任务：不与任何正在执行或同批次任务并行；
+- 声明了 `verification` 的任务，完成时必须提交 `evidence`。
+
+旧版 `.forge/task-graph/*.json` 不需要迁移；缺失的新字段会按空范围和 `parallel` 方式读取。任务图负责决定“哪些任务现在可安全执行”，Worktree 继续负责文件隔离和集成时的最终冲突保护。
 
 ### 验收条件
 

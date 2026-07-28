@@ -23,7 +23,7 @@ def run(coroutine: object):
 
 def test_send_message_and_check_inbox_consumes_messages(tmp_path: Path) -> None:
     bus = MessageBus(tmp_path)
-    send = SendMessageTool(tmp_path, bus=bus, sender='explore_subagent')
+    send = SendMessageTool(tmp_path, bus=bus, sender='task_subagent')
     check = CheckInboxTool(tmp_path, bus=bus, recipient='lead')
 
     sent = run(
@@ -39,11 +39,11 @@ def test_send_message_and_check_inbox_consumes_messages(tmp_path: Path) -> None:
     empty = run(check.run({}))
 
     assert sent.success is True
-    assert sent.metadata['from'] == 'explore_subagent'
+    assert sent.metadata['from'] == 'task_subagent'
     assert collected.success is True
     assert collected.metadata['message_count'] == 1
     assert '<team_message>' in collected.content
-    assert '<from>explore_subagent</from>' in collected.content
+    assert '<from>task_subagent</from>' in collected.content
     assert 'Found the relevant files.' in collected.content
     assert empty.success is True
     assert empty.metadata['message_count'] == 0
@@ -53,7 +53,7 @@ def test_team_notification_escapes_xml_sensitive_content(tmp_path: Path) -> None
     bus = MessageBus(tmp_path)
     message = bus.send(
         sender='lead',
-        recipient='explore_subagent',
+        recipient='task_subagent',
         message_type='warning',
         content='Use A < B & C > D',
     )
@@ -69,20 +69,20 @@ def test_team_request_response_tracks_protocol_state(tmp_path: Path) -> None:
     respond_tool = RespondTeamRequestTool(
         tmp_path,
         bus=bus,
-        sender='explore_subagent',
+        sender='task_subagent',
     )
     list_tool = ListTeamRequestsTool(tmp_path, bus=bus)
 
     requested = run(
         request_tool.run(
             {
-                'to': 'explore_subagent',
+                'to': 'task_subagent',
                 'type': 'shutdown',
                 'content': 'Please shut down gracefully.',
             }
         )
     )
-    inbox = bus.collect('explore_subagent')
+    inbox = bus.collect('task_subagent')
     responded = run(
         respond_tool.run(
             {
@@ -141,12 +141,12 @@ def test_claim_next_task_claims_first_unblocked_task(tmp_path: Path) -> None:
     tool = ClaimNextTaskTool(
         tmp_path,
         store=store,
-        agent_id='explore_subagent',
+        agent_id='task_subagent',
     )
 
     result = run(tool.run({}))
 
     assert result.success is True
     assert result.metadata['task_id'] in {first.id, available.id}
-    assert store.load(result.metadata['task_id']).owner == 'explore_subagent'
+    assert store.load(result.metadata['task_id']).owner == 'task_subagent'
     assert store.load(blocked.id).status == 'pending'

@@ -287,11 +287,7 @@ class ClaimNextTaskTool(Tool[ClaimNextTaskInput]):
 
     async def execute(self, arguments: ClaimNextTaskInput) -> ToolResult:
         owner = arguments.owner or self.agent_id
-        for task in self.store.list():
-            if task.status != 'pending' or task.owner:
-                continue
-            if self.store.blocking_dependencies(task):
-                continue
+        for task in self.store.ready_wave():
             try:
                 claimed = self.store.claim(task.id, owner=owner)
             except ValueError:
