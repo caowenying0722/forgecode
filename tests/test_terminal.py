@@ -74,6 +74,20 @@ def test_terminal_repairs_invalid_surrogate_prompt_text() -> None:
     assert repair_input_text('fix\udc80bug') == 'fix?bug'
 
 
+def test_terminal_repairs_windows_utf8_gbk_mojibake_prompt_text() -> None:
+    original = '根据 task.md 继续完善项目功能'
+    mojibake = original.encode('utf-8').decode('gb18030', errors='replace')
+
+    assert mojibake != original
+    assert repair_input_text(mojibake) == original
+
+
+def test_terminal_keeps_normal_chinese_prompt_text() -> None:
+    original = '根据 task.md 继续完善项目功能'
+
+    assert repair_input_text(original) == original
+
+
 def test_encoding_safe_text_io_replaces_unencodable_output() -> None:
     class FakeOutput:
         encoding = 'gbk'

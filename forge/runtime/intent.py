@@ -47,7 +47,7 @@ class TaskContract:
 _CHANGE_VERBS_ZH = (
     '修复|修好|解决|修改|改|实现|实施|执行|落地|处理|新增|添加|'
     '新建|删除|移除|创建|编写|写入|重写|重构|优化|更新|调整|调高|'
-    '调低|改进|完成|替换|继续|开始'
+    '调低|改进|完成|替换|继续|开始|完善|开发'
 )
 _DIRECT_CHANGE_ZH = re.compile(
     rf'^\s*(?:(?:请你?|帮我|麻烦你?|你直接|直接)\s*)?'
@@ -69,8 +69,12 @@ _PRIORITY_FIX_ZH = re.compile(
     rf'按\s*(?:最高)?\s*优先级\s*[Pp]0\b[^，。；！？\n]{{0,20}}(?:进行|执行|开始|实施|修复|处理|解决|优化|完成|实现|修改|改|新增|添加|重写|重构|落地)'
 )
 _EXECUTE_PLAN_ZH = re.compile(
-    r'(?:按|按照).{0,40}(?:方案|计划|上述|刚才).{0,20}'
+    r'(?:按|按照|根据).{0,40}(?:方案|计划|上述|刚才).{0,20}'
     r'(?:执行|实施|实现|落地)'
+)
+_TASK_SPEC_CHANGE_ZH = re.compile(
+    r'(?:按|按照|根据).{0,40}(?:task\.md|任务|需求|说明).{0,50}'
+    r'(?:完善|实现|完成|继续|优化|开发|落地|改进|修改|补齐)'
 )
 _START_TASK_WORK_ZH = re.compile(
     r'(?:阅读|读取|查看|明确|理解).{0,40}(?:任务|task\.md|需求)'
@@ -190,6 +194,7 @@ def infer_change_required(prompt: str) -> bool:
             or _COMBINED_CHANGE_EN.search(clause)
             or _PRIORITY_FIX_ZH.search(clause)
             or _EXECUTE_PLAN_ZH.search(clause)
+            or _TASK_SPEC_CHANGE_ZH.search(clause)
             or _START_TASK_WORK_ZH.search(clause)
         ):
             return True

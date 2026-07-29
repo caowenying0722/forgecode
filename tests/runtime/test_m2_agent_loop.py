@@ -645,6 +645,82 @@ def test_required_change_enters_action_recovery_after_bounded_read_progress(
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
 
 
+def test_dirty_workspace_still_forces_action_recovery_before_new_write(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    (tmp_path / 'task.md').write_text('old task\n', encoding='utf-8')
+    subprocess.run(['git', 'add', 'task.md'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'add task spec'],
+        cwd=tmp_path,
+        check=True,
+    )
+    (tmp_path / 'background.txt').write_text('existing\n', encoding='utf-8')
+    investigation = [
+        ToolCall(
+            0,
+            'dirty-read-task',
+            'read_file',
+            {'path': 'task.md'},
+        ),
+        ToolCall(0, 'dirty-status', 'git_status', {}),
+        ToolCall(
+            0,
+            'dirty-grep',
+            'grep',
+            {'path': '.', 'pattern': 'old task', 'regex': False},
+        ),
+    ]
+    edit = ToolCall(
+        0,
+        'dirty-edit',
+        'replace_text',
+        {
+            'path': 'task.md',
+            'old_text': 'old task\n',
+            'new_text': 'new task\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'dirty-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    client = FakeModelClient(
+        *(response_with_tool(call) for call in investigation),
+        response_with_tool(edit),
+        response_with_tool(verify),
+        finish_response(
+            'dirty-finish',
+            task_kind='change',
+            summary='Changed task.md after dirty-worktree recovery.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        pre_mutation_limit=2,
+        task_policy=TaskPolicy(require_changes=True),
+    )
+
+    events = collect_turn(conversation, '根据 task.md 继续完善项目功能')
+
+    recovery_tools = {
+        str(tool.get('name')) for tool in client.calls[3]['tools'] or ()
+    }
+    assert '[ForgeCode Action Recovery]' in client.calls[3]['system']
+    assert 'replace_text' in recovery_tools
+    assert 'read_file' in recovery_tools
+    assert 'task' not in recovery_tools
+    assert 'find_files' not in recovery_tools
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert (tmp_path / 'task.md').read_text(encoding='utf-8') == 'new task\n'
+
+
 def test_failed_subagent_delegation_for_change_enters_local_action_recovery(
     tmp_path: Path,
 ) -> None:

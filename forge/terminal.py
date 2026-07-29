@@ -385,9 +385,41 @@ class EncodingSafeTextIO:
         return self.wrapped.write(safe)
 
 
+_MOJIBAKE_MARKERS = frozenset(
+    '鏍嵁缁瀹屽杽椤圭洰鍔熻兘锛氫紭鍏堝疄鐜版湰'
+    '鍦版渶楂樺垎璁板綍銆傝锋妸鎺叆鏄剧ず褰撳墠'
+    '鏈苟鎴忕粨淇濆瓨'
+)
+_RECOVERED_ZH_MARKERS = (
+    '根据',
+    '继续',
+    '完善',
+    '项目',
+    '功能',
+    '实现',
+    '保存',
+    '修改',
+    '优化',
+    '删除',
+    '替换',
+)
+
+
 def repair_input_text(value: str) -> str:
-    '''Replace invalid surrogate code points from mis-decoded stdin.'''
-    return value.encode('utf-8', errors='replace').decode('utf-8')
+    '''Repair invalid surrogate and common Windows UTF-8/GBK stdin mojibake.'''
+    repaired = value.encode('utf-8', errors='replace').decode('utf-8')
+    if sum(character in _MOJIBAKE_MARKERS for character in repaired) < 3:
+        return repaired
+    try:
+        candidate = repaired.encode(
+            'gb18030',
+            errors='ignore',
+        ).decode('utf-8', errors='replace')
+    except UnicodeError:
+        return repaired
+    if any(marker in candidate for marker in _RECOVERED_ZH_MARKERS):
+        return candidate
+    return repaired
 
 
 class TerminalUI:

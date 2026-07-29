@@ -812,7 +812,10 @@ class Conversation:
             if not text and not tool_calls:
                 if (
                     request_usage is not None
-                    and self._pending_required_change(change_required)
+                    and self._pending_required_change(
+                        change_required,
+                        mutation_attempted=mutation_attempted,
+                    )
                 ):
                     completed_usage = add_token_usage(
                         completed_usage,
@@ -1050,7 +1053,10 @@ class Conversation:
                         )
                     )
                     return
-                if self._pending_required_change(change_required):
+                if self._pending_required_change(
+                    change_required,
+                    mutation_attempted=mutation_attempted,
+                ):
                     if action_recovery:
                         action_recovery_calls += 1
                     else:
@@ -1454,7 +1460,10 @@ class Conversation:
                         finish_rejection = finish_reasons
                         last_completion_reasons = finish_reasons
                         pending_required_change = (
-                            self._pending_required_change(change_required)
+                            self._pending_required_change(
+                                change_required,
+                                mutation_attempted=mutation_attempted,
+                            )
                         )
                         if pending_required_change:
                             batch.required_change_rejected = True
@@ -1528,7 +1537,10 @@ class Conversation:
                 if (
                     tool_call.name == 'task'
                     and not result.success
-                    and self._pending_required_change(change_required)
+                    and self._pending_required_change(
+                        change_required,
+                        mutation_attempted=mutation_attempted,
+                    )
                 ):
                     batch.required_change_rejected = True
                 tool_changed_workspace = False
@@ -1865,7 +1877,8 @@ class Conversation:
                 )
                 continue
             pending_required_change = self._pending_required_change(
-                change_required
+                change_required,
+                mutation_attempted=mutation_attempted,
             )
             if (
                 pending_required_change
@@ -2058,7 +2071,10 @@ class Conversation:
             elif calls_without_progress >= self.stagnation_limit:
                 if (
                     not mutation_failures
-                    and self._pending_required_change(change_required)
+                    and self._pending_required_change(
+                        change_required,
+                        mutation_attempted=mutation_attempted,
+                    )
                 ):
                     action_recovery = True
                     action_recovery_calls = 0
@@ -2305,13 +2321,18 @@ class Conversation:
             if str(definition.get('name', '')) in PLAN_MODE_TOOLS
         ]
 
-    def _pending_required_change(self, change_required: bool) -> bool:
+    def _pending_required_change(
+        self,
+        change_required: bool,
+        *,
+        mutation_attempted: bool,
+    ) -> bool:
         tracker = self.workspace_tracker
         return bool(
             change_required
             and tracker is not None
             and getattr(tracker, 'available', True)
-            and not tracker.changed_paths
+            and (not mutation_attempted or not tracker.changed_paths)
         )
 
     async def compact(self) -> CompactionReport:
