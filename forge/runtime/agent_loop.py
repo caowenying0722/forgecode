@@ -27,6 +27,12 @@ from forge.runtime.agent_messages import (
     build_assistant_message,
     build_tool_result_message,
 )
+from forge.runtime.agent_controller import (
+    AgentController,
+    batch_requires_todo,
+    build_planning_recovery_feedback,
+    is_todo_required_result,
+)
 from forge.runtime.completion_checker import (
     CompletionChecker,
     build_completion_feedback,
@@ -296,6 +302,7 @@ class Conversation:
         self.interaction_mode: InteractionMode = 'auto'
         self.working_state = WorkingState()
         self.run_state = AgentRunState()
+        self.agent_controller = AgentController()
         if registry is not None:
             if 'task' in registry.names:
                 registry.replace(
@@ -499,6 +506,7 @@ class Conversation:
         self.task_manager.begin_turn(prompt)
         self.working_state = WorkingState()
         self.run_state = AgentRunState()
+        self.agent_controller.begin_turn()
         self._last_task_context = self.task_manager.system_suffix()
         user_message = {'role': 'user', 'content': prompt}
         request_messages = (
@@ -560,6 +568,7 @@ class Conversation:
             is_recovering = (
                 action_recovery
                 or bool(mutation_failures)
+                or self.agent_controller.planning_recovery
                 or finalization_recovery
                 or stagnation_final_recovery
                 or token_limit_recovery
@@ -631,6 +640,10 @@ class Conversation:
                 verification_recovery=verification_recovery,
                 verification_fix_recovery=verification_fix_recovery,
                 verification_read_used=verification_read_used,
+                planning_recovery=self.agent_controller.planning_recovery,
+                planning_recovery_calls=(
+                    self.agent_controller.planning_recovery_calls
+                ),
                 token_limit_recovery=token_limit_recovery,
                 completion_ready_context=completion_ready_context,
                 change_required=change_required,
@@ -647,6 +660,7 @@ class Conversation:
                 base_system_prompt=self._system_prompt_with_task(
                     include_tool_availability=(
                         not request_state.tool_free_recovery
+                        and not request_state.finalization_recovery
                     ),
                 ),
                 repository_context=self._last_repository_context,
@@ -919,39 +933,46 @@ class Conversation:
                 or stagnation_final_recovery
                 or token_limit_recovery
             ) and tool_calls:
-                all_tool_calls.extend(tool_calls)
-                if finalization_recovery:
-                    recovery_name = 'finalization recovery'
-                elif stagnation_final_recovery:
-                    recovery_name = 'stagnation final recovery'
+                finalization_finish = (
+                    finalization_recovery
+                    and len(tool_calls) == 1
+                    and tool_calls[0].name == 'finish_task'
+                )
+                if finalization_finish:
+                    pass
                 else:
-                    recovery_name = 'token-limit recovery'
-                reason = (
-                    f'The model requested another tool during the dedicated '
-                    f'{recovery_name} instead of returning its final '
-                    'evidence-based answer.'
-                )
-                self.task_manager.stuck((reason,))
-                self.messages[:] = request_messages
-                yield TurnCompleted(
-                    result=TurnResult(
-                        text=reason,
-                        usage=completed_usage,
-                        last_request_usage=request_usage,
-                        model_calls=iteration,
-                        tool_calls=tuple(all_tool_calls),
-                        status='stuck',
-                        changed_paths=(
-                            self.workspace_tracker.changed_paths
-                            if self.workspace_tracker is not None
-                            else ()
-                        ),
-                        verification=latest_verification,
-                        completion_reasons=(reason,),
+                    all_tool_calls.extend(tool_calls)
+                    if finalization_recovery:
+                        recovery_name = 'finalization recovery'
+                    elif stagnation_final_recovery:
+                        recovery_name = 'stagnation final recovery'
+                    else:
+                        recovery_name = 'token-limit recovery'
+                    reason = (
+                        f'The model requested another tool during the dedicated '
+                        f'{recovery_name} instead of returning its final '
+                        'evidence-based answer.'
                     )
-                )
-                return
-
+                    self.task_manager.stuck((reason,))
+                    self.messages[:] = request_messages
+                    yield TurnCompleted(
+                        result=TurnResult(
+                            text=reason,
+                            usage=completed_usage,
+                            last_request_usage=request_usage,
+                            model_calls=iteration,
+                            tool_calls=tuple(all_tool_calls),
+                            status='stuck',
+                            changed_paths=(
+                                self.workspace_tracker.changed_paths
+                                if self.workspace_tracker is not None
+                                else ()
+                            ),
+                            verification=latest_verification,
+                            completion_reasons=(reason,),
+                        )
+                    )
+                    return
             if not tool_calls:
                 phase_event = self._transition(
                     AgentPhase.CHECKING_RESULT,
@@ -1338,6 +1359,9 @@ class Conversation:
                         available_tools=frozenset(request_tool_names),
                         action_recovery=action_recovery,
                         mutation_recovery=bool(mutation_failures),
+                        planning_recovery=(
+                            self.agent_controller.planning_recovery
+                        ),
                         action_read_exhausted=action_read_exhausted,
                         verification_read_exhausted=(
                             verification_read_exhausted
@@ -1349,7 +1373,15 @@ class Conversation:
                     ),
                 )
                 result = run.result
-                if run.executed and tool_call.name != 'finish_task':
+                self.agent_controller.observe_tool_result(
+                    tool_call.name,
+                    result,
+                )
+                if (
+                    run.executed
+                    and tool_call.name != 'finish_task'
+                    and not is_todo_required_result(result)
+                ):
                     tool_attempts[signature] = (
                         previous_count + 1,
                         result.success,
@@ -1753,6 +1785,23 @@ class Conversation:
                 tool_protocol_failures += 1
             elif any(result.success for _, result in batch.results):
                 tool_protocol_failures = 0
+            if batch_requires_todo(batch.results):
+                self.agent_controller.enter_planning_recovery()
+                force_synthesis = False
+                synthesis_retries = 0
+                calls_without_progress = 0
+                action_recovery = False
+                action_recovery_calls = 0
+                action_read_used = False
+                request_messages.append(
+                    build_planning_recovery_feedback(
+                        self.task_manager.system_suffix(),
+                        attempt=(
+                            self.agent_controller.planning_recovery_calls
+                        ),
+                    )
+                )
+                continue
             pending_required_change = self._pending_required_change(
                 change_required
             )
@@ -1856,20 +1905,16 @@ class Conversation:
                     completion_reviewed_paths,
                 )
                 calls_without_progress = 0
-                if (
-                    completion_decision_calls
-                    >= self.completion_decision_limit
-                ):
-                    finalization_recovery = True
-                    force_synthesis = True
-                    request_messages.append(
-                        build_finalization_recovery_feedback(
-                            self.task_manager.system_suffix(),
-                            self.working_state.system_suffix(),
-                            self.workspace_tracker.changed_paths,
-                            latest_verification,
-                        )
+                finalization_recovery = True
+                force_synthesis = True
+                request_messages.append(
+                    build_finalization_recovery_feedback(
+                        self.task_manager.system_suffix(),
+                        self.working_state.system_suffix(),
+                        self.workspace_tracker.changed_paths,
+                        latest_verification,
                     )
+                )
                 continue
             completion_ready_revision = None
             completion_decision_calls = 0

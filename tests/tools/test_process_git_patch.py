@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 from forge.tools.base import ToolResult
+from forge.tools.filesystem import WriteFileTool
 from forge.tools.git import GitDiffTool, GitStatusTool
 from forge.tools.patch import ApplyPatchTool
 from forge.tools.shell import RunCommandTool
@@ -231,6 +232,14 @@ def test_verify_failure_is_structured(tmp_path: Path) -> None:
     assert result.error.code == 'verification_failed'
     assert result.metadata['verification_status'] == 'failed'
     assert result.metadata['exit_code'] != 0
+
+
+def test_write_file_rejects_empty_content(tmp_path: Path) -> None:
+    result = run(WriteFileTool(tmp_path).run({'path': 'empty.ts', 'content': ''}))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'invalid_arguments'
 
 
 def test_git_status_and_diff_return_real_working_tree_state(

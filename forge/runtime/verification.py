@@ -97,6 +97,7 @@ def choose_validation_command(
     target: ValidationTarget = 'auto',
     command_id: str = '',
 ) -> ValidationCommand | None:
+    root = root.resolve()
     commands = discover_validation_commands(root)
     if command_id:
         return next((command for command in commands if command.id == command_id), None)
@@ -104,7 +105,11 @@ def choose_validation_command(
         targeted = [command for command in commands if command.target == target]
         if targeted:
             return max(targeted, key=lambda command: command.strength)
+        if target != 'diff' and _has_project_validation_marker(root):
+            return None
     candidates = [command for command in commands if command.target != 'diff']
+    if not candidates and _has_project_validation_marker(root):
+        return None
     if not candidates:
         candidates = list(commands)
     return max(candidates, key=lambda command: command.strength, default=None)
@@ -166,6 +171,20 @@ def _package_json_commands(root: Path) -> list[ValidationCommand]:
                 )
             )
     return commands
+
+
+def _has_project_validation_marker(root: Path) -> bool:
+    markers = (
+        'package.json',
+        'pyproject.toml',
+        'pytest.ini',
+        'setup.cfg',
+        'tox.ini',
+        'tsconfig.json',
+        'Cargo.toml',
+        'go.mod',
+    )
+    return any((root / marker).exists() for marker in markers)
 
 
 def _python_commands(root: Path) -> list[ValidationCommand]:

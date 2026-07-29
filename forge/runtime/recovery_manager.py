@@ -111,3 +111,21 @@ class RecoveryManager:
                 )
             )
         ]
+
+    def finalization_tools(self) -> list[dict[str, Any]] | None:
+        if self.tools is None:
+            return None
+        return [
+            definition
+            for definition in self.tools
+            if str(definition.get('name', '')) == 'finish_task'
+        ]
+
+    def planning_tools(self) -> list[dict[str, Any]] | None:
+        if self.tools is None:
+            return None
+        return [
+            definition
+            for definition in self.tools
+            if str(definition.get('name', '')) == 'todo_write'
+        ]

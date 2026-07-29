@@ -142,6 +142,32 @@ def finish_response(
     )
 
 
+def todo_response(call_id: str = 'toolu_todo') -> list[ModelStreamEvent]:
+    return response_with_tool(
+        ToolCall(
+            0,
+            call_id,
+            'todo_write',
+            {
+                'todos': [
+                    {
+                        'content': 'Update the sample file',
+                        'status': 'in_progress',
+                        'priority': 'high',
+                        'id': 'edit-sample',
+                    },
+                    {
+                        'content': 'Verify and finish',
+                        'status': 'pending',
+                        'priority': 'medium',
+                        'id': 'verify-finish',
+                    },
+                ]
+            },
+        )
+    )
+
+
 def collect_turn(
     conversation: Conversation,
     prompt: str,
@@ -169,6 +195,62 @@ def read_only_stagnation_calls(prefix: str) -> list[ToolCall]:
         ToolCall(0, f'{prefix}-{index}', name, arguments)
         for index, (name, arguments) in enumerate(specifications, start=1)
     ]
+
+
+def test_todo_required_enters_planning_recovery_before_write(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'toolu_edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    verify = ToolCall(
+        0, 'toolu_verify', 'verify', {'command': 'git diff --check'}
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        todo_response(),
+        response_with_tool(edit),
+        response_with_tool(verify),
+        finish_response(
+            'finish_after_todo',
+            task_kind='change',
+            summary='Updated sample after planning.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(
+        conversation,
+        '帮我完整实现权限 hook 系统并修改 sample.txt',
+    )
+
+    completed = events[-1]
+    second_tools = {
+        str(tool.get('name')) for tool in client.calls[1]['tools'] or []
+    }
+    assert second_tools == {'todo_write'}
+    assert '[ForgeCode Planning Recovery]' in client.calls[1]['system']
+    assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
+    assert any(
+        isinstance(event, ToolExecutionCompleted)
+        and event.tool_call.name == 'todo_write'
+        and event.result.success
+        for event in events
+    )
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.changed_paths == ('sample.txt',)
 
 
 def test_agent_loop_rejects_early_answer_then_accepts_verify_evidence(
@@ -566,7 +648,6 @@ def test_pending_write_failure_hides_finish_and_bounds_invalid_attempts(
     )
     client = FakeModelClient(
         response_with_tool(edit),
-        response_with_tool(verify),
         response_with_tool(failed_edit),
         *(
             finish_response(
@@ -593,14 +674,13 @@ def test_pending_write_failure_hides_finish_and_bounds_invalid_attempts(
     assert finish_result.error is not None
     assert finish_result.error.code == 'tool_not_available_in_phase'
     assert 'finish_task' not in {
-        definition['name'] for definition in client.calls[3]['tools'] or ()
+        definition['name'] for definition in client.calls[2]['tools'] or ()
     }
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'stuck'
-    assert completed.result.model_calls == 6
-    assert completed.result.verification is not None
-    assert completed.result.verification.success is True
+    assert completed.result.model_calls == 5
+    assert completed.result.verification is None
     assert 'malformed or schema-invalid tool requests' in completed.result.text
     assert 'Finished despite the unresolved edit.' not in completed.result.text
 
@@ -1846,8 +1926,6 @@ def test_verified_change_stagnation_allows_final_summary_recovery(
     client = FakeModelClient(
         response_with_tool(edit),
         response_with_tool(verify),
-        response_with_tool(initial_diff),
-        *(response_with_tool(call) for call in redundant_diffs),
         text_response(summary),
     )
     conversation = Conversation(
@@ -1861,18 +1939,20 @@ def test_verified_change_stagnation_allows_final_summary_recovery(
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'completed'
-    assert completed.result.model_calls == 12
+    assert completed.result.model_calls == 3
     assert completed.result.text == summary
     assert completed.result.changed_paths == ('sample.txt',)
     assert completed.result.verification is not None
     assert completed.result.verification.success is True
-    assert client.responses == []
+    assert len(client.calls) == 3
     final_request = (
         (client.calls[-1]['system'] or '')
         + str(client.calls[-1]['messages'])
     )
     assert '[ForgeCode Finalization Recovery]' in final_request
-    assert client.calls[-1]['tools'] is None
+    assert {tool['name'] for tool in client.calls[-1]['tools']} == {
+        'finish_task'
+    }
     assert 'Runtime Tool Availability' not in (
         client.calls[-1]['system'] or ''
     )
@@ -1977,15 +2057,10 @@ def test_novel_repository_evidence_cannot_extend_completion_ready_loop(
         )
         for index in range(1, 9)
     ]
-    summary = (
-        'Updated and verified sample.txt after reviewing '
-        'notes/evidence-1.txt.'
-    )
+    summary = 'Updated and verified sample.txt.'
     client = FakeModelClient(
         response_with_tool(edit),
         response_with_tool(verify),
-        response_with_tool(diff),
-        *(response_with_tool(call) for call in novel_reads),
         text_response(summary),
     )
     conversation = Conversation(
@@ -1999,9 +2074,11 @@ def test_novel_repository_evidence_cannot_extend_completion_ready_loop(
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'completed'
-    assert completed.result.model_calls == 12
+    assert completed.result.model_calls == 3
     assert completed.result.text == summary
-    assert client.calls[-1]['tools'] is None
+    assert {tool['name'] for tool in client.calls[-1]['tools']} == {
+        'finish_task'
+    }
     assert '[ForgeCode Finalization Recovery]' in (
         client.calls[-1]['system'] or ''
     )
@@ -2049,18 +2126,20 @@ def test_finalization_recovery_stops_after_one_more_redundant_diff(
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'stuck'
-    assert completed.result.model_calls == 12
+    assert completed.result.model_calls == 3
     assert 'finalization recovery' in completed.result.text.casefold()
     assert completed.result.changed_paths == ('sample.txt',)
     assert completed.result.verification is not None
     assert completed.result.verification.success is True
-    assert len(client.calls) == 12
+    assert len(client.calls) == 3
     recovery_request = (
         (client.calls[-1]['system'] or '')
         + str(client.calls[-1]['messages'])
     )
     assert '[ForgeCode Finalization Recovery]' in recovery_request
-    assert client.calls[-1]['tools'] is None
+    assert {tool['name'] for tool in client.calls[-1]['tools']} == {
+        'finish_task'
+    }
 
 
 def test_unfinished_explicit_plan_does_not_enter_finalization_recovery(

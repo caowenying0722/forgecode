@@ -155,7 +155,7 @@ class ReadFileTool(Tool[ReadFileInput]):
 
 class WriteFileInput(ToolInput):
     path: str = Field(min_length=1)
-    content: str = Field(max_length=MAX_EDIT_CHARACTERS)
+    content: str = Field(min_length=1, max_length=MAX_EDIT_CHARACTERS)
 
 
 class WriteFileTool(Tool[WriteFileInput]):

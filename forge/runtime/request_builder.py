@@ -22,6 +22,8 @@ class RequestState:
     verification_recovery: bool = False
     verification_fix_recovery: bool = False
     verification_read_used: bool = False
+    planning_recovery: bool = False
+    planning_recovery_calls: int = 0
     change_required: bool = False
     mutation_attempted: bool = False
     action_recovery: bool = False
@@ -31,8 +33,7 @@ class RequestState:
     @property
     def tool_free_recovery(self) -> bool:
         return (
-            self.finalization_recovery
-            or self.stagnation_final_recovery
+            self.stagnation_final_recovery
             or self.token_limit_recovery
         )
 
@@ -97,6 +98,10 @@ class RequestBuilder:
     ) -> list[dict[str, Any]] | None:
         if state.tool_free_recovery:
             return None
+        if state.planning_recovery:
+            return self.recovery_manager.planning_tools()
+        if state.finalization_recovery:
+            return self.recovery_manager.finalization_tools()
         if interaction_mode == 'plan':
             return plan_tools
         if state.verification_recovery:
@@ -173,12 +178,21 @@ def recovery_system_suffix(
             '\n\n[ForgeCode Finalization Recovery]\n'
             'The current workspace revision already has a real Diff and '
             'current successful verification. This is a dedicated final '
-            'synthesis request, so no tools are included. Return one '
-            "concise final answer in the user's language based only on "
-            'the collected evidence. State what changed and the exact '
-            'verification performed. Be honest about anything that was '
-            'not semantically or visually verified. Do not request or '
-            'describe another tool call.'
+            'synthesis request. Return one concise final answer in the '
+            "user's language or call finish_task alone. State what changed "
+            'and the exact verification performed. Be honest about anything '
+            'that was not semantically or visually verified. Do not request '
+            'any tool except finish_task.'
+        )
+    if state.planning_recovery:
+        return (
+            '\n\n[ForgeCode Planning Recovery]\n'
+            'The previous tool call was rejected with TODO_REQUIRED. This '
+            'request is restricted to todo_write. Call todo_write with a '
+            'short working plan and exactly one in_progress item. Do not '
+            'request any write, process, verification, discovery, or finish '
+            'tool until todo_write succeeds. '
+            f'Planning recovery count: {state.planning_recovery_calls}.'
         )
     if state.stagnation_final_recovery:
         return (

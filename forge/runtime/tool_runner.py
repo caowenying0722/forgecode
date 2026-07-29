@@ -15,6 +15,7 @@ class ToolRunPolicy:
     available_tools: frozenset[str]
     action_recovery: bool = False
     mutation_recovery: bool = False
+    planning_recovery: bool = False
     action_read_exhausted: bool = False
     verification_read_exhausted: bool = False
     semantic_repeat: ToolResult | None = None
@@ -102,6 +103,11 @@ class ToolRunner:
                 'Complete other actions first, then declare the outcome in a '
                 'separate response.',
             )
+        if (
+            policy.planning_recovery
+            and tool_call.name not in policy.available_tools
+        ):
+            return unavailable_in_phase(tool_call, policy, 'Planning Recovery')
         if (
             policy.action_recovery
             and tool_call.name not in policy.available_tools

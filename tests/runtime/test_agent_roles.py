@@ -106,8 +106,8 @@ def test_tool_runner_blocks_repeat_before_executor() -> None:
     assert result.result.error.code == 'repeated_tool_call'
 
 
-def test_request_builder_hides_tools_during_final_recovery() -> None:
-    tools = [{'name': 'read_file'}, {'name': 'write_file'}]
+def test_request_builder_only_allows_finish_during_final_recovery() -> None:
+    tools = [{'name': 'read_file'}, {'name': 'write_file'}, {'name': 'finish_task'}]
     recovery = RecoveryManager(
         tools,
         None,
@@ -126,9 +126,9 @@ def test_request_builder_hides_tools_during_final_recovery() -> None:
         changed_paths=('forge/runtime/example.py',),
     )
 
-    assert spec.tools is None
+    assert spec.tools == [{'name': 'finish_task'}]
     assert '[ForgeCode Finalization Recovery]' in spec.system_prompt
-    assert spec.tool_names == frozenset()
+    assert spec.tool_names == frozenset({'finish_task'})
 
 
 def test_request_builder_uses_plan_tool_surface() -> None:

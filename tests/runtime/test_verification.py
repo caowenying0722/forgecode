@@ -53,3 +53,15 @@ def test_validation_command_classifier_rejects_probe_and_dev_server(
     assert probe_status == 'invalid'
     assert dev_status == 'invalid'
     assert diff_status == 'passed'
+
+
+def test_empty_package_json_does_not_satisfy_build_discovery(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / 'package.json').write_text('', encoding='utf-8')
+
+    auto = choose_validation_command(tmp_path)
+    build = choose_validation_command(tmp_path, target='build')
+
+    assert auto is None
+    assert build is None

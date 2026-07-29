@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 import json
 from pathlib import Path
+import subprocess
 from typing import Any
 
 import pytest
@@ -474,24 +475,83 @@ def test_strict_permission_blocks_write_tool_in_agent_loop(
 def test_todo_required_does_not_count_as_workspace_write_failure(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / 'sample.txt').write_text('old\n', encoding='utf-8')
+    subprocess.run(['git', 'init', '--quiet'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'forge@example.test'],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'ForgeCode Tests'],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(['git', 'add', '.'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'baseline'],
+        cwd=tmp_path,
+        check=True,
+    )
     tool_call = ToolCall(
         0,
         'toolu_write',
-        'tiny_write',
-        {'path': 'sample.txt', 'content': 'abc'},
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
     )
-    tracker = NoChangeWorkspaceTracker(tmp_path)
-    registry = ToolRegistry(
-        [TinyWriteTool(tmp_path)],
-        workspace_tracker=tracker,
+    todo_call = ToolCall(
+        0,
+        'toolu_todo',
+        'todo_write',
+        {
+            'todos': [
+                {
+                    'content': 'Edit sample.txt',
+                    'status': 'in_progress',
+                    'priority': 'high',
+                    'id': 'edit',
+                },
+                {
+                    'content': 'Verify the change',
+                    'status': 'pending',
+                    'priority': 'medium',
+                    'id': 'verify',
+                },
+            ]
+        },
+    )
+    verify_call = ToolCall(
+        0,
+        'toolu_verify',
+        'verify',
+        {'command': 'git diff --check'},
     )
     client = FakeModelClient(
         tool_response(tool_call),
-        streamed_response('I need to plan first.'),
+        tool_response(todo_call),
+        tool_response(tool_call),
+        tool_response(verify_call),
+        tool_response(
+            ToolCall(
+                0,
+                'toolu_finish',
+                'finish_task',
+                {
+                    'task_kind': 'change',
+                    'status': 'completed',
+                    'summary': 'Changed sample.txt after planning.',
+                    'blocked_reasons': [],
+                },
+            )
+        ),
     )
     conversation = Conversation(
         client=client,
-        registry=registry,
+        registry=create_default_registry(tmp_path),
         mutation_recovery_limit=1,
         max_tool_protocol_recoveries=1,
     )
@@ -504,9 +564,14 @@ def test_todo_required_does_not_count_as_workspace_write_failure(
     assert completed.result.success is False
     assert completed.result.error is not None
     assert completed.result.error.code == 'todo_required'
+    assert {
+        str(tool.get('name')) for tool in client.calls[1]['tools'] or []
+    } == {'todo_write'}
     final = events[-1]
     assert isinstance(final, TurnCompleted)
     assert 'workspace-write attempt' not in final.result.text
+    assert final.result.status == 'completed'
+    assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
 
 
 def test_task_policy_requires_workspace_tracking(tmp_path: Path) -> None:
