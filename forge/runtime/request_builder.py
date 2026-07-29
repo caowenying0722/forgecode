@@ -22,6 +22,13 @@ from forge.runtime.task_model import (
 
 @dataclass(frozen=True, slots=True)
 class RequestState:
+    '''Request inputs for one model call.
+
+    ``runtime`` is the production source of truth. The scalar recovery fields
+    remain as compatibility fallbacks for narrow tests and older callers that
+    have not yet been migrated.
+    '''
+
     runtime: TurnRuntimeState | None = None
     control_state: AgentControlState | None = None
     force_synthesis: bool = False
@@ -54,7 +61,7 @@ class RequestState:
     def tool_free_recovery(self) -> bool:
         runtime = self.runtime
         if runtime is not None:
-            return runtime.synthesis_mode in {
+            return runtime.synthesis.mode.value in {
                 'stagnation_final',
                 'token_limit',
             }
@@ -133,11 +140,7 @@ class RequestBuilder:
             return self.recovery_manager.finalization_tools()
         if _planning_recovery_active(state):
             return self.recovery_manager.planning_tools()
-        mutation_failures = (
-            runtime.mutation_failures
-            if runtime is not None
-            else state.mutation_failures
-        )
+        mutation_failures = _mutation_failures(state)
         if (
             mutation_failures
             or (
@@ -145,11 +148,7 @@ class RequestBuilder:
                 and mutation_failures
             )
         ):
-            mutation_read_used = (
-                runtime.mutation_read_used
-                if runtime is not None
-                else state.mutation_read_used
-            )
+            mutation_read_used = _mutation_read_used(state)
             return self.recovery_manager.mutation_tools(
                 list(mutation_failures),
                 read_available=not mutation_read_used,
@@ -160,11 +159,7 @@ class RequestBuilder:
             read_budget = self.recovery_manager.verification_read_budget(
                 target
             )
-            read_count = (
-                runtime.verification_read_count
-                if runtime is not None
-                else state.verification_read_count
-            )
+            read_count = _verification_read_count(state)
             if runtime is None and state.verification_read_used:
                 read_count = max(read_count, read_budget)
             return self.recovery_manager.verification_tools(
@@ -176,11 +171,7 @@ class RequestBuilder:
             control_state is AgentControlState.TARGETED_ANALYSIS
             or (control_state is None and state.action_recovery)
         ):
-            action_read_used = (
-                runtime.action_read_used
-                if runtime is not None
-                else state.action_read_used
-            )
+            action_read_used = _action_read_used(state)
             return self.recovery_manager.action_tools(
                 read_available=not action_read_used
             )
@@ -345,7 +336,7 @@ def recovery_system_suffix(
             'short working plan and exactly one in_progress item. Do not '
             'request any write, process, verification, discovery, or finish '
             'tool until todo_write succeeds. '
-            f'Planning recovery count: {state.planning_recovery_calls}.'
+            f'Planning recovery count: {_planning_recovery_calls(state)}.'
         )
     if synthesis_mode == 'stagnation_final' or (
         state.runtime is None and state.stagnation_final_recovery
@@ -407,11 +398,13 @@ def recovery_system_suffix(
         )
     if _action_recovery_active(state):
         return '\n\n' + render_action_recovery_context(
-            state.action_recovery_calls,
+            _action_recovery_calls(state),
             action_recovery_limit,
-            read_used=state.action_read_used,
+            read_used=_action_read_used(state),
         )
-    if state.force_synthesis:
+    if synthesis_mode == 'checkpoint' or (
+        state.runtime is None and state.force_synthesis
+    ):
         return (
             '\n\n[ForgeCode Recovery Checkpoint]\n'
             'Recent actions did not produce new evidence or workspace '
@@ -437,6 +430,12 @@ def _planning_recovery_active(state: RequestState) -> bool:
         state.control_state is AgentControlState.TASK_PLANNING
         or (state.control_state is None and state.planning_recovery)
     )
+
+
+def _planning_recovery_calls(state: RequestState) -> int:
+    if state.runtime is not None:
+        return state.runtime.planning_recovery_calls
+    return state.planning_recovery_calls
 
 
 def _action_recovery_active(state: RequestState) -> bool:
@@ -482,8 +481,20 @@ def _mutation_attempted(state: RequestState) -> bool:
 
 def _mutation_recovery_context(state: RequestState) -> str:
     if state.runtime is not None:
-        return state.runtime.mutation_recovery_context
+        return state.runtime.edit_recovery.context
     return state.mutation_recovery_context
+
+
+def _mutation_failures(state: RequestState) -> tuple[dict[str, object], ...]:
+    if state.runtime is not None:
+        return tuple(state.runtime.edit_recovery.failures)
+    return state.mutation_failures
+
+
+def _mutation_read_used(state: RequestState) -> bool:
+    if state.runtime is not None:
+        return state.runtime.edit_recovery.read_used
+    return state.mutation_read_used
 
 
 def _completion_ready_context(state: RequestState) -> str:
@@ -494,7 +505,7 @@ def _completion_ready_context(state: RequestState) -> str:
 
 def _synthesis_mode(state: RequestState) -> str:
     if state.runtime is not None:
-        return state.runtime.synthesis_mode
+        return state.runtime.synthesis.mode.value
     if state.finalization_recovery:
         return 'finalization'
     if state.stagnation_final_recovery:
@@ -504,27 +515,43 @@ def _synthesis_mode(state: RequestState) -> str:
     return ''
 
 
+def _action_recovery_calls(state: RequestState) -> int:
+    if state.runtime is not None:
+        return state.runtime.action_recovery_state.calls
+    return state.action_recovery_calls
+
+
+def _action_read_used(state: RequestState) -> bool:
+    if state.runtime is not None:
+        return state.runtime.action_recovery_state.read_used
+    return state.action_read_used
+
+
 def _latest_verification(state: RequestState) -> VerificationEvidence | None:
     if state.runtime is not None:
-        return state.runtime.latest_verification
+        return state.runtime.verification.latest
     return state.latest_verification
 
 
 def _verification_repair_target(state: RequestState) -> RepairTarget | None:
     if state.runtime is not None:
-        return state.runtime.repair_target
+        return state.runtime.verification.repair_target
     return state.verification_repair_target
 
 
 def _verification_recovery_active(state: RequestState) -> bool:
     if state.runtime is not None:
-        return state.runtime.verification_recovery
+        return state.runtime.verification.recovery_active(
+            state.runtime.control_state
+        )
     return state.verification_recovery
 
 
 def _verification_fix_required(state: RequestState) -> bool:
     if state.runtime is not None:
-        return state.runtime.verification_fix_required
+        return state.runtime.verification.requires_repair(
+            state.runtime.control_state
+        )
     return state.verification_fix_required
 
 
@@ -532,6 +559,12 @@ def _verification_fix_recovery_active(state: RequestState) -> bool:
     if state.runtime is not None:
         return state.runtime.control_state is AgentControlState.FIX_REQUIRED
     return state.verification_fix_recovery
+
+
+def _verification_read_count(state: RequestState) -> int:
+    if state.runtime is not None:
+        return state.runtime.verification.read_count
+    return state.verification_read_count
 
 
 def _prefixed_repair_target(context: str) -> str:

@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from forge.runtime.state import ToolCall
 from forge.runtime.tool_executor import ToolExecutionRecord, ToolExecutor
 from forge.tools.base import ToolResult
+
+if TYPE_CHECKING:
+    from forge.runtime.agent_controller import TurnRuntimeState
 
 
 @dataclass(frozen=True, slots=True)
 class ToolRunPolicy:
     tool_count: int
     available_tools: frozenset[str]
+    runtime: 'TurnRuntimeState | None' = None
+    control_state: Any = None
+    # Legacy compatibility fields. Runtime/controller state wins when present.
     action_recovery: bool = False
     mutation_recovery: bool = False
     planning_recovery: bool = False
@@ -143,30 +149,6 @@ class ToolRunner:
                 policy,
                 'the current AgentController state',
             )
-        if (
-            policy.planning_recovery
-            and tool_call.name not in policy.available_tools
-        ):
-            return unavailable_in_phase(tool_call, policy, 'Planning Recovery')
-        if (
-            policy.action_recovery
-            and tool_call.name not in policy.available_tools
-        ):
-            return unavailable_in_phase(tool_call, policy, 'Action Recovery')
-        if (
-            policy.mutation_recovery
-            and tool_call.name not in policy.available_tools
-        ):
-            return unavailable_in_phase(tool_call, policy, 'Edit Recovery')
-        if (
-            policy.verification_recovery
-            and tool_call.name not in policy.available_tools
-        ):
-            return unavailable_in_phase(
-                tool_call,
-                policy,
-                'Verification Recovery',
-            )
         if policy.action_read_exhausted:
             return synthetic_failure(
                 'action_read_limit_reached',
@@ -289,6 +271,15 @@ def unavailable_in_phase(
 
 
 def transaction_phase(policy: ToolRunPolicy) -> str:
+    control_state = policy_control_state(policy)
+    if state_value(control_state) == 'task_planning':
+        return 'planning_recovery'
+    if policy_runtime_edit_recovery(policy):
+        return 'edit_recovery'
+    if policy_runtime_verification_recovery(policy):
+        return 'verification_recovery'
+    if state_value(control_state) == 'targeted_analysis':
+        return 'action_recovery'
     if policy.planning_recovery:
         return 'planning_recovery'
     if policy.mutation_recovery:
@@ -298,6 +289,30 @@ def transaction_phase(policy: ToolRunPolicy) -> str:
     if policy.action_recovery:
         return 'action_recovery'
     return 'normal'
+
+
+def policy_control_state(policy: ToolRunPolicy) -> Any:
+    if policy.runtime is not None:
+        return policy.runtime.control_state
+    return policy.control_state
+
+
+def state_value(control_state: Any) -> str:
+    return str(getattr(control_state, 'value', control_state or ''))
+
+
+def policy_runtime_edit_recovery(policy: ToolRunPolicy) -> bool:
+    if policy.runtime is not None:
+        return policy.runtime.edit_recovery.active
+    return False
+
+
+def policy_runtime_verification_recovery(policy: ToolRunPolicy) -> bool:
+    if policy.runtime is not None:
+        return policy.runtime.verification.recovery_active(
+            policy.runtime.control_state
+        )
+    return False
 
 
 def transaction_decision(run: ToolRunResult) -> TransactionDecision:

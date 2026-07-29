@@ -243,3 +243,72 @@ Next agent_loop.py migration areas:
   controller-owned edit recovery state.
 - Route progress acceptance criteria and plan-step completion directly from
   Task Envelope state instead of passing booleans into `evaluate_progress`.
+
+## Milestone 8 - agent_loop.py State Source Migration
+
+Status: complete for this vertical slice.
+
+Completed changes:
+- Removed the remaining local `agent_loop.py` flow-state variables for
+  verification recovery, edit recovery, action recovery counters, and
+  synthesis/finalization recovery.
+- Added controller-owned nested runtime state objects:
+  `VerificationRecoveryState`, `EditRecoveryState`,
+  `ActionRecoveryRuntimeState`, and `SynthesisRuntimeState`.
+- Replaced synthesis booleans with `SynthesisMode` enum values for checkpoint,
+  finalization, stagnation-final, and token-limit paths.
+- Changed the main request construction path so `agent_loop.py` passes one
+  `TurnRuntimeState` snapshot instead of copying recovery booleans into
+  `RequestState`.
+- Changed RequestBuilder internals to read nested runtime state directly when
+  a runtime snapshot is present; scalar `RequestState` fields now act only as
+  legacy fallback inputs.
+- Changed ToolRunner transaction phase detection to prefer `TurnRuntimeState`
+  and `AgentControlState`, and removed duplicated per-recovery tool-availability
+  gates.
+- Added regression coverage proving runtime snapshots override contradictory
+  legacy `RequestState` and `ToolRunPolicy` booleans.
+
+Validation:
+- `uv lock --check`
+- `uv run python -m compileall -q forge tests`
+- `uv run pytest -q`
+- `git diff --check`
+
+Duplicate control logic removed or deprecated in this slice:
+- Removed `agent_loop.py` locals:
+  `verification_recovery`, `verification_fix_recovery`,
+  `verification_fix_required`, `verification_failed_revision`,
+  `verification_read_count`, `verification_recovery_calls`,
+  `last_verification_failure_signature`, `mutation_recovery_context`,
+  `mutation_failures`, `mutation_recovery_read_used`,
+  `mutation_failure_count`, `action_recovery_calls`, `action_read_used`,
+  `action_block_events`, `force_synthesis`, `finalization_recovery`,
+  `stagnation_final_recovery`, and `token_limit_recovery`.
+- Removed the request-time copy-back from local recovery variables into
+  `TurnRuntimeState`; the controller snapshot is now the live state object.
+- Removed duplicate ToolRunner checks that reinterpreted planning/action/edit/
+  verification booleans after the state-selected tool set had already been
+  enforced.
+
+Remaining old state sources:
+- `RequestState` still exposes scalar recovery fields for compatibility with
+  older tests and non-runtime callers; runtime snapshots override them.
+- `ToolRunPolicy` still exposes legacy recovery booleans for compatibility
+  callers; runtime/control-state values override them.
+- `TurnRuntimeState` still exposes compatibility properties such as
+  `latest_verification`, `repair_target`, `mutation_failures`,
+  `action_recovery_calls`, and `synthesis_mode`; production code should prefer
+  the nested state objects.
+- `AgentController.planning_recovery` and `AgentController.action_recovery`
+  remain compatibility views over `AgentControlState`.
+
+Next agent_loop.py migration areas:
+- Encapsulate repeated recovery reset blocks behind controller/runtime methods
+  so `agent_loop.py` mutates less nested state directly.
+- Move completion block counters and current acceptance-step tracking into the
+  controller runtime snapshot.
+- Retire `RequestState` scalar recovery fields after downstream tests/callers
+  construct runtime snapshots.
+- Retire `ToolRunPolicy` scalar recovery fields after all direct tests use
+  runtime/control-state inputs.

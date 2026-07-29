@@ -26,6 +26,14 @@ class AgentControlState(str, Enum):
     BLOCKED = 'blocked'
 
 
+class SynthesisMode(str, Enum):
+    NORMAL = ''
+    CHECKPOINT = 'checkpoint'
+    FINALIZATION = 'finalization'
+    STAGNATION_FINAL = 'stagnation_final'
+    TOKEN_LIMIT = 'token_limit'
+
+
 @dataclass(slots=True)
 class AgentController:
     '''Map structured tool failures onto bounded runtime state transitions.'''
@@ -169,6 +177,126 @@ class BudgetLedger:
 
 
 @dataclass(slots=True)
+class VerificationRecoveryState:
+    latest: VerificationEvidence | None = None
+    repair_target: RepairTarget | None = None
+    failed_revision: int | None = None
+    repair_revision: int | None = None
+    read_count: int = 0
+    recovery_calls: int = 0
+    last_failure_signature: str = ''
+
+    def clear(self) -> None:
+        self.latest = None
+        self.repair_target = None
+        self.failed_revision = None
+        self.repair_revision = None
+        self.read_count = 0
+        self.recovery_calls = 0
+        self.last_failure_signature = ''
+
+    def clear_failure(self) -> None:
+        self.failed_revision = None
+        self.repair_target = None
+        self.read_count = 0
+        self.recovery_calls = 0
+        self.last_failure_signature = ''
+
+    def requires_repair(self, control_state: AgentControlState) -> bool:
+        return (
+            control_state is AgentControlState.FIX_REQUIRED
+            and self.latest is not None
+            and not self.latest.success
+        )
+
+    def recovery_active(self, control_state: AgentControlState) -> bool:
+        if control_state is AgentControlState.READY_TO_VERIFY:
+            return True
+        return self.requires_repair(control_state)
+
+
+@dataclass(slots=True)
+class EditRecoveryState:
+    context: str = ''
+    failures: list[dict[str, object]] = field(default_factory=list)
+    failure_count: int = 0
+    read_used: bool = False
+
+    @property
+    def active(self) -> bool:
+        return bool(self.failures)
+
+    def clear(self) -> None:
+        self.context = ''
+        self.failures.clear()
+        self.failure_count = 0
+        self.read_used = False
+
+
+@dataclass(slots=True)
+class ActionRecoveryRuntimeState:
+    calls: int = 0
+    read_used: bool = False
+    block_events: int = 0
+
+    def reset(self) -> None:
+        self.calls = 0
+        self.read_used = False
+
+
+@dataclass(slots=True)
+class SynthesisRuntimeState:
+    mode: SynthesisMode = SynthesisMode.NORMAL
+
+    @property
+    def force(self) -> bool:
+        return self.mode is not SynthesisMode.NORMAL
+
+    @force.setter
+    def force(self, value: bool) -> None:
+        if not value and self.mode is SynthesisMode.CHECKPOINT:
+            self.mode = SynthesisMode.NORMAL
+        elif value and self.mode is SynthesisMode.NORMAL:
+            self.mode = SynthesisMode.CHECKPOINT
+
+    def clear(self) -> None:
+        self.mode = SynthesisMode.NORMAL
+
+    @property
+    def finalization_recovery(self) -> bool:
+        return self.mode is SynthesisMode.FINALIZATION
+
+    @finalization_recovery.setter
+    def finalization_recovery(self, value: bool) -> None:
+        if value:
+            self.mode = SynthesisMode.FINALIZATION
+        elif self.mode is SynthesisMode.FINALIZATION:
+            self.mode = SynthesisMode.NORMAL
+
+    @property
+    def stagnation_final_recovery(self) -> bool:
+        return self.mode is SynthesisMode.STAGNATION_FINAL
+
+    @stagnation_final_recovery.setter
+    def stagnation_final_recovery(self, value: bool) -> None:
+        if value:
+            self.mode = SynthesisMode.STAGNATION_FINAL
+        elif self.mode is SynthesisMode.STAGNATION_FINAL:
+            self.mode = SynthesisMode.NORMAL
+
+    @property
+    def token_limit_recovery(self) -> bool:
+        return self.mode is SynthesisMode.TOKEN_LIMIT
+
+    @token_limit_recovery.setter
+    def token_limit_recovery(self, value: bool) -> None:
+        if value:
+            self.mode = SynthesisMode.TOKEN_LIMIT
+        elif self.mode is SynthesisMode.TOKEN_LIMIT:
+            self.mode = SynthesisMode.NORMAL
+
+
+@dataclass(slots=True)
 class TurnRuntimeState:
     '''Single controller-owned snapshot for one active user turn.'''
 
@@ -177,39 +305,115 @@ class TurnRuntimeState:
     budget: BudgetLedger = field(default_factory=BudgetLedger)
     current_step: str = ''
     failure_reasons: tuple[str, ...] = ()
-    repair_target: RepairTarget | None = None
-    latest_verification: VerificationEvidence | None = None
-    verification_failed_revision: int | None = None
-    verification_repair_revision: int | None = None
-    verification_read_count: int = 0
+    verification: VerificationRecoveryState = field(
+        default_factory=VerificationRecoveryState
+    )
     planning_recovery_calls: int = 0
     requires_planning: bool = False
-    mutation_recovery_context: str = ''
-    mutation_failures: tuple[dict[str, object], ...] = ()
-    mutation_read_used: bool = False
+    edit_recovery: EditRecoveryState = field(default_factory=EditRecoveryState)
     completion_ready_context: str = ''
-    action_recovery_calls: int = 0
-    action_read_used: bool = False
-    synthesis_mode: str = ''
+    action_recovery_state: ActionRecoveryRuntimeState = field(
+        default_factory=ActionRecoveryRuntimeState
+    )
+    synthesis: SynthesisRuntimeState = field(
+        default_factory=SynthesisRuntimeState
+    )
 
     @property
     def verification_recovery(self) -> bool:
-        if self.control_state in {
-            AgentControlState.READY_TO_VERIFY,
-        }:
-            return True
-        return (
-            self.control_state is AgentControlState.FIX_REQUIRED
-            and self.latest_verification is not None
-        )
+        return self.verification.recovery_active(self.control_state)
 
     @property
     def verification_fix_required(self) -> bool:
-        return (
-            self.control_state is AgentControlState.FIX_REQUIRED
-            and self.latest_verification is not None
-            and not self.latest_verification.success
-        )
+        return self.verification.requires_repair(self.control_state)
+
+    @property
+    def latest_verification(self) -> VerificationEvidence | None:
+        return self.verification.latest
+
+    @latest_verification.setter
+    def latest_verification(self, value: VerificationEvidence | None) -> None:
+        self.verification.latest = value
+
+    @property
+    def repair_target(self) -> RepairTarget | None:
+        return self.verification.repair_target
+
+    @repair_target.setter
+    def repair_target(self, value: RepairTarget | None) -> None:
+        self.verification.repair_target = value
+
+    @property
+    def verification_failed_revision(self) -> int | None:
+        return self.verification.failed_revision
+
+    @verification_failed_revision.setter
+    def verification_failed_revision(self, value: int | None) -> None:
+        self.verification.failed_revision = value
+
+    @property
+    def verification_repair_revision(self) -> int | None:
+        return self.verification.repair_revision
+
+    @verification_repair_revision.setter
+    def verification_repair_revision(self, value: int | None) -> None:
+        self.verification.repair_revision = value
+
+    @property
+    def verification_read_count(self) -> int:
+        return self.verification.read_count
+
+    @verification_read_count.setter
+    def verification_read_count(self, value: int) -> None:
+        self.verification.read_count = value
+
+    @property
+    def mutation_recovery_context(self) -> str:
+        return self.edit_recovery.context
+
+    @mutation_recovery_context.setter
+    def mutation_recovery_context(self, value: str) -> None:
+        self.edit_recovery.context = value
+
+    @property
+    def mutation_failures(self) -> tuple[dict[str, object], ...]:
+        return tuple(self.edit_recovery.failures)
+
+    @mutation_failures.setter
+    def mutation_failures(self, value: tuple[dict[str, object], ...]) -> None:
+        self.edit_recovery.failures = list(value)
+
+    @property
+    def mutation_read_used(self) -> bool:
+        return self.edit_recovery.read_used
+
+    @mutation_read_used.setter
+    def mutation_read_used(self, value: bool) -> None:
+        self.edit_recovery.read_used = value
+
+    @property
+    def action_recovery_calls(self) -> int:
+        return self.action_recovery_state.calls
+
+    @action_recovery_calls.setter
+    def action_recovery_calls(self, value: int) -> None:
+        self.action_recovery_state.calls = value
+
+    @property
+    def action_read_used(self) -> bool:
+        return self.action_recovery_state.read_used
+
+    @action_read_used.setter
+    def action_read_used(self, value: bool) -> None:
+        self.action_recovery_state.read_used = value
+
+    @property
+    def synthesis_mode(self) -> str:
+        return self.synthesis.mode.value
+
+    @synthesis_mode.setter
+    def synthesis_mode(self, value: str) -> None:
+        self.synthesis.mode = SynthesisMode(value)
 
 
 def is_todo_required_result(result: ToolResult) -> bool:
