@@ -249,4 +249,12 @@ def sanitize(value: Any) -> Any:
 
 
 def redact_text(value: str) -> str:
-    return _SENSITIVE_ASSIGNMENT.sub(r'\1\2[REDACTED]', value)
+    return _SENSITIVE_ASSIGNMENT.sub(
+        r'\1\2[REDACTED]',
+        repair_unicode(value),
+    )
+
+
+def repair_unicode(value: str) -> str:
+    '''Replace invalid surrogate code points before JSONL persistence.'''
+    return value.encode('utf-8', errors='replace').decode('utf-8')

@@ -95,6 +95,20 @@ class ProcessRevertTool(Tool[EmptyProcessInput]):
         return ToolResult.ok('Reverted sample.txt to the turn baseline.')
 
 
+class FailedTaskTool(Tool[EmptyProcessInput]):
+    name = 'task'
+    description = 'Fail like a subagent that reached its round limit.'
+    input_model = EmptyProcessInput
+    effect = 'process'
+
+    async def execute(self, arguments: EmptyProcessInput) -> ToolResult:
+        del arguments
+        return ToolResult.fail(
+            'subagent_no_report',
+            'Task subagent reached its round limit without a report.',
+        )
+
+
 def response_with_tool(call: ToolCall) -> list[ModelStreamEvent]:
     return [
         ModelUsageUpdate(usage=TokenUsage(10, 0)),
@@ -562,6 +576,132 @@ def test_write_then_revert_to_baseline_enters_edit_recovery(
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'old\n'
 
 
+def test_required_change_enters_action_recovery_after_bounded_read_progress(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    client = FakeModelClient(
+        response_with_tool(
+            ToolCall(
+                0,
+                'read-sample',
+                'read_file',
+                {'path': 'sample.txt', 'start_line': 1, 'end_line': 20},
+            )
+        ),
+        response_with_tool(ToolCall(0, 'status', 'git_status', {})),
+        response_with_tool(
+            ToolCall(
+                0,
+                'edit-sample',
+                'replace_text',
+                {
+                    'path': 'sample.txt',
+                    'old_text': 'old\n',
+                    'new_text': 'new\n',
+                },
+            )
+        ),
+        response_with_tool(
+            ToolCall(
+                0,
+                'verify-sample',
+                'verify',
+                {'command': 'git diff --check'},
+            )
+        ),
+        finish_response(
+            'finish-sample',
+            task_kind='change',
+            summary='Changed sample.txt.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        pre_mutation_limit=1,
+    )
+
+    events = collect_turn(conversation, 'Change sample.txt to new')
+
+    blocked = [
+        event for event in events if isinstance(event, CompletionBlocked)
+    ]
+    assert blocked
+    recovery_tools = {
+        str(tool.get('name')) for tool in client.calls[2]['tools'] or ()
+    }
+    assert '[ForgeCode Action Recovery]' in client.calls[2]['system']
+    assert 'replace_text' in recovery_tools
+    assert 'read_file' in recovery_tools
+    assert 'grep' in recovery_tools
+    assert 'git_status' not in recovery_tools
+    assert 'find_files' not in recovery_tools
+    assert 'run_command' not in recovery_tools
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.model_calls == 5
+    assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
+
+
+def test_failed_subagent_delegation_for_change_enters_local_action_recovery(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    registry = create_default_registry(tmp_path)
+    registry.replace(FailedTaskTool(tmp_path))
+    client = FakeModelClient(
+        response_with_tool(
+            ToolCall(
+                0,
+                'delegate-edit',
+                'task',
+                {'task': 'Edit sample.txt', 'focus_paths': ['sample.txt']},
+            )
+        ),
+        response_with_tool(
+            ToolCall(
+                0,
+                'local-edit',
+                'replace_text',
+                {
+                    'path': 'sample.txt',
+                    'old_text': 'old\n',
+                    'new_text': 'new\n',
+                },
+            )
+        ),
+        response_with_tool(
+            ToolCall(
+                0,
+                'verify-local-edit',
+                'verify',
+                {'command': 'git diff --check'},
+            )
+        ),
+        finish_response(
+            'finish-local-edit',
+            task_kind='change',
+            summary='Recovered locally after subagent failure.',
+        ),
+    )
+    conversation = Conversation(client=client, registry=registry)
+
+    events = collect_turn(conversation, 'Change sample.txt to new')
+
+    recovery_names = {
+        str(definition.get('name')) for definition in client.calls[1]['tools'] or ()
+    }
+    assert '[ForgeCode Action Recovery]' in client.calls[1]['system']
+    assert 'replace_text' in recovery_names
+    assert 'task' not in recovery_names
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.changed_paths == ('sample.txt',)
+
+
 def test_later_write_failure_in_same_response_remains_in_recovery(
     tmp_path: Path,
 ) -> None:
@@ -985,7 +1125,7 @@ def test_required_change_stagnation_enters_action_recovery_and_can_finish(
     assert executed_names[-3:] == ['replace_text', 'verify', 'finish_task']
 
 
-def test_cli_fix_intent_enters_action_recovery_despite_novel_reads(
+def test_cli_fix_intent_keeps_normal_analysis_for_novel_reads(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -1064,16 +1204,15 @@ def test_cli_fix_intent_enters_action_recovery_despite_novel_reads(
         )
         for read in reads
     )
-    assert '[ForgeCode Action Recovery]' in (
-        client.calls[3]['system'] or ''
+    assert all(
+        '[ForgeCode Action Recovery]' not in (call['system'] or '')
+        for call in client.calls[:3]
     )
-    recovery_names = {
+    edit_tool_names = {
         str(definition['name'])
         for definition in client.calls[3]['tools'] or ()
     }
-    assert 'replace_text' in recovery_names
-    assert 'find_files' not in recovery_names
-    assert 'list_directory' not in recovery_names
+    assert 'replace_text' in edit_tool_names
 
 
 def test_action_recovery_failed_edit_transfers_to_mutation_recovery(
@@ -1135,7 +1274,7 @@ def test_action_recovery_failed_edit_transfers_to_mutation_recovery(
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'completed'
     assert completed.result.changed_paths == ('sample.txt',)
-    assert '[ForgeCode Action Recovery]' in (
+    assert '[ForgeCode Action Recovery]' not in (
         client.calls[1]['system'] or ''
     )
     assert '[Failed Mutation Recovery]' in (
@@ -1217,7 +1356,7 @@ def test_process_modify_then_revert_does_not_reset_pre_mutation_budget(
     )
 
 
-def test_action_recovery_executes_at_most_one_read_from_a_tool_batch(
+def test_normal_analysis_allows_more_than_one_related_read_before_edit(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -1280,15 +1419,16 @@ def test_action_recovery_executes_at_most_one_read_from_a_tool_batch(
         if isinstance(event, ToolExecutionCompleted)
         and event.tool_call.id == second_recovery_read.id
     )
-    assert second_result.success is False
-    assert second_result.error is not None
-    assert second_result.error.code == 'action_read_limit_reached'
+    assert second_result.success is True
     post_read_names = {
         str(definition['name'])
         for definition in client.calls[2]['tools'] or ()
     }
-    assert 'read_file' not in post_read_names
-    assert 'grep' not in post_read_names
+    assert 'replace_text' in post_read_names
+    assert all(
+        '[ForgeCode Action Recovery]' not in (call['system'] or '')
+        for call in client.calls[:2]
+    )
     assert isinstance(events[-1], TurnCompleted)
     assert events[-1].result.status == 'completed'
 
@@ -1330,10 +1470,10 @@ def test_required_change_action_recovery_read_only_call_stops_specifically(
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'stuck'
-    assert completed.result.model_calls == 12
+    assert completed.result.model_calls == 10
     assert completed.result.changed_paths == ()
-    assert client.responses == []
-    assert 'action recovery' in completed.result.text.casefold()
+    assert len(client.responses) == 2
+    assert 'malformed or schema-invalid tool requests' in completed.result.text
     assert (
         'without new workspace, plan, or repository evidence'
         not in completed.result.text
@@ -1360,13 +1500,8 @@ def test_required_change_action_recovery_read_only_call_stops_specifically(
         and event.tool_call.id == recovery_read.id
     ]
     assert len(recovery_events) == 1
-    assert all(event.result.success for event in recovery_events)
-    post_read_tool_names = {
-        str(definition['name'])
-        for definition in client.calls[10]['tools'] or ()
-    }
-    assert 'read_file' not in post_read_tool_names
-    assert 'grep' not in post_read_tool_names
+    assert recovery_events[0].result.error is not None
+    assert recovery_events[0].result.error.code == 'tool_not_available_in_phase'
 
 
 def test_cli_intent_requires_task_local_edit_for_preexisting_untracked_file(

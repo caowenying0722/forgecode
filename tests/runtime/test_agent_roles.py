@@ -18,6 +18,7 @@ from forge.runtime.model_client import (
 )
 from forge.runtime.recovery_manager import RecoveryManager
 from forge.runtime.request_builder import RequestBuilder, RequestState
+from forge.runtime.progress import evaluate_progress
 from forge.runtime.state import (
     ModelStreamEvent,
     ModelTextDelta,
@@ -294,6 +295,52 @@ def test_request_builder_uses_contract_read_only_surface() -> None:
 
     assert spec.tools == plan_tools
     assert '[ForgeCode Turn Task Contract]' in spec.system_prompt
+
+
+def test_request_builder_injects_runtime_task_model_for_change() -> None:
+    tools = [{'name': 'read_file'}, {'name': 'write_file'}]
+    recovery = RecoveryManager(
+        tools,
+        None,
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    contract = infer_task_contract('帮我修复 src/player.ts')
+
+    spec = RequestBuilder(recovery, action_recovery_limit=3).build(
+        state=RequestState(
+            task_contract=contract,
+            task_goal='帮我修复 src/player.ts',
+            change_required=True,
+            task_scope_patterns=('src/player.ts',),
+        ),
+        interaction_mode='auto',
+        all_tools=tools,
+        plan_tools=[tools[0]],
+        base_system_prompt='base',
+        repository_context='',
+        changed_paths=(),
+    )
+
+    assert '[ForgeCode Runtime Task Model]' in spec.system_prompt
+    assert 'Completion conditions:' in spec.system_prompt
+    assert 'Expected impact scope:' in spec.system_prompt
+    assert 'src/player.ts' in spec.system_prompt
+
+
+def test_progress_evaluator_counts_verification_as_progress() -> None:
+    progress = evaluate_progress(
+        workspace_progressed=False,
+        task_progressed=False,
+        evidence_progressed=False,
+        verification_progressed=True,
+        review_progressed=False,
+        protocol_failure=False,
+        mutation_recovery_active=False,
+    )
+
+    assert progress.progressed is True
+    assert progress.signal == 'verification_evidence'
 
 
 def test_action_recovery_excludes_directory_only_writes() -> None:

@@ -8,6 +8,10 @@ from typing import Any
 from forge.runtime.intent import TaskContract
 from forge.runtime.recovery_feedback import render_action_recovery_context
 from forge.runtime.recovery_manager import RecoveryManager
+from forge.runtime.task_model import (
+    build_runtime_task_model,
+    render_runtime_task_model,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +37,7 @@ class RequestState:
     action_recovery_calls: int = 0
     action_read_used: bool = False
     task_scope_patterns: tuple[str, ...] = ()
+    task_goal: str = ''
 
     @property
     def tool_free_recovery(self) -> bool:
@@ -147,6 +152,14 @@ class RequestBuilder:
         prompt = base
         if repository_context:
             prompt += '\n\n' + repository_context
+        if state.task_contract is not None and state.task_goal:
+            prompt += '\n\n' + render_runtime_task_model(
+                build_runtime_task_model(
+                    state.task_goal,
+                    state.task_contract,
+                    scope_patterns=state.task_scope_patterns,
+                )
+            )
         if state.change_required:
             prompt += '\n\n' + render_change_contract_context(
                 changed_paths,

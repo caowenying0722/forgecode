@@ -82,7 +82,7 @@ class ApplyPatchTool(Tool[ApplyPatchInput]):
             patch_format = 'codex_envelope'
             try:
                 operations = parse_codex_envelope(arguments.patch)
-                normalized_patch = build_unified_patch(self.root, operations)
+                changes = build_envelope_changes(self.root, operations)
             except (_EnvelopeError, ToolExecutionError) as error:
                 code = (
                     error.code
@@ -99,6 +99,38 @@ class ApplyPatchTool(Tool[ApplyPatchInput]):
                     details=details,
                     metadata={'format': patch_format},
                 )
+            target_paths = tuple(change[0] for change in changes)
+            for path, _, after in changes:
+                target = resolve_repository_path(
+                    self.root,
+                    path,
+                    must_exist=False,
+                )
+                if after is None:
+                    target.unlink()
+                else:
+                    target.write_text(after, encoding='utf-8', newline='')
+            status = await run_process(
+                ['git', 'status', '--short', '--', *target_paths],
+                cwd=self.root,
+                timeout_seconds=30,
+            )
+            status_text = status.stdout.rstrip()
+            changed_files = [
+                line[3:].strip()
+                for line in status.stdout.splitlines()
+                if len(line) >= 4
+            ]
+            return ToolResult.ok(
+                f'Applied patch to {len(changed_files)} target path(s).',
+                content=status_text,
+                metadata={
+                    'format': patch_format,
+                    'target_paths': list(target_paths),
+                    'changed_files': changed_files,
+                    'status': process_metadata(status),
+                },
+            )
         try:
             target_paths = validate_unified_patch_paths(
                 self.root,
@@ -315,6 +347,19 @@ def build_unified_patch(
     operations: tuple[_EnvelopeOperation, ...],
 ) -> str:
     '''Validate all envelope operations in memory, then create one Git patch.'''
+    changes = build_envelope_changes(root, operations)
+    patch_parts = [render_unified_change(*change) for change in changes]
+    normalized = ''.join(patch_parts)
+    if not normalized:
+        raise _EnvelopeError('Codex patch does not produce any changes.')
+    return normalized
+
+
+def build_envelope_changes(
+    root: Path,
+    operations: tuple[_EnvelopeOperation, ...],
+) -> list[tuple[str, str | None, str | None]]:
+    '''Validate all envelope operations and return filesystem changes.'''
     changes: list[tuple[str, str | None, str | None]] = []
     for operation in operations:
         if operation.kind == 'add':
@@ -371,11 +416,9 @@ def build_unified_patch(
             )
         changes.append((display_path(root, path), before, after))
 
-    patch_parts = [render_unified_change(*change) for change in changes]
-    normalized = ''.join(patch_parts)
-    if not normalized:
+    if not changes:
         raise _EnvelopeError('Codex patch does not produce any changes.')
-    return normalized
+    return changes
 
 
 def parse_added_file(operation: _EnvelopeOperation) -> str:

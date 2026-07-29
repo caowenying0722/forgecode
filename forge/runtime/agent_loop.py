@@ -52,6 +52,7 @@ from forge.runtime.protocol_recovery import (
     build_synthesis_retry_feedback,
     build_tool_protocol_feedback,
 )
+from forge.runtime.progress import evaluate_progress
 from forge.runtime.request_builder import RequestBuilder, RequestState
 from forge.runtime.recovery_manager import RecoveryManager
 from forge.runtime.recovery_feedback import (
@@ -208,7 +209,7 @@ class Conversation:
         stagnation_limit: int = 16,
         completion_decision_limit: int = 8,
         mutation_recovery_limit: int = 5,
-        pre_mutation_limit: int = 8,
+        pre_mutation_limit: int = 4,
         action_recovery_limit: int = 3,
         max_turn_input_tokens: int | None = None,
     ) -> None:
@@ -660,6 +661,11 @@ class Conversation:
                 action_read_used=action_read_used,
                 task_scope_patterns=self.completion_checker.task_scope_patterns(
                     evidence_paths=self.working_state.evidence_paths,
+                ),
+                task_goal=(
+                    self.task_manager.active.goal
+                    if self.task_manager.active is not None
+                    else prompt
                 ),
             )
             request_spec = self.request_builder.build(
@@ -1519,6 +1525,12 @@ class Conversation:
                         ),
                         reasons=finish_rejection,
                     )
+                if (
+                    tool_call.name == 'task'
+                    and not result.success
+                    and self._pending_required_change(change_required)
+                ):
+                    batch.required_change_rejected = True
                 tool_changed_workspace = False
                 if self.workspace_tracker is not None:
                     change = await self.workspace_tracker.refresh()
@@ -1643,6 +1655,7 @@ class Conversation:
                         )
                         verification_read_used = False
                     if latest_verification is not None:
+                        batch.verification_progressed = True
                         yield VerificationCompleted(
                             evidence=latest_verification
                         )
@@ -1750,6 +1763,7 @@ class Conversation:
                 verification_read_used = False
                 if not verification_recovery:
                     verification_recovery_calls = 0
+                self.agent_controller.enter_ready_to_verify()
                 completion_ready_revision = None
                 completion_decision_calls = 0
                 completion_ready_context = ''
@@ -1779,6 +1793,7 @@ class Conversation:
                     )
                 mutation_failures = mutation_failures[-3:]
             if mutation_failures:
+                self.agent_controller.enter_fix_required()
                 action_recovery = False
                 action_recovery_calls = 0
                 action_read_used = False
@@ -1860,19 +1875,22 @@ class Conversation:
                 entered_action_recovery = False
                 if action_recovery:
                     action_recovery_calls += 1
-                elif batch.required_change_rejected:
+                elif batch.required_change_rejected or batch_reverted_to_baseline:
                     action_recovery = True
                     action_recovery_calls = 0
                     action_read_used = False
                     entered_action_recovery = True
+                elif batch.task_progressed:
+                    pre_mutation_calls = 0
                 else:
                     pre_mutation_calls += 1
-                    if pre_mutation_calls >= self.pre_mutation_limit:
+                    if pre_mutation_calls > self.pre_mutation_limit:
                         action_recovery = True
                         action_recovery_calls = 0
                         action_read_used = False
                         entered_action_recovery = True
                 if action_recovery:
+                    self.agent_controller.enter_targeted_analysis()
                     force_synthesis = False
                     synthesis_retries = 0
                     stagnation_final_recovery = False
@@ -1968,11 +1986,16 @@ class Conversation:
             completion_decision_calls = 0
             completion_ready_context = ''
             completion_reviewed_paths.clear()
-            if (
-                workspace_progressed
-                or batch.task_progressed
-                or batch.evidence_progressed
-            ):
+            progress = evaluate_progress(
+                workspace_progressed=workspace_progressed,
+                task_progressed=batch.task_progressed,
+                evidence_progressed=batch.evidence_progressed,
+                verification_progressed=batch.verification_progressed,
+                review_progressed=bool(new_reviews),
+                protocol_failure=protocol_failure,
+                mutation_recovery_active=bool(mutation_failures),
+            )
+            if progress.progressed:
                 calls_without_progress = 0
                 force_synthesis = False
                 synthesis_retries = 0

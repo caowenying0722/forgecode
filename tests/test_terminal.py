@@ -19,10 +19,12 @@ from forge.runtime.state import (
 )
 from forge.runtime.agent_state import AgentPhase
 from forge.terminal import (
+    EncodingSafeTextIO,
     ForgePromptCompleter,
     SLASH_COMMAND_COMPLETER,
     TerminalUI,
     permission_answer_allows,
+    repair_input_text,
     streaming_preview,
     token_usage_summary,
 )
@@ -66,6 +68,32 @@ def test_terminal_preserves_multiline_prompt_from_interactive_session() -> None:
     assert len(prompt_session.messages) == 1
     assert prompt_session.kwargs[0]['completer'] is terminal.prompt_completer
     assert prompt_session.kwargs[0]['complete_while_typing'] is True
+
+
+def test_terminal_repairs_invalid_surrogate_prompt_text() -> None:
+    assert repair_input_text('fix\udc80bug') == 'fix?bug'
+
+
+def test_encoding_safe_text_io_replaces_unencodable_output() -> None:
+    class FakeOutput:
+        encoding = 'gbk'
+
+        def __init__(self) -> None:
+            self.value = ''
+
+        def write(self, text: str) -> int:
+            self.value += text
+            return len(text)
+
+        def flush(self) -> None:
+            pass
+
+    output = FakeOutput()
+    stream = EncodingSafeTextIO(output)
+
+    stream.write('step ↳ done')
+
+    assert output.value == 'step ? done'
 
 
 def test_terminal_rebinds_completion_on_every_prompt(tmp_path: Path) -> None:

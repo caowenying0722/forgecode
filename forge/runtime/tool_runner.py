@@ -67,6 +67,7 @@ class ToolBatchState:
     last_workspace_change_position: int = -1
     task_progressed: bool = False
     evidence_progressed: bool = False
+    verification_progressed: bool = False
     required_change_rejected: bool = False
     accepted_finish: ToolResult | None = None
     terminal_finish_reasons: tuple[str, ...] = ()

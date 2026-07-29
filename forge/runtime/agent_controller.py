@@ -11,9 +11,13 @@ from forge.tools.base import ToolResult
 
 class AgentControlState(str, Enum):
     INIT = 'init'
+    TASK_PLANNING = 'task_planning'
     EXPLORING = 'exploring'
+    TARGETED_ANALYSIS = 'targeted_analysis'
     PLANNING = 'planning'
     IMPLEMENTING = 'implementing'
+    FIX_REQUIRED = 'fix_required'
+    READY_TO_VERIFY = 'ready_to_verify'
     VERIFYING = 'verifying'
     RECOVERING = 'recovering'
     DONE = 'done'
@@ -41,9 +45,18 @@ class AgentController:
         return self.contract.initial_tool_surface
 
     def enter_planning_recovery(self) -> None:
-        self.state = AgentControlState.PLANNING
+        self.state = AgentControlState.TASK_PLANNING
         self.planning_recovery = True
         self.planning_recovery_calls += 1
+
+    def enter_targeted_analysis(self) -> None:
+        self.state = AgentControlState.TARGETED_ANALYSIS
+
+    def enter_fix_required(self) -> None:
+        self.state = AgentControlState.FIX_REQUIRED
+
+    def enter_ready_to_verify(self) -> None:
+        self.state = AgentControlState.READY_TO_VERIFY
 
     def observe_tool_result(self, tool_name: str, result: ToolResult) -> None:
         if tool_name == 'todo_write' and result.success:
@@ -51,11 +64,13 @@ class AgentController:
             self.state = AgentControlState.IMPLEMENTING
         elif tool_name == 'verify' and result.success:
             self.state = AgentControlState.VERIFYING
+        elif tool_name == 'verify' and not result.success:
+            self.enter_targeted_analysis()
 
 
 def initial_state(contract: TaskContract) -> AgentControlState:
     if contract.initial_phase == 'planning':
-        return AgentControlState.PLANNING
+        return AgentControlState.TASK_PLANNING
     if contract.initial_phase == 'implementing':
         return AgentControlState.IMPLEMENTING
     return AgentControlState.EXPLORING

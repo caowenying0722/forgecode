@@ -362,6 +362,34 @@ class _InteractivePrompt(Protocol):
         ...
 
 
+class EncodingSafeTextIO:
+    '''Text stream wrapper that replaces characters unsupported by the sink.'''
+
+    def __init__(self, wrapped: Any) -> None:
+        self.wrapped = wrapped
+
+    @property
+    def encoding(self) -> str | None:
+        return getattr(self.wrapped, 'encoding', None)
+
+    def isatty(self) -> bool:
+        isatty = getattr(self.wrapped, 'isatty', None)
+        return bool(isatty()) if isatty is not None else False
+
+    def flush(self) -> None:
+        self.wrapped.flush()
+
+    def write(self, text: str) -> int:
+        encoding = self.encoding or 'utf-8'
+        safe = text.encode(encoding, errors='replace').decode(encoding)
+        return self.wrapped.write(safe)
+
+
+def repair_input_text(value: str) -> str:
+    '''Replace invalid surrogate code points from mis-decoded stdin.'''
+    return value.encode('utf-8', errors='replace').decode('utf-8')
+
+
 class TerminalUI:
     '''Render the interactive ForgeCode conversation.'''
 
@@ -373,7 +401,11 @@ class TerminalUI:
         permission_selector: PermissionSelector | None = None,
         approval_selector: ApprovalSelector | None = None,
     ) -> None:
-        self.console = console if console is not None else Console()
+        self.console = (
+            console
+            if console is not None
+            else Console(file=EncodingSafeTextIO(sys.stdout))
+        )
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.prompt_completer = ForgePromptCompleter(self.workspace_root)
         self.prompt_session = prompt_session
@@ -428,14 +460,18 @@ class TerminalUI:
         '''Read one message, preserving bracketed multi-line terminal paste.'''
         if self.prompt_session is not None:
             self.prompt_completer.refresh()
-            return self.prompt_session.prompt(
-                [('ansibrightcyan bold', '\u276f ')],
-                completer=self.prompt_completer,
-                complete_while_typing=True,
-                complete_style=CompleteStyle.COLUMN,
-                reserve_space_for_menu=8,
+            return repair_input_text(
+                self.prompt_session.prompt(
+                    [('ansibrightcyan bold', '\u276f ')],
+                    completer=self.prompt_completer,
+                    complete_while_typing=True,
+                    complete_style=CompleteStyle.COLUMN,
+                    reserve_space_for_menu=8,
+                )
             )
-        return self.console.input('[bold bright_cyan]>[/] ')
+        return repair_input_text(
+            self.console.input('[bold bright_cyan]>[/] ')
+        )
 
     def stream_response(self) -> StreamingResponseView:
         '''Create a live view for one streaming model response.'''

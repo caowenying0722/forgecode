@@ -149,3 +149,16 @@ def test_trajectory_records_lifecycle_without_large_tool_content(
     assert turn['model_calls'] == 2
     assert turn['changed_paths'] == ['a.py']
     assert turn['verification']['workspace_revision'] == 1
+
+
+def test_trajectory_repairs_invalid_surrogate_text(tmp_path: Path) -> None:
+    recorder = TrajectoryRecorder.create(tmp_path)
+
+    recorder.record_user_message('根据 task\udc80.md 修复')
+
+    records = [
+        json.loads(line)
+        for line in recorder.path.read_text(encoding='utf-8').splitlines()
+    ]
+    assert records[-1]['type'] == 'user_message'
+    assert records[-1]['content'] == '根据 task?.md 修复'

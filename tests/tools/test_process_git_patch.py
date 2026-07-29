@@ -547,6 +547,42 @@ def test_apply_patch_codex_envelope_supports_add_and_delete(
     )
 
 
+def test_apply_patch_codex_envelope_supports_single_delete(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    envelope = (
+        '*** Begin Patch\n'
+        '*** Delete File: sample.txt\n'
+        '*** End Patch'
+    )
+
+    result = run(ApplyPatchTool(tmp_path).run({'patch': envelope}))
+
+    assert result.success is True
+    assert not (tmp_path / 'sample.txt').exists()
+    assert result.metadata['format'] == 'codex_envelope'
+
+
+def test_apply_patch_codex_envelope_deletes_untracked_file(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    untracked = tmp_path / 'scratch.txt'
+    untracked.write_text('temporary\n', encoding='utf-8')
+    envelope = (
+        '*** Begin Patch\n'
+        '*** Delete File: scratch.txt\n'
+        '*** End Patch'
+    )
+
+    result = run(ApplyPatchTool(tmp_path).run({'patch': envelope}))
+
+    assert result.success is True
+    assert not untracked.exists()
+    assert result.metadata['changed_files'] == []
+
+
 def test_apply_patch_validates_entire_codex_envelope_before_applying(
     tmp_path: Path,
 ) -> None:
