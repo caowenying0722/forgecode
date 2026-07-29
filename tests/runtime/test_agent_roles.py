@@ -3,6 +3,8 @@
 import asyncio
 from collections.abc import AsyncIterator
 
+import pytest
+
 from forge.runtime.agent_loop import tool_call_signature
 from forge.runtime.intent import infer_task_contract
 from forge.runtime.agent_controller import AgentControlState, AgentController
@@ -470,6 +472,69 @@ def test_progress_evaluator_counts_verification_as_progress() -> None:
 
     assert progress.progressed is True
     assert progress.signal == 'verification_evidence'
+
+
+@pytest.mark.parametrize(
+    (
+        'workspace_progressed',
+        'evidence_progressed',
+        'changed_paths',
+        'evidence_paths',
+        'repair_target_paths',
+        'expected_signal',
+    ),
+    [
+        (
+            True,
+            False,
+            ('notes/unrelated.txt',),
+            (),
+            (),
+            'unrelated_workspace_revision',
+        ),
+        (
+            False,
+            True,
+            (),
+            ('notes/unrelated.txt',),
+            (),
+            'unrelated_repository_evidence',
+        ),
+        (
+            False,
+            True,
+            (),
+            ('src/app.py',),
+            ('src/app.py',),
+            'repository_evidence',
+        ),
+    ],
+)
+def test_progress_evaluator_requires_task_or_repair_relevance(
+    workspace_progressed: bool,
+    evidence_progressed: bool,
+    changed_paths: tuple[str, ...],
+    evidence_paths: tuple[str, ...],
+    repair_target_paths: tuple[str, ...],
+    expected_signal: str,
+) -> None:
+    progress = evaluate_progress(
+        workspace_progressed=workspace_progressed,
+        task_progressed=False,
+        evidence_progressed=evidence_progressed,
+        verification_progressed=False,
+        review_progressed=False,
+        protocol_failure=False,
+        mutation_recovery_active=False,
+        requires_change=True,
+        task_scope_patterns=('src/app.py',),
+        changed_paths=changed_paths,
+        evidence_paths=evidence_paths,
+        repair_target_paths=repair_target_paths,
+    )
+
+    assert progress.signal == expected_signal
+    assert progress.progressed is (not expected_signal.startswith('unrelated'))
 
 
 def test_action_recovery_excludes_directory_only_writes() -> None:

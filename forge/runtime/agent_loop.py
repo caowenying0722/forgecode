@@ -1355,6 +1355,7 @@ class Conversation:
 
             all_tool_calls.extend(tool_calls)
             batch = ToolBatchState()
+            evidence_paths_before_batch = set(self.working_state.evidence_paths)
             for tool_position, tool_call in enumerate(tool_calls):
                 finish_rejection: tuple[str, ...] = ()
                 tool_effect = self.tool_runner.effect(tool_call.name)
@@ -2052,6 +2053,29 @@ class Conversation:
                 review_progressed=bool(new_reviews),
                 protocol_failure=protocol_failure,
                 mutation_recovery_active=bool(mutation_failures),
+                requires_change=change_required,
+                task_scope_patterns=(
+                    self.completion_checker.task_scope_patterns(
+                        evidence_paths=(),
+                    )
+                ),
+                changed_paths=(
+                    self.workspace_tracker.changed_paths
+                    if self.workspace_tracker is not None
+                    else ()
+                ),
+                evidence_paths=tuple(
+                    sorted(
+                        set(self.working_state.evidence_paths)
+                        - evidence_paths_before_batch
+                    )
+                ),
+                review_paths=tuple(sorted(new_reviews)),
+                repair_target_paths=(
+                    verification_repair_target.paths
+                    if verification_repair_target is not None
+                    else ()
+                ),
             )
             if progress.progressed:
                 calls_without_progress = 0

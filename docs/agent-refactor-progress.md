@@ -67,11 +67,27 @@ Validation:
 
 ## Milestone 3 - Relevant Progress Evaluation
 
-Status: pending.
+Status: complete.
 
-Goal:
+Completed changes:
 - Count progress only when evidence, verification, plan updates, or diffs are
   relevant to the Task Envelope and the current blocker.
+- Extended `ProgressEvaluator` with optional task scope, changed paths, new
+  evidence paths, diff review paths, repair target paths, and change-required
+  context while keeping existing callers compatible.
+- Unrelated workspace revisions, repository evidence, and diff reviews no
+  longer reset stagnation progress when a task or repair target has a
+  constrained scope.
+- Repair-target evidence is accepted as relevant progress for verification
+  recovery.
+- Added parameterized regression coverage for unrelated workspace changes,
+  unrelated evidence, and repair-target evidence.
+
+Validation:
+- `uv lock --check`
+- `uv run python -m compileall -q forge tests`
+- `uv run pytest -q`
+- `git diff --check`
 
 ## Milestone 4 - Earlier Completion Relevance Guards
 
