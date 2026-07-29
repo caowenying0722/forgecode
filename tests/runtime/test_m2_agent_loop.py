@@ -1248,10 +1248,14 @@ def test_failed_subagent_delegation_for_change_enters_local_action_recovery(
 
     events = collect_turn(conversation, 'Change sample.txt to new')
 
+    recovery_call = next(
+        call
+        for call in client.calls
+        if '[ForgeCode Action Recovery]' in str(call['system'])
+    )
     recovery_names = {
-        str(definition.get('name')) for definition in client.calls[1]['tools'] or ()
+        str(definition.get('name')) for definition in recovery_call['tools'] or ()
     }
-    assert '[ForgeCode Action Recovery]' in client.calls[1]['system']
     assert 'replace_text' in recovery_names
     assert 'task' not in recovery_names
     completed = events[-1]

@@ -315,21 +315,6 @@ class PermissionManager:
 
 def normalize_permission_mode(mode: str) -> PermissionMode:
     normalized = mode.strip().casefold()
-    aliases = {
-        'read only': 'plan',
-        'read-only': 'plan',
-        'readonly': 'plan',
-        'ask': 'supervised',
-        'ask for approval': 'supervised',
-        'strict': 'supervised',
-        'approve': 'auto',
-        'approve for me': 'auto',
-        'trusted': 'auto',
-        'full': 'auto',
-        'full access': 'auto',
-        'full-access': 'auto',
-    }
-    normalized = aliases.get(normalized, normalized)
     if normalized not in {'plan', 'supervised', 'auto'}:
         raise ValueError(
             'Permission mode must be one of: plan, supervised, auto.'

@@ -6,6 +6,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from forge.runtime.state import ToolCall
 from forge.runtime.tool_runner import ToolBatchState
 from forge.runtime.tool_targets import mutation_target_paths
@@ -70,10 +72,10 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_legacy_permission_modes_normalize_to_new_modes() -> None:
-    assert normalize_permission_mode('readonly') == 'plan'
-    assert normalize_permission_mode('strict') == 'supervised'
-    assert normalize_permission_mode('trusted') == 'auto'
+@pytest.mark.parametrize('mode', ['readonly', 'strict', 'trusted'])
+def test_legacy_permission_modes_are_rejected(mode: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_permission_mode(mode)
 
 
 def test_tool_executor_allows_auto_tools_and_logs_result(
