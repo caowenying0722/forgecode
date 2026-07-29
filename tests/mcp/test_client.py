@@ -8,7 +8,11 @@ import sys
 from pathlib import Path
 
 from forge.mcp.client import MCPClientManager, parse_mcp_config
+from forge.mcp.client import MCPRemoteTool
+from forge.runtime.agent_loop import Conversation
 from forge.tools import create_default_registry
+from forge.tools.base import ToolRegistry
+from forge.tools.mcp import MCPTool, infer_mcp_tool_effect
 
 
 SERVER_SCRIPT = r'''
@@ -67,6 +71,10 @@ while True:
 '''
 
 
+class DummyMCPClient:
+    pass
+
+
 def test_mcp_config_parses_stdio_servers(tmp_path: Path) -> None:
     configs = parse_mcp_config(
         {
@@ -91,7 +99,10 @@ def test_mcp_config_parses_stdio_servers(tmp_path: Path) -> None:
 def test_mcp_manager_lists_and_calls_stdio_tool(tmp_path: Path) -> None:
     server = tmp_path / 'server.py'
     server.write_text(SERVER_SCRIPT, encoding='utf-8')
-    manager = MCPClientManager.from_config_file(write_config(tmp_path, server))
+    manager = MCPClientManager.from_config_file(
+        write_config(tmp_path, server),
+        app_root=tmp_path / 'empty-app',
+    )
     try:
         tools = manager.list_tools()
         result = tools[0].client.call_tool('echo', {'text': 'hello'})
@@ -104,10 +115,17 @@ def test_mcp_manager_lists_and_calls_stdio_tool(tmp_path: Path) -> None:
     assert result['content'][0]['text'] == 'echo:hello'
 
 
-def test_default_registry_exposes_mcp_tools(tmp_path: Path) -> None:
+def test_default_registry_exposes_mcp_tools(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     server = tmp_path / 'server.py'
     server.write_text(SERVER_SCRIPT, encoding='utf-8')
     write_config(tmp_path, server)
+    monkeypatch.setattr(
+        'forge.mcp.client.forge_app_root',
+        lambda *, app_root=None: tmp_path / 'empty-app',
+    )
 
     registry = create_default_registry(tmp_path)
     result = asyncio.run(
@@ -119,6 +137,43 @@ def test_default_registry_exposes_mcp_tools(tmp_path: Path) -> None:
     assert result.content == 'echo:hello'
     assert result.metadata['mcp_server'] == 'demo'
     assert result.metadata['mcp_tool'] == 'echo'
+
+
+def test_fetch_url_mcp_tool_is_read_only(tmp_path: Path) -> None:
+    remote = MCPRemoteTool(
+        server_name='web',
+        name='fetch_url',
+        description='Fetch one public http(s) URL and return text.',
+        input_schema={'type': 'object'},
+        client=DummyMCPClient(),  # type: ignore[arg-type]
+    )
+    tool = MCPTool(tmp_path, remote)
+
+    assert infer_mcp_tool_effect(remote) == 'read_only'
+    assert tool.effect == 'read_only'
+
+
+def test_read_only_tool_surface_includes_read_only_mcp_tool(
+    tmp_path: Path,
+) -> None:
+    remote = MCPRemoteTool(
+        server_name='web',
+        name='fetch_url',
+        description='Fetch one public http(s) URL and return text.',
+        input_schema={'type': 'object'},
+        client=DummyMCPClient(),  # type: ignore[arg-type]
+    )
+    conversation = Conversation(
+        client=object(),  # type: ignore[arg-type]
+        registry=ToolRegistry([MCPTool(tmp_path, remote)]),
+    )
+
+    names = {
+        str(definition.get('name'))
+        for definition in conversation._plan_mode_tools() or ()
+    }
+
+    assert 'mcp_web_fetch_url' in names
 
 
 def test_project_mcp_config_overrides_user_server_with_same_name(
@@ -157,7 +212,64 @@ def test_project_mcp_config_overrides_user_server_with_same_name(
         encoding='utf-8',
     )
 
-    manager = MCPClientManager.from_config_file(project, home=home)
+    manager = MCPClientManager.from_config_file(
+        project,
+        home=home,
+        app_root=tmp_path / 'empty-app',
+    )
+
+    assert len(manager.clients) == 1
+    assert manager.clients[0].config.cwd == project.resolve()
+    manager.close()
+
+
+def test_app_root_mcp_config_is_used_as_workspace_fallback(
+    tmp_path: Path,
+) -> None:
+    app_root = tmp_path / 'app'
+    home = tmp_path / 'home'
+    project = tmp_path / 'project'
+    app_root.mkdir()
+    home.mkdir()
+    project.mkdir()
+    server = tmp_path / 'server.py'
+    server.write_text(SERVER_SCRIPT, encoding='utf-8')
+    write_config(app_root, server)
+
+    manager = MCPClientManager.from_config_file(
+        project,
+        home=home,
+        app_root=app_root,
+    )
+    try:
+        tools = manager.list_tools()
+    finally:
+        manager.close()
+
+    assert len(tools) == 1
+    assert tools[0].server_name == 'demo'
+    assert manager.clients[0].config.cwd == app_root.resolve()
+
+
+def test_project_mcp_config_overrides_app_root_fallback(
+    tmp_path: Path,
+) -> None:
+    app_root = tmp_path / 'app'
+    home = tmp_path / 'home'
+    project = tmp_path / 'project'
+    app_root.mkdir()
+    home.mkdir()
+    project.mkdir()
+    server = tmp_path / 'server.py'
+    server.write_text(SERVER_SCRIPT, encoding='utf-8')
+    write_config(app_root, server)
+    write_config(project, server)
+
+    manager = MCPClientManager.from_config_file(
+        project,
+        home=home,
+        app_root=app_root,
+    )
 
     assert len(manager.clients) == 1
     assert manager.clients[0].config.cwd == project.resolve()

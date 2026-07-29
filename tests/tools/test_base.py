@@ -13,7 +13,14 @@ def run(coroutine: object) -> ToolResult:
     return asyncio.run(coroutine)  # type: ignore[arg-type]
 
 
-def test_default_registry_exposes_all_tool_schemas(tmp_path: Path) -> None:
+def test_default_registry_exposes_all_tool_schemas(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        'forge.mcp.client.forge_app_root',
+        lambda *, app_root=None: tmp_path / 'empty-app',
+    )
     registry = create_default_registry(tmp_path)
 
     assert registry.names == (

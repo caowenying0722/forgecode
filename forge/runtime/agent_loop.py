@@ -17,10 +17,16 @@ from forge.context.manager import (
     ContextStats,
 )
 from forge.context.working import WorkingState
+from forge.config import forge_home
 from forge.hooks import TodoPlanningHook
 from forge.hooks.registry import HookRegistry
 from forge.hooks.state import HookContext
-from forge.mcp.client import MCPConfigurationError, parse_mcp_config
+from forge.mcp.client import (
+    MCPConfigurationError,
+    forge_app_root,
+    mcp_config_sources,
+    parse_mcp_config,
+)
 from forge.runtime.intent import TaskContract, infer_task_contract
 from forge.runtime.agent_state import AgentPhase, AgentRunState
 from forge.runtime.agent_messages import (
@@ -2315,11 +2321,19 @@ class Conversation:
     def _plan_mode_tools(self) -> list[dict[str, Any]] | None:
         if self.tools is None:
             return None
-        return [
-            definition
-            for definition in self.tools
-            if str(definition.get('name', '')) in PLAN_MODE_TOOLS
-        ]
+        selected: list[dict[str, Any]] = []
+        for definition in self.tools:
+            name = str(definition.get('name', ''))
+            if name in PLAN_MODE_TOOLS:
+                selected.append(definition)
+                continue
+            if (
+                name.startswith('mcp_')
+                and self.registry is not None
+                and self.registry.effect(name) == 'read_only'
+            ):
+                selected.append(definition)
+        return selected
 
     def _pending_required_change(
         self,
@@ -2629,36 +2643,56 @@ def required_change_block_reason() -> str:
         'This turn requires a real task-local workspace change, but no file '
         'differs from the workspace snapshot captured when the turn began.'
     )
+
+
 def render_mcp_status(root: Path, tool_names: tuple[str, ...]) -> str:
-    config_path = root / '.forge' / 'mcp.json'
-    if not config_path.is_file():
+    sources = mcp_config_sources(
+        root,
+        home=forge_home(),
+        app_root=forge_app_root(),
+    )
+    existing = [
+        (path, cwd) for path, cwd in sources if path.is_file()
+    ]
+    if not existing:
         return (
-            f'Config: {config_path.as_posix()}\n'
+            'Config sources:\n'
+            + ''.join(f'- {path.as_posix()}\n' for path, _ in sources)
+            +
             'Status: no MCP config file found.\n'
             'Servers: 0\n'
             f'Tools: {len(tool_names)}'
         )
+    configs_by_name = {}
     try:
-        data = json.loads(config_path.read_text(encoding='utf-8'))
-        configs = parse_mcp_config(data, root)
+        for path, cwd in existing:
+            data = json.loads(path.read_text(encoding='utf-8'))
+            for config in parse_mcp_config(data, cwd):
+                configs_by_name[config.name] = config
     except (
         OSError,
         json.JSONDecodeError,
         MCPConfigurationError,
     ) as error:
         return (
-            f'Config: {config_path.as_posix()}\n'
+            'Config sources:\n'
+            + ''.join(f'- {path.as_posix()}\n' for path, _ in sources)
+            +
             'Status: invalid MCP config.\n'
             f'Error: {error}\n'
             f'Tools registered before error: {len(tool_names)}'
         )
 
     lines = [
-        f'Config: {config_path.as_posix()}',
+        'Config sources:',
+        *[
+            f'- {path.as_posix()}'
+            for path, _ in sources
+        ],
         'Status: configured',
-        f'Servers: {len(configs)}',
+        f'Servers: {len(configs_by_name)}',
     ]
-    for config in configs:
+    for config in configs_by_name.values():
         command = ' '.join((config.command, *config.args)).strip()
         lines.append(f'- {config.name}: stdio `{command}`')
     lines.append(f'Tools: {len(tool_names)}')

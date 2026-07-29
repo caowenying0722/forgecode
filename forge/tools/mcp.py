@@ -9,19 +9,20 @@ import re
 from typing import Any, Mapping
 
 from forge.mcp.client import MCPProtocolError, MCPRemoteTool
-from forge.tools.base import Tool, ToolInput, ToolResult
+from forge.tools.base import Tool, ToolEffect, ToolInput, ToolResult
 
 
 class MCPTool(Tool[ToolInput]):
     '''Expose one MCP remote tool through ForgeCode's registry.'''
 
     input_model = ToolInput
-    effect = 'process'
+    effect: ToolEffect = 'process'
 
     def __init__(self, root: Path, remote: MCPRemoteTool) -> None:
         super().__init__(root)
         self.remote = remote
         self.name = mcp_tool_name(remote.server_name, remote.name)
+        self.effect = infer_mcp_tool_effect(remote)
         self.description = (
             f'MCP tool `{remote.name}` from server `{remote.server_name}`. '
             + (remote.description or 'Use according to its input schema.')
@@ -71,6 +72,19 @@ def mcp_tool_name(server_name: str, tool_name: str) -> str:
     raw = f'mcp_{server_name}_{tool_name}'
     sanitized = re.sub(r'[^a-zA-Z0-9_]+', '_', raw)
     return sanitized.strip('_')[:64] or 'mcp_tool'
+
+
+def infer_mcp_tool_effect(remote: MCPRemoteTool) -> ToolEffect:
+    '''Classify obviously read-only MCP tools without trusting arbitrary names.'''
+    text = f'{remote.name} {remote.description or ""}'.casefold()
+    if re.search(r'\b(?:fetch|get|read|search|query|list|lookup)\b', text):
+        if not re.search(
+            r'\b(?:write|update|delete|remove|create|send|post|put|patch|'
+            r'mutate|execute|run|install|deploy)\b',
+            text,
+        ):
+            return 'read_only'
+    return 'process'
 
 
 def normalize_input_schema(schema: Mapping[str, Any]) -> dict[str, Any]:

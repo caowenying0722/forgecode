@@ -381,7 +381,12 @@ def test_conversation_forks_saved_session(tmp_path: Path) -> None:
 
 def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        'forge.mcp.client.forge_app_root',
+        lambda *, app_root=None: tmp_path / 'empty-app',
+    )
     client = FakeModelClient(streamed_response('P0/P1/P2 plan'))
     conversation = Conversation(
         client=client,

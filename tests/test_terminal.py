@@ -82,6 +82,14 @@ def test_terminal_repairs_windows_utf8_gbk_mojibake_prompt_text() -> None:
     assert repair_input_text(mojibake) == original
 
 
+def test_terminal_repairs_weather_question_mojibake_prompt_text() -> None:
+    original = '厦门今天天气，能联网就用 MCP 查一下，简短回答。'
+    mojibake = original.encode('utf-8').decode('gb18030', errors='replace')
+
+    assert mojibake != original
+    assert repair_input_text(mojibake).startswith('厦门今天天气，能联网')
+
+
 def test_terminal_keeps_normal_chinese_prompt_text() -> None:
     original = '根据 task.md 继续完善项目功能'
 

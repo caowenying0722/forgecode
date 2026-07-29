@@ -257,12 +257,15 @@ class MCPClientManager:
         root: Path,
         *,
         home: Path | None = None,
+        app_root: Path | None = None,
     ) -> MCPClientManager:
         resolved_home = forge_home(home=home)
+        resolved_app_root = forge_app_root(app_root=app_root)
         configs_by_name: dict[str, MCPServerConfig] = {}
-        for path, cwd in (
-            (resolved_home / 'mcp.json', resolved_home),
-            (root / '.forge' / 'mcp.json', root),
+        for path, cwd in mcp_config_sources(
+            root,
+            home=resolved_home,
+            app_root=resolved_app_root,
         ):
             if not path.is_file():
                 continue
@@ -283,6 +286,35 @@ class MCPClientManager:
     def close(self) -> None:
         for client in self.clients:
             client.close()
+
+
+def forge_app_root(*, app_root: Path | None = None) -> Path:
+    if app_root is not None:
+        return app_root.expanduser().resolve()
+    return Path(__file__).resolve().parents[2]
+
+
+def mcp_config_sources(
+    root: Path,
+    *,
+    home: Path,
+    app_root: Path,
+) -> tuple[tuple[Path, Path], ...]:
+    '''Return MCP config paths from broadest fallback to current workspace.'''
+    sources = [
+        (app_root / '.forge' / 'mcp.json', app_root),
+        (home / 'mcp.json', home),
+        (root / '.forge' / 'mcp.json', root),
+    ]
+    unique: list[tuple[Path, Path]] = []
+    seen: set[Path] = set()
+    for path, cwd in sources:
+        resolved_path = path.resolve(strict=False)
+        if resolved_path in seen:
+            continue
+        seen.add(resolved_path)
+        unique.append((path, cwd))
+    return tuple(unique)
 
 
 def parse_mcp_config(data: Any, root: Path) -> tuple[MCPServerConfig, ...]:
