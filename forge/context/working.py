@@ -275,7 +275,8 @@ class WorkingState:
             return ''
         lines = [
             '[Current Working Evidence]',
-            'Use this evidence instead of re-reading covered content.',
+            'Covered read_file ranges are replayable from cached source, even '
+            'after conversation compaction.',
         ]
         file_evidence = sorted(
             self.files.values(),
@@ -397,16 +398,13 @@ class WorkingState:
             return None
         if start_line < 1 or end_line < start_line:
             return None
-        if evidence.replay(start_line, end_line) is None:
+        content = evidence.replay(start_line, end_line)
+        if content is None:
             return None
         return ToolResult.ok(
-            f'Skipped covered read for {path} lines '
+            f'Replayed covered read for {path} lines '
             f'{start_line}-{end_line}.',
-            content=(
-                f'{path} lines {start_line}-{end_line} are already covered '
-                'by current working evidence. Reuse that evidence instead of '
-                'requesting the same or an overlapping range again.'
-            ),
+            content=content,
             metadata={
                 'path': path,
                 'start_line': start_line,

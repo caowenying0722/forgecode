@@ -22,7 +22,7 @@ def read_call(
     )
 
 
-def test_exact_read_returns_short_reference_but_new_ranges_may_execute() -> None:
+def test_exact_read_replays_content_and_new_ranges_may_execute() -> None:
     state = WorkingState()
     initial = read_call('first', end_line=260)
     result = ToolResult.ok(
@@ -43,9 +43,9 @@ def test_exact_read_returns_short_reference_but_new_ranges_may_execute() -> None
     replay = state.preflight(initial, 0, 'first')
 
     assert replay is not None and replay.success is True
-    assert replay.summary.startswith('Skipped covered read')
-    assert 'already covered' in replay.content
-    assert 'line 1\n' not in replay.content
+    assert replay.summary.startswith('Replayed covered read')
+    assert '     1 | line 1' in replay.content
+    assert '   251 | line 251' in replay.content
     assert replay.metadata['cache_hit'] is True
     subset = state.preflight(read_call('subset', end_line=120), 0, 'subset')
     extended = state.preflight(
@@ -55,13 +55,15 @@ def test_exact_read_returns_short_reference_but_new_ranges_may_execute() -> None
     )
     assert subset is not None and subset.metadata['evidence_replayed'] is True
     assert subset.summary.endswith('lines 1-120.')
-    assert 'already covered' in subset.content
+    assert '     1 | line 1' in subset.content
+    assert '   120 | line 120' in subset.content
+    assert '   121 | line 121' not in subset.content
     assert extended is not None
     assert extended.metadata['end_line'] == 251
     assert state.preflight(read_call('new-revision', end_line=260), 1, 'new') is None
 
 
-def test_adjacent_and_overlapping_segments_return_one_short_reference() -> None:
+def test_adjacent_and_overlapping_segments_replay_requested_content() -> None:
     for second_start in (40, 41):
         state = WorkingState()
         for call_id, start_line, end_line in (
@@ -96,11 +98,36 @@ def test_adjacent_and_overlapping_segments_return_one_short_reference() -> None:
 
         assert replay is not None
         assert replay.metadata['evidence_replayed'] is True
-        assert replay.content == (
-            'play/js/player.js lines 1-140 are already covered by current '
-            'working evidence. Reuse that evidence instead of requesting '
-            'the same or an overlapping range again.'
-        )
+        assert '     1 | line 1' in replay.content
+        assert '   140 | line 140' in replay.content
+        assert '   141 | line 141' not in replay.content
+
+
+def test_read_replay_keeps_source_available_after_compaction_reference() -> None:
+    state = WorkingState()
+    call = read_call('first', end_line=3)
+    state.observe(
+        call,
+        ToolResult.ok(
+            'Read file.',
+            content='     1 | alpha\n     2 | beta\n     3 | gamma',
+            metadata={
+                'path': 'play/js/player.js',
+                'start_line': 1,
+                'end_line': 3,
+                'total_lines': 3,
+            },
+        ),
+        0,
+        'first',
+    )
+
+    assert 'replayable from cached source' in state.system_suffix()
+    replay = state.preflight(read_call('after-compaction', end_line=3), 0)
+
+    assert replay is not None
+    assert replay.metadata['evidence_replayed'] is True
+    assert replay.content == '     1 | alpha\n     2 | beta\n     3 | gamma'
 
 
 def test_working_evidence_is_small_and_answer_check_uses_paths() -> None:

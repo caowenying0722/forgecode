@@ -115,11 +115,25 @@ Validation:
 
 ## Milestone 5 - Context Replay After Compaction
 
-Status: pending.
+Status: complete.
 
-Goal:
+Completed changes:
 - Ensure source content that was read before context compaction can be replayed
   or reacquired, rather than reduced to unrecoverable short references.
+- Changed `WorkingState` read preflight from a short "already covered" marker
+  to an actual cached source replay for covered `read_file` ranges.
+- Preserved cache metadata so replayed reads remain visible as cache hits and
+  do not execute redundant filesystem reads.
+- Updated working-evidence system context to state that covered read ranges are
+  replayable after conversation compaction.
+- Added regression coverage for exact, subset, overlapping, and
+  compaction-reference read replay.
+
+Validation:
+- `uv lock --check`
+- `uv run python -m compileall -q forge tests`
+- `uv run pytest -q`
+- `git diff --check`
 
 ## Milestone 6 - Loop State Consolidation
 
