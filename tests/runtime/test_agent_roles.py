@@ -47,7 +47,7 @@ from forge.hooks.builtin import should_require_todo_plan
 
 
 class FakePermission:
-    mode = 'auto'
+    mode = 'trusted'
 
 
 class FakeClient:
@@ -77,7 +77,7 @@ class TransactionExecutor:
             result=ToolResult.ok('Read sample.', content='sample'),
             effect='read_only',
             duration_seconds=0.01,
-            permission_mode='auto',
+            permission_mode='trusted',
         )
 
 
@@ -167,7 +167,7 @@ def test_tool_runner_wraps_execution_as_transaction() -> None:
     assert result.transaction is not None
     assert result.transaction.decision == 'executed'
     assert result.transaction.phase == 'normal'
-    assert result.transaction.permission_mode == 'auto'
+    assert result.transaction.permission_mode == 'trusted'
     assert result.result.metadata['tool_transaction'] is True
     assert result.result.metadata['transaction_revision'] == 3
 

@@ -318,7 +318,7 @@ def test_conversation_saves_and_resumes_session(tmp_path: Path) -> None:
         context_root=tmp_path,
     )
     conversation.mode_set('plan')
-    conversation.permission_set('plan')
+    conversation.permission_set('readonly')
     collect_turn(conversation, 'hello')
     session_id = conversation.save_session()
     resumed = Conversation(
@@ -332,7 +332,7 @@ def test_conversation_saves_and_resumes_session(tmp_path: Path) -> None:
     assert session_id in notice
     assert resumed.messages == conversation.messages
     assert resumed.interaction_mode == 'plan'
-    assert resumed.permission.mode == 'plan'
+    assert resumed.permission.mode == 'readonly'
 
 
 def test_conversation_persists_rollout_during_stream(tmp_path: Path) -> None:
@@ -443,7 +443,7 @@ def test_code_mode_requires_diff_even_for_plan_like_prompt(
     assert conversation._initial_change_required('给我一个计划') is True
 
 
-def test_supervised_permission_blocks_write_tool_in_agent_loop(
+def test_strict_permission_blocks_write_tool_in_agent_loop(
     tmp_path: Path,
 ) -> None:
     tool_call = ToolCall(
@@ -462,7 +462,7 @@ def test_supervised_permission_blocks_write_tool_in_agent_loop(
         streamed_response('Permission blocked the write.'),
     )
     conversation = Conversation(client=client, registry=registry)
-    conversation.permission_set('supervised')
+    conversation.permission_set('strict')
 
     events = collect_turn(conversation, 'write sample')
 

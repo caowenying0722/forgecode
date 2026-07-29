@@ -14,7 +14,6 @@ from forge.runtime.tool_executor import (
     ToolExecutionLogger,
     ToolExecutor,
 )
-from forge.permissions.policy import normalize_permission_mode
 from forge.hooks import TodoPlanningHook
 from forge.hooks.registry import HookRegistry
 from forge.hooks.state import HookContext
@@ -70,20 +69,14 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_legacy_permission_modes_normalize_to_new_modes() -> None:
-    assert normalize_permission_mode('readonly') == 'plan'
-    assert normalize_permission_mode('strict') == 'supervised'
-    assert normalize_permission_mode('trusted') == 'auto'
-
-
-def test_tool_executor_allows_auto_tools_and_logs_result(
+def test_tool_executor_allows_trusted_tools_and_logs_result(
     tmp_path: Path,
 ) -> None:
     registry = ToolRegistry([ReadOnlyTool(tmp_path)])
     executor = ToolExecutor(
         registry,
         root=tmp_path,
-        permission=PermissionMiddleware('auto'),
+        permission=PermissionMiddleware('trusted'),
         logger=ToolExecutionLogger(tmp_path),
     )
 
@@ -100,17 +93,17 @@ def test_tool_executor_allows_auto_tools_and_logs_result(
     )
     assert log['tool'] == 'read_sample'
     assert log['success'] is True
-    assert log['permission_mode'] == 'auto'
+    assert log['permission_mode'] == 'trusted'
 
 
-def test_supervised_permission_blocks_workspace_write_without_approval(
+def test_strict_permission_blocks_workspace_write_before_execution(
     tmp_path: Path,
 ) -> None:
     registry = ToolRegistry([WriteTool(tmp_path)])
     executor = ToolExecutor(
         registry,
         root=tmp_path,
-        permission=PermissionMiddleware('supervised'),
+        permission=PermissionMiddleware('strict'),
         logger=ToolExecutionLogger(tmp_path),
     )
 
@@ -124,17 +117,14 @@ def test_supervised_permission_blocks_workspace_write_without_approval(
     assert not (tmp_path / 'sample.txt').exists()
 
 
-def test_supervised_permission_runs_workspace_write_when_approved(
+def test_strict_permission_runs_workspace_write_when_approved(
     tmp_path: Path,
 ) -> None:
     registry = ToolRegistry([WriteTool(tmp_path)])
     executor = ToolExecutor(
         registry,
         root=tmp_path,
-        permission=PermissionMiddleware(
-            'supervised',
-            approver=lambda _request: True,
-        ),
+        permission=PermissionMiddleware('strict', approver=lambda *_: True),
         logger=ToolExecutionLogger(tmp_path),
     )
 
@@ -146,10 +136,10 @@ def test_supervised_permission_runs_workspace_write_when_approved(
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'changed'
 
 
-def test_supervised_session_approval_reuses_tool_scope(tmp_path: Path) -> None:
+def test_strict_session_approval_reuses_tool_scope(tmp_path: Path) -> None:
     approvals: list[str] = []
 
-    def approve(_request):
+    def approve(*_):
         approvals.append('asked')
         return 'allow_session'
 
@@ -157,7 +147,7 @@ def test_supervised_session_approval_reuses_tool_scope(tmp_path: Path) -> None:
     executor = ToolExecutor(
         registry,
         root=tmp_path,
-        permission=PermissionMiddleware('supervised', approver=approve),
+        permission=PermissionMiddleware('strict', approver=approve),
         logger=ToolExecutionLogger(tmp_path),
     )
 
@@ -182,7 +172,7 @@ def test_switching_permission_mode_clears_session_approvals(
         approvals.append('asked')
         return 'allow_session'
 
-    permission = PermissionMiddleware('supervised', approver=approve)
+    permission = PermissionMiddleware('strict', approver=approve)
     executor = ToolExecutor(
         ToolRegistry([WriteTool(tmp_path)]),
         root=tmp_path,
@@ -192,8 +182,8 @@ def test_switching_permission_mode_clears_session_approvals(
     call = ToolCall(0, 'toolu_write_1', 'write_sample', {})
 
     first = run(executor.execute(call))
-    permission.set_mode('auto')
-    permission.set_mode('supervised')
+    permission.set_mode('trusted')
+    permission.set_mode('strict')
     second = run(
         executor.execute(ToolCall(0, 'toolu_write_2', 'write_sample', {}))
     )
@@ -210,7 +200,7 @@ def test_user_denial_is_recoverable_when_prompt_was_available(
         ToolRegistry([WriteTool(tmp_path)]),
         root=tmp_path,
         permission=PermissionMiddleware(
-            'supervised', approver=lambda _request: 'deny'
+            'strict', approver=lambda *_: 'deny'
         ),
         logger=ToolExecutionLogger(tmp_path),
     )
@@ -264,8 +254,8 @@ def test_auto_mode_prompts_for_risky_process_command(tmp_path: Path) -> None:
         root=tmp_path,
         permission=PermissionMiddleware(
             'auto',
-            approver=lambda request: (
-                asked.append(request.preview.strip()) or 'allow_once'
+            approver=lambda call, _effect: (
+                asked.append(str(call.arguments['command'])) or 'allow_once'
             ),
         ),
         logger=ToolExecutionLogger(tmp_path),
@@ -293,8 +283,8 @@ def test_auto_mode_checks_verify_command_for_risk(tmp_path: Path) -> None:
         root=tmp_path,
         permission=PermissionMiddleware(
             'auto',
-            approver=lambda request: (
-                asked.append(request.preview.strip()) or 'deny'
+            approver=lambda call, _effect: (
+                asked.append(str(call.arguments['command'])) or 'deny'
             ),
         ),
         logger=ToolExecutionLogger(tmp_path),
@@ -323,7 +313,7 @@ def test_todo_planning_hook_blocks_complex_write_before_todo(
     executor = ToolExecutor(
         registry,
         root=tmp_path,
-        permission=PermissionMiddleware('auto'),
+        permission=PermissionMiddleware('trusted'),
         logger=ToolExecutionLogger(tmp_path),
         hooks=HookRegistry([planning, ToolExecutionLogger(tmp_path)]),
     )
@@ -355,7 +345,7 @@ def test_memory_write_goes_through_permission_and_logging(
     executor = ToolExecutor(
         registry,
         root=tmp_path,
-        permission=PermissionMiddleware('plan'),
+        permission=PermissionMiddleware('readonly'),
         logger=ToolExecutionLogger(tmp_path),
     )
 
@@ -381,7 +371,7 @@ def test_memory_write_goes_through_permission_and_logging(
     )
     assert log['event'] == 'permission_denied'
     assert log['tool'] == 'memory_write'
-    assert log['permission_mode'] == 'plan'
+    assert log['permission_mode'] == 'readonly'
 
 
 def test_mutation_targets_are_shared_for_patch_tracking_and_recovery() -> None:

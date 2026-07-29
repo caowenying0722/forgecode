@@ -148,7 +148,7 @@ def test_task_subagent_tool_calls_go_through_permission_hooks(
     subagent = TaskSubagent(
         tmp_path,
         client,
-        permission=PermissionHook('plan'),
+        permission=PermissionHook('readonly'),
     )
 
     result = asyncio.run(
@@ -237,7 +237,7 @@ def test_task_subagent_can_write_when_permission_allows(
     subagent = TaskSubagent(
         tmp_path,
         client,
-        permission=PermissionHook('auto'),
+        permission=PermissionHook('trusted'),
     )
 
     result = asyncio.run(
@@ -297,7 +297,7 @@ def test_subagent_tool_isolates_and_integrates_worktree_changes(
     tool = TaskSubagentTool(
         repository,
         client=client,
-        permission=PermissionHook('auto'),
+        permission=PermissionHook('trusted'),
     )
 
     result = asyncio.run(

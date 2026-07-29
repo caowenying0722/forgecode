@@ -310,7 +310,7 @@ class Conversation:
             if tracker is not None
             else Path.cwd()
         )
-        self.permission = PermissionMiddleware('auto')
+        self.permission = PermissionMiddleware('trusted')
         self.todo_list = TodoList()
         self.todo_planning = TodoPlanningHook()
         self.tool_logger = ToolExecutionLogger(resolved_context_root)

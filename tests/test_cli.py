@@ -77,7 +77,7 @@ class FakeConversation:
             stored_tool_result_characters=457_675,
         )
         self.rollout_enabled = False
-        self.permission_mode = 'auto'
+        self.permission_mode = 'trusted'
         self.permission_modes: list[str] = []
 
     def enable_rollout_persistence(self) -> None:
@@ -632,7 +632,7 @@ def test_permissions_picker_switches_mode_without_calling_model(
 
     assert result.exit_code == 0
     assert 'ForgeCode Permissions' in result.output
-    assert 'Auto' in result.output
+    assert 'Approve for me' in result.output
     assert 'Permission: auto.' in result.output
     assert conversation.permission_modes == ['auto']
     assert conversation.prompts == []

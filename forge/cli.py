@@ -287,7 +287,7 @@ def run_interactive_chat(
             current_mode = getattr(
                 getattr(resolved_session, 'permission', None),
                 'mode',
-                'auto',
+                'trusted',
             )
             selected = resolved_terminal.select_permission_mode(current_mode)
             if selected is None:

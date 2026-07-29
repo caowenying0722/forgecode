@@ -36,7 +36,7 @@ class SessionSnapshot:
     messages: list[dict[str, Any]]
     active_task: ActiveTask | None = None
     interaction_mode: str = 'auto'
-    permission_mode: str = 'auto'
+    permission_mode: str = 'trusted'
     git_head: str | None = None
     git_branch: str | None = None
     workspace_digest: str | None = None
@@ -88,7 +88,7 @@ class SessionSnapshot:
                 else None
             ),
             interaction_mode=str(data.get('interaction_mode', 'auto')),
-            permission_mode=str(data.get('permission_mode', 'auto')),
+            permission_mode=str(data.get('permission_mode', 'trusted')),
             git_head=optional_string(data.get('git_head')),
             git_branch=optional_string(data.get('git_branch')),
             workspace_digest=optional_string(data.get('workspace_digest')),
@@ -113,7 +113,7 @@ class SessionStore:
         session_id: str | None = None,
         active_task: ActiveTask | None = None,
         interaction_mode: str = 'auto',
-        permission_mode: str = 'auto',
+        permission_mode: str = 'trusted',
         update_workspace: bool = True,
         parent_session_id: str | None = None,
         forked_at_seq: int | None = None,
