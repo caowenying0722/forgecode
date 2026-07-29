@@ -658,6 +658,9 @@ class Conversation:
                 action_recovery=action_recovery,
                 action_recovery_calls=action_recovery_calls,
                 action_read_used=action_read_used,
+                task_scope_patterns=self.completion_checker.task_scope_patterns(
+                    evidence_paths=self.working_state.evidence_paths,
+                ),
             )
             request_spec = self.request_builder.build(
                 state=request_state,
@@ -1149,6 +1152,7 @@ class Conversation:
                             mutation_attempted or change_required
                         ),
                         reviewed_paths=completion_reviewed_paths,
+                        evidence_paths=self.working_state.evidence_paths,
                     )
                     if not decision.allowed:
                         last_completion_reasons = decision.reasons
@@ -1425,6 +1429,7 @@ class Conversation:
                         change_required=change_required,
                         verification=latest_verification,
                         reviewed_paths=completion_reviewed_paths,
+                        evidence_paths=self.working_state.evidence_paths,
                     )
                     if (
                         result.metadata.get('status') != 'blocked'
@@ -1921,6 +1926,7 @@ class Conversation:
                     verification=latest_verification,
                     mutation_failures=mutation_failures,
                     reviewed_paths=completion_reviewed_paths,
+                    evidence_paths=self.working_state.evidence_paths,
                 )
             )
             if completion_ready:
@@ -2055,6 +2061,7 @@ class Conversation:
                     mutation_attempted=mutation_attempted,
                     verification=latest_verification,
                     mutation_failures=mutation_failures,
+                    evidence_paths=self.working_state.evidence_paths,
                 ):
                     finalization_recovery = True
                     force_synthesis = True
@@ -2075,6 +2082,7 @@ class Conversation:
                         latest_verification,
                         mutation_attempted=mutation_attempted,
                         reviewed_paths=completion_reviewed_paths,
+                        evidence_paths=self.working_state.evidence_paths,
                     )
                     if not decision.allowed:
                         last_completion_reasons = decision.reasons

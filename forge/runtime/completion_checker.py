@@ -8,6 +8,10 @@ import hashlib
 from forge.context.working import WorkingState
 from forge.runtime.completion import CompletionDecision, CompletionGate
 from forge.runtime.state import ToolCall, VerificationEvidence
+from forge.runtime.task_scope import (
+    evaluate_change_relevance,
+    infer_task_scope,
+)
 from forge.runtime.workspace import WorkspaceTracker
 from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolResult
@@ -58,14 +62,21 @@ class CompletionChecker:
         *,
         mutation_attempted: bool,
         reviewed_paths: set[str] | None = None,
+        evidence_paths: tuple[str, ...] = (),
     ) -> CompletionDecision:
         if self.tracker is None or self.gate is None:
             return CompletionDecision(allowed=True)
-        return await self.gate.evaluate(
+        decision = await self.gate.evaluate(
             self.tracker,
             verification,
             mutation_attempted=mutation_attempted,
             reviewed_paths=reviewed_paths,
+        )
+        if not decision.allowed:
+            return decision
+        return self._with_relevance_reasons(
+            decision,
+            evidence_paths=evidence_paths,
         )
 
     async def finish_rejection_reasons(
@@ -77,6 +88,7 @@ class CompletionChecker:
         change_required: bool,
         verification: VerificationEvidence | None,
         reviewed_paths: set[str] | None = None,
+        evidence_paths: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
         metadata = result.metadata
         if metadata.get('status') == 'blocked':
@@ -122,6 +134,13 @@ class CompletionChecker:
                     reviewed_paths=reviewed_paths,
                 )
                 reasons.extend(decision.reasons)
+                if decision.allowed:
+                    reasons.extend(
+                        self._with_relevance_reasons(
+                            decision,
+                            evidence_paths=evidence_paths,
+                        ).reasons
+                    )
         elif mutation_attempted and not changed_paths:
             reasons.append(
                 'A workspace write was attempted but produced no final Diff; '
@@ -136,6 +155,7 @@ class CompletionChecker:
         verification: VerificationEvidence | None,
         mutation_failures: list[dict[str, object]],
         reviewed_paths: set[str] | None = None,
+        evidence_paths: tuple[str, ...] = (),
     ) -> bool:
         if (
             self.tracker is None
@@ -155,7 +175,55 @@ class CompletionChecker:
             mutation_attempted=mutation_attempted,
             reviewed_paths=reviewed_paths,
         )
-        return decision.allowed
+        if not decision.allowed:
+            return False
+        return self._with_relevance_reasons(
+            decision,
+            evidence_paths=evidence_paths,
+        ).allowed
+
+    def task_scope_patterns(
+        self,
+        *,
+        evidence_paths: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        task = self.task_manager.active
+        if task is None:
+            return ()
+        return infer_task_scope(
+            task.goal,
+            evidence_paths=evidence_paths,
+            scope_hints=task.scope_hints,
+        ).patterns
+
+    def _with_relevance_reasons(
+        self,
+        decision: CompletionDecision,
+        *,
+        evidence_paths: tuple[str, ...] = (),
+    ) -> CompletionDecision:
+        if self.tracker is None:
+            return decision
+        task = self.task_manager.active
+        if task is None:
+            return decision
+        scope = infer_task_scope(
+            task.goal,
+            evidence_paths=evidence_paths,
+            scope_hints=task.scope_hints,
+        )
+        relevance = evaluate_change_relevance(
+            self.tracker.changed_paths,
+            scope,
+        )
+        if relevance.relevant:
+            return decision
+        return CompletionDecision(
+            allowed=False,
+            reasons=tuple(
+                dict.fromkeys((*decision.reasons, *relevance.reasons))
+            ),
+        )
 
 
 def build_completion_feedback(

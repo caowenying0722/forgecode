@@ -32,6 +32,7 @@ class RequestState:
     action_recovery: bool = False
     action_recovery_calls: int = 0
     action_read_used: bool = False
+    task_scope_patterns: tuple[str, ...] = ()
 
     @property
     def tool_free_recovery(self) -> bool:
@@ -151,6 +152,7 @@ class RequestBuilder:
                 changed_paths,
                 mutation_attempted=state.mutation_attempted,
                 contract=state.task_contract,
+                task_scope_patterns=state.task_scope_patterns,
             )
         elif state.task_contract is not None:
             prompt += '\n\n' + render_task_contract_context(
@@ -172,10 +174,21 @@ def render_change_contract_context(
     *,
     mutation_attempted: bool,
     contract: TaskContract | None = None,
+    task_scope_patterns: tuple[str, ...] = (),
 ) -> str:
     paths = ', '.join(changed_paths) if changed_paths else 'none'
     attempted = 'yes' if mutation_attempted else 'no'
     intent = render_contract_summary(contract) if contract is not None else ''
+    scope = ''
+    if task_scope_patterns:
+        patterns = ', '.join(task_scope_patterns[:16])
+        suffix = ' ...' if len(task_scope_patterns) > 16 else ''
+        scope = (
+            '\nTask-relevant path patterns: '
+            f'{patterns}{suffix}\n'
+            'Completion checks reject placeholder or temporary-only Diffs '
+            'that do not match the task goal.'
+        )
     return (
         '[ForgeCode Turn Change Contract]\n'
         f'{intent}'
@@ -186,7 +199,7 @@ def render_change_contract_context(
         'Only a file revision after the turn baseline satisfies this '
         'contract. Git HEAD changes or untracked files that already existed '
         'when the turn began are background context, not work completed in '
-        'this turn.'
+        f'this turn.{scope}'
     )
 
 

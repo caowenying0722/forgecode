@@ -54,6 +54,19 @@ class RecoveryManager:
         include_finish: bool = False,
     ) -> list[dict[str, Any]] | None:
         latest = failures[-1] if failures else {}
+        latest_code = str(latest.get('code', ''))
+        if latest_code in {
+            'patch_rejected',
+            'patch_apply_failed',
+            'patch_context_not_found',
+            'patch_context_ambiguous',
+            'patch_contains_read_line_numbers',
+        }:
+            return self.scoped_mutation_tools(
+                failures,
+                read_available=read_available,
+                include_finish=include_finish,
+            )
         if latest.get('code') != 'parent_not_found':
             return self.action_tools(
                 read_available=read_available,
@@ -76,6 +89,49 @@ class RecoveryManager:
             allowed.update({'write_file', 'write_file_chunk', 'apply_patch'})
         if read_available:
             allowed.add('list_directory')
+        return [
+            definition
+            for definition in self.tools
+            if str(definition.get('name', '')) in allowed
+        ]
+
+    def scoped_mutation_tools(
+        self,
+        failures: list[dict[str, Any]],
+        *,
+        read_available: bool,
+        include_finish: bool,
+    ) -> list[dict[str, Any]] | None:
+        if self.tools is None:
+            return None
+        failed_tools = {
+            str(failure.get('tool', ''))
+            for failure in failures
+            if str(failure.get('tool', ''))
+        }
+        allowed = {
+            tool
+            for tool in failed_tools
+            if (
+                tool in {
+                    'apply_patch',
+                    'replace_text',
+                    'write_file',
+                    'write_file_chunk',
+                }
+                or (
+                    self.tool_runner is not None
+                    and self.tool_runner.effect(tool) == 'workspace_write'
+                    and tool not in self.excluded_write_tools
+                )
+            )
+        }
+        if not allowed:
+            allowed.add('apply_patch')
+        if read_available:
+            allowed.update({'read_file', 'grep'})
+        if include_finish:
+            allowed.add('finish_task')
         return [
             definition
             for definition in self.tools

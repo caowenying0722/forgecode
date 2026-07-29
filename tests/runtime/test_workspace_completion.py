@@ -13,8 +13,10 @@ from forge.runtime.completion import (
     TaskPolicy,
     matches_any,
 )
+from forge.runtime.completion_checker import CompletionChecker
 from forge.runtime.state import VerificationEvidence
 from forge.runtime.workspace import WorkspaceTracker, should_skip_workspace_path
+from forge.tasks.manager import TaskManager
 
 
 def initialize_git_repository(root: Path) -> None:
@@ -519,3 +521,86 @@ def test_completion_gate_rejects_forbidden_and_out_of_scope_paths(
     assert decision.allowed is False
     assert any('Forbidden paths' in item for item in decision.reasons)
     assert any('outside the allowed scope' in item for item in decision.reasons)
+
+
+def test_completion_checker_rejects_tmp_only_change_for_game_task(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    (tmp_path / 'tmp_check.txt').write_text('placeholder\n', encoding='utf-8')
+    run(tracker.refresh())
+    evidence = VerificationEvidence(
+        command='python -m pytest -q',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=1,
+    )
+    task_manager = TaskManager(tmp_path)
+    task_manager.begin_turn('补齐 Phaser 游戏骨架，创建场景、Player、Enemy 和碰撞系统')
+    checker = CompletionChecker(
+        tracker,
+        CompletionGate(tmp_path),
+        task_manager,
+    )
+
+    decision = run(
+        checker.evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=(),
+        )
+    )
+
+    assert decision.allowed is False
+    assert any('temporary' in item for item in decision.reasons)
+
+
+def test_completion_checker_accepts_evidence_related_change(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    scene = tmp_path / 'src' / 'game' / 'scenes' / 'MainScene.ts'
+    scene.parent.mkdir(parents=True)
+    scene.write_text('export class MainScene {}\n', encoding='utf-8')
+    subprocess.run(['git', 'add', '.'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'game baseline'],
+        cwd=tmp_path,
+        check=True,
+    )
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    scene.write_text(
+        'export class MainScene { create() {} }\n',
+        encoding='utf-8',
+    )
+    run(tracker.refresh())
+    evidence = VerificationEvidence(
+        command='npm run build --if-present',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=1,
+    )
+    task_manager = TaskManager(tmp_path)
+    task_manager.begin_turn('实现游戏主场景')
+    checker = CompletionChecker(
+        tracker,
+        CompletionGate(tmp_path),
+        task_manager,
+    )
+
+    decision = run(
+        checker.evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/game/scenes/MainScene.ts',),
+        )
+    )
+
+    assert decision.allowed is True

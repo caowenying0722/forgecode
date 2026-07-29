@@ -185,6 +185,22 @@ def mutation_recovery_instruction(
     failures: list[dict[str, Any]],
 ) -> str:
     latest = failures[-1] if failures else {}
+    if str(latest.get('code', '')) in {
+        'patch_rejected',
+        'patch_apply_failed',
+        'patch_context_not_found',
+        'patch_context_ambiguous',
+        'patch_contains_read_line_numbers',
+    }:
+        targets = ', '.join(str(item) for item in latest.get('targets', []))
+        target_text = targets or 'the failed patch target'
+        return (
+            'The latest failure is PATCH_FAILED for '
+            f'{target_text}. Do not restart broad discovery or switch to '
+            'placeholder writes. Use at most one targeted read_file or grep '
+            'for the failed target, then retry a smaller corrected patch or '
+            'exact replacement against the same task-relevant code.'
+        )
     if latest.get('code') == 'parent_not_found':
         parents = parent_directories_from_failures(failures)
         parent_text = ', '.join(parents) if parents else 'the missing parent'
