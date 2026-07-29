@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import select
 import sys
+from time import monotonic
 from typing import Any, Protocol
 
 from prompt_toolkit import PromptSession
@@ -641,6 +642,102 @@ def phase_label(phase: AgentPhase) -> str:
     }[phase]
 
 
+def tool_action_label(tool_name: str) -> str:
+    if tool_name in {
+        'read_file',
+        'list_directory',
+        'find_files',
+        'grep',
+        'git_status',
+        'git_diff',
+    }:
+        return '查看项目'
+    if tool_name in {
+        'write_file',
+        'write_file_chunk',
+        'replace_text',
+        'apply_patch',
+        'create_directory',
+    }:
+        return '修改文件'
+    if tool_name == 'verify':
+        return '运行验证'
+    if tool_name == 'run_command':
+        return '运行命令'
+    if tool_name in {'todo_write', 'task_plan', 'task_update'}:
+        return '更新计划'
+    if tool_name == 'finish_task':
+        return '整理结果'
+    return '执行工具'
+
+
+def phase_status(phase: AgentPhase, reason: str) -> str:
+    if reason.startswith('executing_tool:'):
+        tool_name = reason.split(':', 1)[1]
+        return f'正在{tool_action_label(tool_name)}'
+    if reason in {'preparing_model_request', 'preparing_recovery_request'}:
+        return '正在准备下一步'
+    if reason == 'model_requested_tool_calls':
+        return '正在准备工具'
+    if reason == 'turn_completed':
+        return '完成'
+    if phase is AgentPhase.RECOVERING:
+        lowered = reason.casefold()
+        if 'verification' in lowered or 'verify' in lowered:
+            return '正在修复验证失败'
+        if 'final' in lowered or 'completion' in lowered:
+            return '正在整理结果'
+        if 'token' in lowered or 'context' in lowered:
+            return '正在整理进度'
+        return '正在恢复'
+    return phase_label(phase)
+
+
+def tool_group_action_summary(group: _ToolTimelineBlock) -> str:
+    actions = [
+        tool_action_label(activity.tool_call.name)
+        for activity in group.activities
+    ]
+    unique_actions = list(dict.fromkeys(actions))
+    if len(unique_actions) == 1:
+        return unique_actions[0]
+    if len(unique_actions) <= 3:
+        return '、'.join(unique_actions)
+    return '混合操作'
+
+
+def tool_group_title(
+    group: _ToolTimelineBlock,
+    *,
+    pending: bool,
+    failed: bool,
+) -> str:
+    count = len(group.activities)
+    summary = tool_group_action_summary(group)
+    if pending:
+        if count == 1:
+            return f'正在{summary}'
+        return f'正在运行 {count} 个工具 · {summary}'
+    if failed:
+        return f'工具执行完成，存在失败 · {summary}'
+    if count == 1:
+        return f'已运行 {group.activities[0].tool_call.name} · {summary}'
+    return f'已运行 {count} 个工具 · {summary}'
+
+
+def tool_result_annotation(result: ToolResult) -> str:
+    decision = result.metadata.get('transaction_decision')
+    cache_hit = bool(result.metadata.get('cache_hit')) or decision == 'cache_hit'
+    if cache_hit:
+        return f' — 复用缓存: {result.summary}'
+    if decision == 'blocked':
+        return f' — 阶段拦截: {result.summary}'
+    phase = result.metadata.get('transaction_phase')
+    if isinstance(phase, str) and phase:
+        return f' — {phase}: {result.summary}'
+    return f' — {result.summary}'
+
+
 class StreamingResponseView:
     '''Update streamed Markdown and exact usage in place.'''
 
@@ -661,6 +758,8 @@ class StreamingResponseView:
         self.result: TurnResult | None = None
         self.phase: AgentPhase | None = None
         self.phase_reason = ''
+        self._last_refresh_at = 0.0
+        self._refresh_interval_seconds = 0.08
         self.live = Live(
             self._render(),
             console=console,
@@ -685,7 +784,7 @@ class StreamingResponseView:
         self.console.print()
 
     def append_text(self, text: str) -> None:
-        '''Append one provider text delta and refresh immediately.'''
+        '''Append one provider text delta and refresh on a bounded cadence.'''
         if (
             self.timeline
             and isinstance(self.timeline[-1], _TextTimelineBlock)
@@ -693,7 +792,7 @@ class StreamingResponseView:
             self.timeline[-1].text += text
         else:
             self.timeline.append(_TextTimelineBlock(text=text))
-        self.live.update(self._render(), refresh=True)
+        self._schedule_update()
 
     def update_usage(
         self,
@@ -706,7 +805,7 @@ class StreamingResponseView:
         self.usage = usage
         self.request_usage = request_usage
         self.model_calls = model_calls
-        self.live.update(self._render(), refresh=True)
+        self._schedule_update()
 
     def start_tool(self, tool_call: ToolCall) -> None:
         '''Show a model-requested tool while it is executing.'''
@@ -719,7 +818,7 @@ class StreamingResponseView:
             group = _ToolTimelineBlock()
             self.timeline.append(group)
         group.activities.append(_ToolActivity(tool_call=tool_call))
-        self.live.update(self._render(), refresh=True)
+        self._schedule_update(force=True)
 
     def complete_tool(
         self,
@@ -733,9 +832,9 @@ class StreamingResponseView:
             for activity in reversed(block.activities):
                 if activity.tool_call.id == tool_call.id:
                     activity.result = result
-                    self.live.update(self._render(), refresh=True)
+                    self._schedule_update(force=True)
                     return
-        self.live.update(self._render(), refresh=True)
+        self._schedule_update(force=True)
 
     def complete(self, result: TurnResult) -> None:
         '''Finalize the view with validated text and exact final usage.'''
@@ -759,7 +858,7 @@ class StreamingResponseView:
         self.model_calls = result.model_calls
         self.result = result
         self.completed = True
-        self.live.update(self._render(), refresh=True)
+        self._schedule_update(force=True)
 
     def block_completion(self, reasons: tuple[str, ...]) -> None:
         '''Show why a tentative final answer was rejected by the runtime.'''
@@ -769,7 +868,7 @@ class StreamingResponseView:
                 text=f'Completion check: continuing work.\n\n{details}'
             )
         )
-        self.live.update(self._render(), refresh=True)
+        self._schedule_update(force=True)
 
     def interrupt(self) -> None:
         '''Finalize the live frame after a user-requested interruption.'''
@@ -782,13 +881,13 @@ class StreamingResponseView:
                 style='yellow',
             )
         )
-        self.live.update(self._render(), refresh=True)
+        self._schedule_update(force=True)
 
     def update_phase(self, phase: AgentPhase, reason: str) -> None:
         '''Show the current orchestration phase without polluting the timeline.'''
         self.phase = phase
         self.phase_reason = reason
-        self.live.update(self._render(), refresh=True)
+        self._schedule_update()
 
     def request_permission(self, tool_call: ToolCall, effect: object) -> str:
         '''Pause live rendering and ask whether one sensitive tool may run.'''
@@ -834,7 +933,17 @@ class StreamingResponseView:
                 style='green',
             )
         )
-        self.live.update(self._render(), refresh=True)
+        self._schedule_update(force=True)
+
+    def _schedule_update(self, *, force: bool = False) -> None:
+        now = monotonic()
+        should_refresh = (
+            force
+            or now - self._last_refresh_at >= self._refresh_interval_seconds
+        )
+        if should_refresh:
+            self._last_refresh_at = now
+        self.live.update(self._render(), refresh=should_refresh)
 
     def _render(self) -> Group:
         content = self._render_timeline()
@@ -842,7 +951,7 @@ class StreamingResponseView:
         if not self.completed and self.phase is not None:
             renderables.append(
                 Text(
-                    f'{phase_label(self.phase)} · {self.phase_reason}',
+                    phase_status(self.phase, self.phase_reason),
                     style='dim bright_cyan',
                 )
             )
@@ -960,27 +1069,22 @@ class StreamingResponseView:
             activity.result is not None and not activity.result.success
             for activity in group.activities
         )
-        count = len(group.activities)
         if pending:
             rendered.append('● ', style='bold bright_cyan')
             rendered.append(
-                '正在运行工具' if count == 1 else f'正在运行 {count} 个工具',
+                tool_group_title(group, pending=pending, failed=failed),
                 style='bold',
             )
         elif failed:
             rendered.append('× ', style='bold red')
             rendered.append(
-                '工具执行完成，存在失败',
+                tool_group_title(group, pending=pending, failed=failed),
                 style='bold',
             )
         else:
             rendered.append('✓ ', style='bold green')
             rendered.append(
-                (
-                    f'已运行 {group.activities[0].tool_call.name}'
-                    if count == 1
-                    else f'已运行 {count} 个工具'
-                ),
+                tool_group_title(group, pending=pending, failed=failed),
                 style='dim',
             )
         rendered.append('\n')
@@ -1010,7 +1114,7 @@ class StreamingResponseView:
                 arguments = f'{arguments[:117]}...'
             rendered.append(f' {arguments}', style='dim')
             if result is not None:
-                rendered.append(f' — {result.summary}', style='dim')
+                rendered.append(tool_result_annotation(result), style='dim')
                 diagnostic = result.content.strip()
                 if not result.success and diagnostic:
                     if len(diagnostic) > 800:

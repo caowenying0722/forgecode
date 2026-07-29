@@ -17,6 +17,7 @@ from forge.runtime.state import (
     TurnResult,
     VerificationEvidence,
 )
+from forge.runtime.agent_state import AgentPhase
 from forge.terminal import (
     ForgePromptCompleter,
     SLASH_COMMAND_COMPLETER,
@@ -457,6 +458,47 @@ def test_terminal_renders_tool_arguments_and_result_status() -> None:
     assert '×' in rendered
     assert 'Command exited with code 1.' in rendered
     assert 'pytest: assertion failed at test_game.py:42' in rendered
+
+
+def test_terminal_renders_friendly_phase_status() -> None:
+    terminal, output = terminal_with_output()
+
+    with terminal.stream_response() as response:
+        response.update_phase(
+            AgentPhase.EXECUTING_TOOLS,
+            'executing_tool:read_file',
+        )
+
+    rendered = output.getvalue()
+    assert '正在查看项目' in rendered
+    assert 'executing_tool:read_file' not in rendered
+
+
+def test_terminal_renders_transaction_cache_annotation() -> None:
+    terminal, output = terminal_with_output()
+    tool_call = ToolCall(
+        index=0,
+        id='toolu_read',
+        name='read_file',
+        arguments={'path': 'README.md'},
+    )
+
+    with terminal.stream_response() as response:
+        response.start_tool(tool_call)
+        response.complete_tool(
+            tool_call,
+            ToolResult.ok(
+                'Cache hit: Read 20 lines.',
+                metadata={
+                    'transaction_decision': 'cache_hit',
+                    'cache_hit': True,
+                },
+            ),
+        )
+
+    rendered = output.getvalue()
+    assert '已运行 read_file · 查看项目' in rendered
+    assert '复用缓存: Cache hit: Read 20 lines.' in rendered
 
 
 def test_terminal_places_tool_group_between_model_text_blocks() -> None:
