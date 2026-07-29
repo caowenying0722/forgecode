@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 
+from forge.runtime.agent_loop import tool_call_signature
 from forge.runtime.agent_state import AgentPhase, AgentRunState
 from forge.runtime.model_runner import ModelRunner
 from forge.runtime.model_failure import (
@@ -24,6 +25,11 @@ from forge.runtime.state import (
     ToolCall,
 )
 from forge.runtime.tool_runner import ToolRunPolicy, ToolRunner
+from forge.tools.base import ToolResult
+
+
+class FakePermission:
+    mode = 'trusted'
 
 
 class FakeClient:
@@ -38,6 +44,23 @@ class NeverExecute:
 
     async def execute(self, _: ToolCall) -> None:
         raise AssertionError('guarded calls must not reach the executor')
+
+
+class TransactionExecutor:
+    permission = FakePermission()
+
+    def effect(self, _: str) -> None:
+        return None
+
+    async def execute(self, _: ToolCall):
+        from forge.runtime.tool_executor import ToolExecutionRecord
+
+        return ToolExecutionRecord(
+            result=ToolResult.ok('Read sample.', content='sample'),
+            effect='read_only',
+            duration_seconds=0.01,
+            permission_mode='trusted',
+        )
 
 
 class EffectByName:
@@ -104,6 +127,98 @@ def test_tool_runner_blocks_repeat_before_executor() -> None:
     assert not result.executed
     assert result.result.error is not None
     assert result.result.error.code == 'repeated_tool_call'
+
+
+def test_tool_runner_wraps_execution_as_transaction() -> None:
+    runner = ToolRunner(TransactionExecutor())  # type: ignore[arg-type]
+    call = ToolCall(index=0, id='tool-1', name='read_file', arguments={})
+
+    result = asyncio.run(
+        runner.transact(
+            call,
+            ToolRunPolicy(
+                tool_count=1,
+                available_tools=frozenset({'read_file'}),
+            ),
+            revision=3,
+            signature='3:read_file:abc123',
+        )
+    )
+
+    assert result.executed is True
+    assert result.transaction is not None
+    assert result.transaction.decision == 'executed'
+    assert result.transaction.phase == 'normal'
+    assert result.transaction.permission_mode == 'trusted'
+    assert result.result.metadata['tool_transaction'] is True
+    assert result.result.metadata['transaction_revision'] == 3
+
+
+def test_tool_runner_wraps_cache_hit_as_transaction() -> None:
+    runner = ToolRunner(NeverExecute())  # type: ignore[arg-type]
+    call = ToolCall(index=0, id='tool-1', name='read_file', arguments={})
+
+    result = asyncio.run(
+        runner.transact(
+            call,
+            ToolRunPolicy(
+                tool_count=1,
+                available_tools=frozenset({'read_file'}),
+                semantic_repeat=ToolResult.ok(
+                    'Cache hit.',
+                    metadata={'cache_hit': True},
+                ),
+            ),
+            revision=3,
+            signature='3:read_file:abc123',
+        )
+    )
+
+    assert result.executed is False
+    assert result.transaction is not None
+    assert result.transaction.decision == 'cache_hit'
+    assert result.result.metadata['transaction_decision'] == 'cache_hit'
+
+
+def test_tool_signature_normalizes_defaults_and_paths() -> None:
+    explicit = ToolCall(
+        index=0,
+        id='explicit',
+        name='list_directory',
+        arguments={'path': '.\\src\\', 'max_results': 1000},
+    )
+    implicit = ToolCall(
+        index=0,
+        id='implicit',
+        name='list_directory',
+        arguments={'path': './src'},
+    )
+
+    assert tool_call_signature(explicit, 4) == tool_call_signature(implicit, 4)
+
+
+def test_grep_signature_normalizes_file_types() -> None:
+    first = ToolCall(
+        index=0,
+        id='first',
+        name='grep',
+        arguments={'pattern': 'Player', 'file_types': ['TS', '.tsx']},
+    )
+    second = ToolCall(
+        index=0,
+        id='second',
+        name='grep',
+        arguments={
+            'pattern': 'Player',
+            'path': '.',
+            'regex': True,
+            'case_sensitive': True,
+            'max_results': 200,
+            'file_types': ['.tsx', '.ts'],
+        },
+    )
+
+    assert tool_call_signature(first, 4) == tool_call_signature(second, 4)
 
 
 def test_request_builder_only_allows_finish_during_final_recovery() -> None:

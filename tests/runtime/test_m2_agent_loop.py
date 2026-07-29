@@ -1710,7 +1710,6 @@ def test_failed_verification_recovery_allows_fix_before_verify(
     client = FakeModelClient(
         response_with_tool(edit),
         response_with_tool(failed_verify),
-        text_response('Build failed.'),
         response_with_tool(fix),
         response_with_tool(passed_verify),
         finish_response(
@@ -1739,13 +1738,17 @@ def test_failed_verification_recovery_allows_fix_before_verify(
     failed_recovery_tool_names = {
         definition['name'] for definition in failed_recovery_request['tools']
     }
-    assert 'verify' in failed_recovery_tool_names
+    assert 'verify' not in failed_recovery_tool_names
     assert 'run_command' in failed_recovery_tool_names
     assert 'write_file' in failed_recovery_tool_names
     assert 'list_directory' not in failed_recovery_tool_names
     assert '[ForgeCode Verification Recovery]' in (
         failed_recovery_request['system'] or ''
     )
+    ready_to_reverify_tools = {
+        definition['name'] for definition in client.calls[3]['tools']
+    }
+    assert ready_to_reverify_tools == {'verify'}
 
 
 def test_failed_verification_recovery_limits_reads_then_forces_repair(
@@ -1841,7 +1844,12 @@ def test_failed_verification_recovery_limits_reads_then_forces_repair(
     assert 'find_files' not in second_repair_tools
     assert 'read_file' not in second_repair_tools
     assert 'grep' not in second_repair_tools
-    assert {'write_file', 'run_command', 'verify'} <= second_repair_tools
+    assert {'write_file', 'run_command'} <= second_repair_tools
+    assert 'verify' not in second_repair_tools
+    ready_to_reverify_tools = {
+        definition['name'] for definition in client.calls[4]['tools']
+    }
+    assert ready_to_reverify_tools == {'verify'}
     rejected_results = [
         event.result
         for event in events
@@ -1851,7 +1859,7 @@ def test_failed_verification_recovery_limits_reads_then_forces_repair(
     assert rejected_results
     assert rejected_results[0].success is False
     assert rejected_results[0].error is not None
-    assert rejected_results[0].error.code == 'verification_read_limit_reached'
+    assert rejected_results[0].error.code == 'tool_not_available_in_phase'
 
 
 def test_repeated_verification_failure_stops_with_specific_report(
@@ -1880,6 +1888,7 @@ def test_repeated_verification_failure_stops_with_specific_report(
         client=client,
         registry=create_default_registry(tmp_path),
         max_completion_blocks=2,
+        max_tool_protocol_recoveries=1,
         stagnation_warning=1,
         stagnation_limit=2,
     )
@@ -1889,10 +1898,17 @@ def test_repeated_verification_failure_stops_with_specific_report(
     completed = events[-1]
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'stuck'
-    assert completed.result.text == (
-        'Verification Recovery stopped after the same verification failure '
-        'repeated.'
-    )
+    repeat_results = [
+        event.result
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.tool_call.id == 'second-failing-verify'
+    ]
+    assert repeat_results
+    assert repeat_results[0].success is False
+    assert repeat_results[0].error is not None
+    assert repeat_results[0].error.code == 'tool_not_available_in_phase'
+    assert 'malformed or schema-invalid tool requests' in completed.result.text
     assert completed.result.verification is not None
     assert completed.result.verification.status == 'failed'
 

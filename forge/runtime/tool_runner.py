@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from forge.runtime.state import ToolCall
 from forge.runtime.tool_executor import ToolExecutionRecord, ToolExecutor
@@ -16,6 +17,7 @@ class ToolRunPolicy:
     action_recovery: bool = False
     mutation_recovery: bool = False
     planning_recovery: bool = False
+    verification_recovery: bool = False
     action_read_exhausted: bool = False
     verification_read_exhausted: bool = False
     semantic_repeat: ToolResult | None = None
@@ -28,6 +30,30 @@ class ToolRunPolicy:
 class ToolRunResult:
     result: ToolResult
     executed: bool
+    transaction: ToolTransaction | None = None
+
+
+TransactionDecision = Literal[
+    'executed',
+    'cache_hit',
+    'blocked',
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTransaction:
+    '''One controlled tool transaction decision and its runtime evidence.'''
+
+    tool: str
+    signature: str
+    revision: int
+    phase: str
+    decision: TransactionDecision
+    executed: bool
+    result_code: str = ''
+    permission_mode: str = ''
+    cache_hit: bool = False
+    available_tools: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -118,6 +144,15 @@ class ToolRunner:
             and tool_call.name not in policy.available_tools
         ):
             return unavailable_in_phase(tool_call, policy, 'Edit Recovery')
+        if (
+            policy.verification_recovery
+            and tool_call.name not in policy.available_tools
+        ):
+            return unavailable_in_phase(
+                tool_call,
+                policy,
+                'Verification Recovery',
+            )
         if policy.action_read_exhausted:
             return synthetic_failure(
                 'action_read_limit_reached',
@@ -166,6 +201,52 @@ class ToolRunner:
         execution = await self.execute(tool_call)
         return ToolRunResult(execution.result, executed=True)
 
+    async def transact(
+        self,
+        tool_call: ToolCall,
+        policy: ToolRunPolicy,
+        *,
+        revision: int,
+        signature: str,
+    ) -> ToolRunResult:
+        '''Run one model tool request as a stateful controlled transaction.'''
+        guarded = await self.execute_checked(tool_call, policy)
+        transaction = ToolTransaction(
+            tool=tool_call.name,
+            signature=signature,
+            revision=revision,
+            phase=transaction_phase(policy),
+            decision=transaction_decision(guarded),
+            executed=guarded.executed,
+            result_code=result_code(guarded.result),
+            permission_mode=(
+                self.executor.permission.mode if guarded.executed else ''
+            ),
+            cache_hit=bool(guarded.result.metadata.get('cache_hit')),
+            available_tools=tuple(sorted(policy.available_tools)),
+        )
+        metadata = {
+            **guarded.result.metadata,
+            'tool_transaction': True,
+            'transaction_phase': transaction.phase,
+            'transaction_decision': transaction.decision,
+            'transaction_signature': transaction.signature,
+            'transaction_revision': transaction.revision,
+            'transaction_executed': transaction.executed,
+        }
+        result = ToolResult(
+            success=guarded.result.success,
+            summary=guarded.result.summary,
+            content=guarded.result.content,
+            error=guarded.result.error,
+            metadata=metadata,
+        )
+        return ToolRunResult(
+            result=result,
+            executed=guarded.executed,
+            transaction=transaction,
+        )
+
 
 def synthetic_failure(
     code: str,
@@ -190,6 +271,34 @@ def unavailable_in_phase(
         'tools included with this request.',
         details={'available_tools': sorted(policy.available_tools)},
     )
+
+
+def transaction_phase(policy: ToolRunPolicy) -> str:
+    if policy.planning_recovery:
+        return 'planning_recovery'
+    if policy.mutation_recovery:
+        return 'edit_recovery'
+    if policy.verification_recovery:
+        return 'verification_recovery'
+    if policy.action_recovery:
+        return 'action_recovery'
+    return 'normal'
+
+
+def transaction_decision(run: ToolRunResult) -> TransactionDecision:
+    if run.executed:
+        return 'executed'
+    if run.result.metadata.get('cache_hit'):
+        return 'cache_hit'
+    return 'blocked'
+
+
+def result_code(result: ToolResult) -> str:
+    if result.error is not None:
+        return result.error.code
+    if result.success:
+        return 'ok'
+    return 'unknown'
 
 
 def is_tool_protocol_failure(result: ToolResult) -> bool:

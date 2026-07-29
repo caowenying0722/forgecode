@@ -32,6 +32,24 @@ def test_package_json_validation_discovery_prefers_project_scripts(
     assert build.command == 'npm run build --if-present'
 
 
+def test_typescript_vite_build_uses_no_emit_typecheck(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / 'tsconfig.json').write_text(
+        '{"compilerOptions":{"strict":true}}\n',
+        encoding='utf-8',
+    )
+    (tmp_path / 'package.json').write_text(
+        '{"scripts":{"build":"tsc -p tsconfig.json && vite build"}}\n',
+        encoding='utf-8',
+    )
+
+    build = choose_validation_command(tmp_path, target='build')
+
+    assert build is not None
+    assert build.command == 'npx tsc --noEmit -p tsconfig.json && npx vite build'
+
+
 def test_validation_command_classifier_rejects_probe_and_dev_server(
     tmp_path: Path,
 ) -> None:

@@ -607,10 +607,16 @@ def test_conversation_executes_tool_and_continues_until_final_text(
     events = collect_turn(conversation, 'Read the README')
 
     assert ToolExecutionStarted(tool_call=tool_call) in events
-    assert ToolExecutionCompleted(
-        tool_call=tool_call,
-        result=tool.result,
-    ) in events
+    completed_tool = next(
+        event
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+    )
+    assert completed_tool.tool_call == tool_call
+    assert completed_tool.result.summary == tool.result.summary
+    assert completed_tool.result.content == tool.result.content
+    assert completed_tool.result.metadata['tool_transaction'] is True
+    assert completed_tool.result.metadata['transaction_decision'] == 'executed'
     assert events[-1] == TurnCompleted(
         result=TurnResult(
             text='Finished',
@@ -647,13 +653,12 @@ def test_conversation_executes_tool_and_continues_until_final_text(
     assert result_block['tool_use_id'] == 'toolu_read'
     assert result_block['is_error'] is False
     payload = json.loads(result_block['content'])
-    assert payload == {
-        'success': True,
-        'summary': 'Read file.',
-        'content': 'file contents',
-        'error': None,
-        'metadata': {},
-    }
+    assert payload['success'] is True
+    assert payload['summary'] == 'Read file.'
+    assert payload['content'] == 'file contents'
+    assert payload['error'] is None
+    assert payload['metadata']['tool_transaction'] is True
+    assert payload['metadata']['transaction_decision'] == 'executed'
     assert conversation.messages == [
         {'role': 'user', 'content': 'Read the README'},
         {

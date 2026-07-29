@@ -87,10 +87,13 @@ class RecoveryManager:
         *,
         fix_available: bool,
         read_available: bool,
+        verify_available: bool = True,
     ) -> list[dict[str, Any]] | None:
         if self.tools is None:
             return None
-        allowed = {'verify'}
+        allowed: set[str] = set()
+        if verify_available:
+            allowed.add('verify')
         if fix_available:
             allowed.add('run_command')
             if read_available:

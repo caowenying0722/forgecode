@@ -21,6 +21,7 @@ class RequestState:
     completion_ready_context: str = ''
     verification_recovery: bool = False
     verification_fix_recovery: bool = False
+    verification_fix_required: bool = False
     verification_read_used: bool = False
     planning_recovery: bool = False
     planning_recovery_calls: int = 0
@@ -108,6 +109,7 @@ class RequestBuilder:
             return self.recovery_manager.verification_tools(
                 fix_available=state.verification_fix_recovery,
                 read_available=not state.verification_read_used,
+                verify_available=not state.verification_fix_required,
             )
         if state.action_recovery:
             return self.recovery_manager.action_tools(
@@ -226,6 +228,18 @@ def recovery_system_suffix(
             read_used=state.action_read_used,
         )
     if state.verification_recovery:
+        verify_gate = (
+            'A previous verification failed and no later workspace revision '
+            'has been created yet, so verify is intentionally unavailable. '
+            'Use the latest verification output to make a relevant repair '
+            'first. After a real workspace change, the next recovery request '
+            'will expose verify for the new revision.'
+            if state.verification_fix_required
+            else (
+                'The current recovery request may expose verify because the '
+                'workspace is ready for formal validation.'
+            )
+        )
         return (
             '\n\n[ForgeCode Verification Recovery]\n'
             'The workspace already has task-local changes. The current '
@@ -236,9 +250,9 @@ def recovery_system_suffix(
             'type-check command for the current project revision. If repair '
             'tools are also exposed, the latest verification failed; use its '
             'output directly to install missing dependencies, edit broken '
-            'files, or adjust project scripts, then call verify again in this '
-            'recovery phase. Verification repair permits at most one targeted '
-            'read/search before editing or running the concrete repair command.'
+            'files, or adjust project scripts. Verification repair permits '
+            'at most one targeted read/search before editing or running the '
+            f'concrete repair command. {verify_gate}'
         )
     if state.force_synthesis:
         return (

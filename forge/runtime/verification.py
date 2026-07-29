@@ -161,16 +161,38 @@ def _package_json_commands(root: Path) -> list[ValidationCommand]:
     ):
         value = scripts.get(script)
         if isinstance(value, str) and value.strip():
+            command = f'npm run {script} --if-present'
+            if script == 'build':
+                command = _safe_typescript_vite_build_command(root, value) or command
             commands.append(
                 ValidationCommand(
                     id=f'npm:{script}',
-                    command=f'npm run {script} --if-present',
+                    command=command,
                     target=target,  # type: ignore[arg-type]
                     source='package.json',
                     strength=strength,
                 )
             )
     return commands
+
+
+def _safe_typescript_vite_build_command(root: Path, script: str) -> str:
+    normalized = script.strip()
+    if not (root / 'tsconfig.json').is_file():
+        return ''
+    if not re.search(r'(?i)\btsc\b', normalized):
+        return ''
+    if not re.search(r'(?i)\bvite\s+build\b', normalized):
+        return ''
+    project_match = re.search(
+        r'(?i)\btsc\b[^&|;]*\s(?:-p|--project)\s+([^\s&|;]+)',
+        normalized,
+    )
+    project = project_match.group(1) if project_match else 'tsconfig.json'
+    project = project.strip('"\'')
+    if Path(project).is_absolute() or '..' in Path(project).parts:
+        return ''
+    return f'npx tsc --noEmit -p {project} && npx vite build'
 
 
 def _has_project_validation_marker(root: Path) -> bool:

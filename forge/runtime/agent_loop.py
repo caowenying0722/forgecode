@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import cache
+import hashlib
 from itertools import count
 import json
 from pathlib import Path
@@ -539,6 +540,8 @@ class Conversation:
         stagnation_final_recovery = False
         verification_recovery = False
         verification_fix_recovery = False
+        verification_fix_required = False
+        verification_failed_revision: int | None = None
         verification_read_used = False
         verification_recovery_calls = 0
         last_verification_failure_signature = ''
@@ -569,6 +572,7 @@ class Conversation:
                 action_recovery
                 or bool(mutation_failures)
                 or self.agent_controller.planning_recovery
+                or verification_recovery
                 or finalization_recovery
                 or stagnation_final_recovery
                 or token_limit_recovery
@@ -639,6 +643,7 @@ class Conversation:
                 stagnation_final_recovery=stagnation_final_recovery,
                 verification_recovery=verification_recovery,
                 verification_fix_recovery=verification_fix_recovery,
+                verification_fix_required=verification_fix_required,
                 verification_read_used=verification_read_used,
                 planning_recovery=self.agent_controller.planning_recovery,
                 planning_recovery_calls=(
@@ -1210,6 +1215,17 @@ class Conversation:
                                 )
                                 for reason in decision.reasons
                             )
+                            verification_fix_required = (
+                                verification_fix_recovery
+                                and latest_verification is not None
+                                and not latest_verification.success
+                            )
+                            verification_failed_revision = (
+                                latest_verification.workspace_revision
+                                if verification_fix_required
+                                and latest_verification is not None
+                                else None
+                            )
                             force_synthesis = False
                             synthesis_retries = 0
                             stagnation_final_recovery = False
@@ -1352,7 +1368,7 @@ class Conversation:
                     revision,
                     signature,
                 )
-                run = await self.tool_runner.execute_checked(
+                run = await self.tool_runner.transact(
                     tool_call,
                     ToolRunPolicy(
                         tool_count=len(tool_calls),
@@ -1362,6 +1378,7 @@ class Conversation:
                         planning_recovery=(
                             self.agent_controller.planning_recovery
                         ),
+                        verification_recovery=verification_recovery,
                         action_read_exhausted=action_read_exhausted,
                         verification_read_exhausted=(
                             verification_read_exhausted
@@ -1371,6 +1388,8 @@ class Conversation:
                         previous_success=previous_success,
                         repeated_limit=self.repeated_tool_limit,
                     ),
+                    revision=revision,
+                    signature=signature,
                 )
                 result = run.result
                 self.agent_controller.observe_tool_result(
@@ -1557,7 +1576,10 @@ class Conversation:
                             )
                         )
                         return
-                    latest_verification = verification_from_result(result)
+                    verification_evidence = verification_from_result(result)
+                    if verification_evidence is None:
+                        continue
+                    latest_verification = verification_evidence
                     verification_recovery = (
                         latest_verification is not None
                         and not latest_verification.success
@@ -1565,6 +1587,8 @@ class Conversation:
                     verification_fix_recovery = verification_recovery
                     if not verification_recovery:
                         verification_fix_recovery = False
+                        verification_fix_required = False
+                        verification_failed_revision = None
                         verification_read_used = False
                         verification_recovery_calls = 0
                         last_verification_failure_signature = ''
@@ -1603,6 +1627,12 @@ class Conversation:
                             latest_verification.failure_signature
                             if latest_verification is not None
                             else ''
+                        )
+                        verification_fix_required = True
+                        verification_failed_revision = (
+                            latest_verification.workspace_revision
+                            if latest_verification is not None
+                            else None
                         )
                         verification_read_used = False
                     if latest_verification is not None:
@@ -1688,6 +1718,13 @@ class Conversation:
             if batch_reverted_to_baseline:
                 workspace_progressed = False
             if workspace_progressed:
+                verification_repair_progressed = (
+                    verification_fix_required
+                    and self.workspace_tracker is not None
+                    and verification_failed_revision is not None
+                    and self.workspace_tracker.revision
+                    > verification_failed_revision
+                )
                 mutation_failure_count = 0
                 mutation_failures.clear()
                 mutation_recovery_read_used = False
@@ -1699,10 +1736,13 @@ class Conversation:
                 force_synthesis = False
                 synthesis_retries = 0
                 stagnation_final_recovery = False
-                verification_recovery = False
+                verification_recovery = verification_repair_progressed
                 verification_fix_recovery = False
+                verification_fix_required = False
+                verification_failed_revision = None
                 verification_read_used = False
-                verification_recovery_calls = 0
+                if not verification_recovery:
+                    verification_recovery_calls = 0
                 completion_ready_revision = None
                 completion_decision_calls = 0
                 completion_ready_context = ''
@@ -2082,6 +2122,17 @@ class Conversation:
                                     )
                                     for reason in decision.reasons
                                 )
+                                verification_fix_required = (
+                                    verification_fix_recovery
+                                    and latest_verification is not None
+                                    and not latest_verification.success
+                                )
+                                verification_failed_revision = (
+                                    latest_verification.workspace_revision
+                                    if verification_fix_required
+                                    and latest_verification is not None
+                                    else None
+                                )
                                 calls_without_progress = 0
                                 force_synthesis = False
                                 synthesis_retries = 0
@@ -2454,13 +2505,73 @@ class Conversation:
 def tool_call_signature(tool_call: ToolCall, revision: int) -> str:
     '''Identify an exact tool request within one workspace revision.'''
     arguments = json.dumps(
-        tool_call.arguments,
+        normalize_tool_arguments(tool_call.name, tool_call.arguments),
         ensure_ascii=False,
         sort_keys=True,
         separators=(',', ':'),
         default=str,
     )
-    return f'{revision}:{tool_call.name}:{arguments}'
+    digest = hashlib.sha256(arguments.encode('utf-8')).hexdigest()[:24]
+    return f'{revision}:{tool_call.name}:{digest}'
+
+
+def normalize_tool_arguments(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(arguments)
+    defaults: dict[str, Any] = {}
+    if tool_name == 'read_file':
+        defaults = {'start_line': 1, 'end_line': None}
+    elif tool_name == 'list_directory':
+        defaults = {'path': '.', 'max_results': 1000}
+    elif tool_name == 'find_files':
+        defaults = {'path': '.', 'max_results': 200}
+    elif tool_name == 'grep':
+        defaults = {
+            'path': '.',
+            'file_types': [],
+            'case_sensitive': True,
+            'regex': True,
+            'max_results': 200,
+        }
+    elif tool_name == 'verify':
+        defaults = {
+            'target': 'auto',
+            'command_id': '',
+            'command': '',
+            'cwd': '.',
+            'timeout_seconds': 120.0,
+        }
+    elif tool_name == 'git_diff':
+        defaults = {'path': None, 'cached': False}
+
+    for key, value in defaults.items():
+        normalized.setdefault(key, value)
+    for key in ('path', 'cwd'):
+        if key in normalized and normalized[key] is not None:
+            normalized[key] = normalize_signature_path(str(normalized[key]))
+    if tool_name == 'grep' and isinstance(normalized.get('file_types'), list):
+        normalized['file_types'] = sorted(
+            normalize_file_type(str(item))
+            for item in normalized['file_types']
+        )
+    return normalized
+
+
+def normalize_signature_path(path: str) -> str:
+    rendered = path.strip().replace('\\', '/')
+    while rendered.startswith('./'):
+        rendered = rendered[2:]
+    rendered = rendered.rstrip('/')
+    return rendered or '.'
+
+
+def normalize_file_type(value: str) -> str:
+    lowered = value.strip().casefold()
+    if not lowered:
+        return lowered
+    return lowered if lowered.startswith('.') else f'.{lowered}'
 
 
 def required_change_block_reason() -> str:
