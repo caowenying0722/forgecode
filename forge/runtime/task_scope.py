@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 import re
+from typing import Literal
 
 from forge.runtime.completion import matches_any
 from forge.runtime.paths import normalize_workspace_path
@@ -106,6 +107,21 @@ class ChangeRelevance:
     reasons: tuple[str, ...] = ()
 
 
+ChangePathRole = Literal[
+    'required',
+    'supporting',
+    'generated',
+    'unrelated',
+    'forbidden',
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ClassifiedPath:
+    path: str
+    role: ChangePathRole
+
+
 def infer_task_scope(
     goal: str,
     *,
@@ -133,17 +149,36 @@ def evaluate_change_relevance(
     if not changed_paths:
         return ChangeRelevance(relevant=True)
 
-    disposable = tuple(
-        path
-        for path in changed_paths
-        if matches_any(path, scope.disposable_patterns)
+    classified = classify_changed_paths(changed_paths, scope)
+    blocked = tuple(
+        item for item in classified if item.role in {'forbidden', 'unrelated'}
     )
-    if len(disposable) == len(changed_paths):
+    generated = tuple(item for item in classified if item.role == 'generated')
+    if classified and len(blocked) == len(classified):
         return ChangeRelevance(
             relevant=False,
             reasons=(
-                'The only workspace changes are disposable or temporary '
-                'files: ' + ', '.join(disposable),
+                'The only workspace changes are unrelated, forbidden, '
+                'generated, or temporary files: '
+                + ', '.join(item.path for item in blocked),
+            ),
+        )
+    if blocked:
+        return ChangeRelevance(
+            relevant=False,
+            reasons=(
+                'The workspace changed, but these paths are outside the '
+                'task scope or are forbidden: '
+                + ', '.join(item.path for item in blocked),
+            ),
+        )
+    if generated:
+        return ChangeRelevance(
+            relevant=False,
+            reasons=(
+                'Generated JavaScript output under src/ cannot satisfy a '
+                'source change on its own: '
+                + ', '.join(item.path for item in generated),
             ),
         )
 
@@ -151,7 +186,7 @@ def evaluate_change_relevance(
         return ChangeRelevance(relevant=True)
 
     relevant_paths = tuple(
-        path for path in changed_paths if matches_any(path, scope.patterns)
+        item.path for item in classified if item.role in {'required', 'supporting'}
     )
     if relevant_paths:
         return ChangeRelevance(relevant=True)
@@ -166,6 +201,33 @@ def evaluate_change_relevance(
             + ', '.join(scope.patterns[:12]),
         ),
     )
+
+
+def classify_changed_paths(
+    changed_paths: tuple[str, ...],
+    scope: TaskScope,
+) -> tuple[ClassifiedPath, ...]:
+    normalized = tuple(
+        path.replace('\\', '/') for path in changed_paths if path
+    )
+    result: list[ClassifiedPath] = []
+    for path in normalized:
+        if matches_any(path, scope.disposable_patterns):
+            result.append(ClassifiedPath(path, 'unrelated'))
+        elif _looks_like_generated_source_output(path):
+            result.append(ClassifiedPath(path, 'generated'))
+        elif scope.constrained and _matches_scope(path, scope.patterns):
+            role: ChangePathRole = (
+                'supporting'
+                if _matches_scope(path, PROJECT_SUPPORT_PATTERNS)
+                else 'required'
+            )
+            result.append(ClassifiedPath(path, role))
+        elif not scope.constrained:
+            result.append(ClassifiedPath(path, 'required'))
+        else:
+            result.append(ClassifiedPath(path, 'unrelated'))
+    return tuple(result)
 
 
 def render_task_scope_context(scope: TaskScope) -> str:
@@ -226,3 +288,21 @@ def _expand_path_pattern(raw_value: str) -> list[str]:
     if suffix:
         return [normalized]
     return [normalized, f'{normalized}/**']
+
+
+def _looks_like_generated_source_output(path: str) -> bool:
+    item = PurePosixPath(path)
+    return (
+        item.suffix == '.js'
+        and len(item.parts) >= 2
+        and item.parts[0] == 'src'
+    )
+
+
+def _matches_scope(path: str, patterns: tuple[str, ...]) -> bool:
+    if matches_any(path, patterns):
+        return True
+    return any(
+        pattern.endswith('/**') and path == pattern[:-3].rstrip('/')
+        for pattern in patterns
+    )

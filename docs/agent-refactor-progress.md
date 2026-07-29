@@ -165,3 +165,81 @@ Remaining state debt:
 - `force_synthesis`, `finalization_recovery`, `stagnation_final_recovery`, and
   `token_limit_recovery` should become a synthesis/finalization mode instead
   of separate booleans.
+
+## Milestone 7 - Unified State Control and Goal-Driven Execution
+
+Status: complete for this vertical slice.
+
+Completed changes:
+- Added controller-owned `TurnRuntimeState` and `BudgetLedger` snapshots so
+  request construction can consume one state object instead of independent
+  recovery booleans.
+- Changed planning-required tasks to start in `PLANNING`, exposing read-only
+  planning tools and `todo_write` before any write tool can be attempted.
+- Changed `TodoPlanningHook` so it executes the controller's `todo_required`
+  decision instead of independently classifying task complexity.
+- Added a production `ModelSemanticTaskClassifier` path for low-confidence
+  Task Envelopes while preserving deterministic fast paths and fake-test
+  behavior.
+- Made `RequestBuilder` prefer `TurnRuntimeState` over legacy `RequestState`
+  booleans for planning, action recovery, verification recovery, finalization,
+  mutation recovery, and tool-free synthesis.
+- Reworked verification recovery around `RepairTarget` diagnostics, including
+  TS2305 missing exports, modules, direct dependencies, and target-sized read
+  budgets instead of a fixed one-read rule.
+- Prevented repeated verify before a relevant RepairTarget mutation and kept
+  unrelated changes from reopening verification.
+- Tightened progress and completion relevance so temporary files, generated
+  `src/**/*.js` outputs, and mixed unrelated changes do not count as source
+  progress or valid completion.
+- Bound budget accounting for model calls and tool calls to the controller
+  runtime snapshot.
+- Preserved read evidence replay after context compaction.
+
+Validation:
+- `uv lock --check`
+- `uv run python -m compileall -q forge tests`
+- `uv run pytest -q`
+- `git diff --check`
+
+Regression coverage added or updated:
+- Complex planning tasks do not get `write_file`/write tools on the first
+  request.
+- Single-file fixes are not forced into todo planning.
+- TS2305 diagnostics build RepairTargets and allow importer/exporter reads.
+- Repeated verify is blocked after failed verification until relevant repair.
+- Unrelated changes after failed verification do not enable verify.
+- New development tasks without a concrete path do not enter Action Recovery.
+- Mixed relevant and temporary-file changes are rejected by completion.
+- Tool/model budget exhaustion stops the trajectory.
+- Runtime snapshots override contradictory legacy `RequestState` booleans.
+
+Duplicate control logic removed or deprecated in this slice:
+- `TodoPlanningHook` no longer owns task complexity classification.
+- RequestBuilder no longer treats legacy recovery booleans as authoritative
+  when a `TurnRuntimeState` is present.
+- Verification read gating is now target-budget based; the old boolean
+  `verification_read_used` remains only for compatibility callers.
+- Tool execution now enforces the current state-selected tool set as a hard
+  boundary while preserving `unknown_tool` behavior for registry misses.
+
+Remaining old state sources:
+- `agent_loop.py` still carries local migration variables for
+  `verification_recovery`, `verification_fix_recovery`,
+  `verification_fix_required`, `finalization_recovery`,
+  `stagnation_final_recovery`, `token_limit_recovery`, `force_synthesis`,
+  mutation recovery counters, and action recovery counters.
+- `RequestState` still exposes legacy boolean fields for compatibility tests
+  and callers that have not yet been moved to `TurnRuntimeState`.
+- `ToolRunPolicy` still transports phase booleans at the execution boundary;
+  these should become a single control-state value plus read-budget decisions.
+
+Next agent_loop.py migration areas:
+- Replace local verification booleans with a revision-bound verification state
+  object owned by `TurnRuntimeState`.
+- Move finalization/stagnation/token-limit synthesis into a single controller
+  mode and remove the local booleans.
+- Move mutation recovery context, failures, and read counters into a dedicated
+  controller-owned edit recovery state.
+- Route progress acceptance criteria and plan-step completion directly from
+  Task Envelope state instead of passing booleans into `evaluate_progress`.

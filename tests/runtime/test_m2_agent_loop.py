@@ -11,6 +11,7 @@ from forge.runtime.completion import TaskPolicy
 from forge.runtime.state import (
     CompletionBlocked,
     ConversationEvent,
+    ModelCallStarted,
     ModelStreamEvent,
     ModelTextDelta,
     ModelToolCallCompleted,
@@ -71,6 +72,14 @@ class EmptyProcessInput(ToolInput):
     pass
 
 
+class VerifyInput(ToolInput):
+    command: str
+
+
+class CommandInput(ToolInput):
+    command: str
+
+
 class ProcessModifyTool(Tool[EmptyProcessInput]):
     name = 'process_modify'
     description = 'Modify sample.txt from a process-like test tool.'
@@ -107,6 +116,64 @@ class FailedTaskTool(Tool[EmptyProcessInput]):
             'subagent_no_report',
             'Task subagent reached its round limit without a report.',
         )
+
+
+class FailingTsVerifyTool(Tool[VerifyInput]):
+    name = 'verify'
+    description = 'Fail with a TypeScript missing export diagnostic.'
+    input_model = VerifyInput
+    effect = 'read_only'
+
+    async def execute(self, arguments: VerifyInput) -> ToolResult:
+        del arguments
+        return ToolResult.fail(
+            'verification_failed',
+            'Verification exited with code 2.',
+            content=(
+                "src/app.ts:1:10 - error TS2305: Module './lib' has no "
+                "exported member 'Foo'."
+            ),
+            metadata={
+                'verification': True,
+                'verification_status': 'failed',
+                'command': 'npx tsc --noEmit',
+                'cwd': '.',
+                'exit_code': 2,
+                'duration_seconds': 0.01,
+                'timed_out': False,
+                'workspace_revision': 1,
+                'failure_signature': 'ts2305:Foo:lib',
+            },
+        )
+
+
+class UnrelatedRunCommandTool(Tool[CommandInput]):
+    name = 'run_command'
+    description = 'Create an unrelated file from a process-like test tool.'
+    input_model = CommandInput
+    effect = 'process'
+
+    async def execute(self, arguments: CommandInput) -> ToolResult:
+        del arguments
+        (self.root / 'notes').mkdir(exist_ok=True)
+        (self.root / 'notes' / 'unrelated.txt').write_text(
+            'unrelated\n',
+            encoding='utf-8',
+        )
+        return ToolResult.ok('Created notes/unrelated.txt.')
+
+
+class MixedChangeRunCommandTool(Tool[CommandInput]):
+    name = 'run_command'
+    description = 'Create one relevant and one temporary file change.'
+    input_model = CommandInput
+    effect = 'process'
+
+    async def execute(self, arguments: CommandInput) -> ToolResult:
+        del arguments
+        (self.root / 'sample.txt').write_text('new\n', encoding='utf-8')
+        (self.root / 'tmp_check.txt').write_text('tmp\n', encoding='utf-8')
+        return ToolResult.ok('Changed sample.txt and tmp_check.txt.')
 
 
 def response_with_tool(call: ToolCall) -> list[ModelStreamEvent]:
@@ -211,7 +278,7 @@ def read_only_stagnation_calls(prefix: str) -> list[ToolCall]:
     ]
 
 
-def test_todo_required_enters_planning_recovery_before_write(
+def test_complex_task_starts_with_planning_tools_before_write(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -229,7 +296,6 @@ def test_todo_required_enters_planning_recovery_before_write(
         0, 'toolu_verify', 'verify', {'command': 'git diff --check'}
     )
     client = FakeModelClient(
-        response_with_tool(edit),
         todo_response(),
         response_with_tool(edit),
         response_with_tool(verify),
@@ -250,11 +316,13 @@ def test_todo_required_enters_planning_recovery_before_write(
     )
 
     completed = events[-1]
-    second_tools = {
-        str(tool.get('name')) for tool in client.calls[1]['tools'] or []
+    first_tools = {
+        str(tool.get('name')) for tool in client.calls[0]['tools'] or []
     }
-    assert second_tools == {'todo_write'}
-    assert '[ForgeCode Planning Recovery]' in client.calls[1]['system']
+    assert 'todo_write' in first_tools
+    assert 'replace_text' not in first_tools
+    assert 'write_file' not in first_tools
+    assert '[ForgeCode Planning Recovery]' not in client.calls[0]['system']
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
     assert any(
         isinstance(event, ToolExecutionCompleted)
@@ -265,6 +333,420 @@ def test_todo_required_enters_planning_recovery_before_write(
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'completed'
     assert completed.result.changed_paths == ('sample.txt',)
+
+
+def test_single_file_fix_is_not_forced_into_todo_planning(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'single-file-edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'single-file-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(verify),
+        finish_response(
+            'single-file-finish',
+            task_kind='change',
+            summary='Fixed sample.txt.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(conversation, '请修复 sample.txt')
+
+    first_tools = {
+        str(tool.get('name')) for tool in client.calls[0]['tools'] or []
+    }
+    assert 'replace_text' in first_tools
+    assert '[ForgeCode Planning Recovery]' not in (
+        client.calls[0]['system'] or ''
+    )
+    assert not any(
+        isinstance(event, ToolExecutionCompleted)
+        and event.result.error is not None
+        and event.result.error.code == 'todo_required'
+        for event in events
+    )
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+
+
+def test_ts2305_recovery_allows_importer_and_exporter_reads(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src' / 'app.ts').write_text(
+        "import { Foo } from './lib';\nconsole.log(Foo);\n",
+        encoding='utf-8',
+    )
+    (tmp_path / 'src' / 'lib.ts').write_text(
+        'export const Bar = 1;\n',
+        encoding='utf-8',
+    )
+    initialize_git_repository(tmp_path)
+    registry = create_default_registry(tmp_path)
+    registry.replace(FailingTsVerifyTool(tmp_path))
+    edit = ToolCall(
+        0,
+        'ts2305-edit',
+        'replace_text',
+        {
+            'path': 'src/app.ts',
+            'old_text': 'console.log(Foo);\n',
+            'new_text': 'console.log(Foo);\n// exercise verify\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'ts2305-verify',
+        'verify',
+        {'command': 'npx tsc --noEmit'},
+    )
+    read_importer = ToolCall(
+        0,
+        'ts2305-read-importer',
+        'read_file',
+        {'path': 'src/app.ts'},
+    )
+    read_exporter = ToolCall(
+        1,
+        'ts2305-read-exporter',
+        'read_file',
+        {'path': 'src/lib.ts'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(verify),
+        response_with_tools(read_importer, read_exporter),
+    )
+    conversation = Conversation(client=client, registry=registry)
+
+    async def collect_until_reads() -> list[ConversationEvent]:
+        events: list[ConversationEvent] = []
+        successful_reads = 0
+        async for event in conversation.stream('请修复 src/app.ts 的导出错误'):
+            events.append(event)
+            if (
+                isinstance(event, ToolExecutionCompleted)
+                and event.tool_call.name == 'read_file'
+                and event.result.success
+            ):
+                successful_reads += 1
+                if successful_reads == 2:
+                    break
+        return events
+
+    events = asyncio.run(collect_until_reads())
+
+    recovery_system = client.calls[2]['system'] or ''
+    recovery_tools = {
+        str(tool.get('name')) for tool in client.calls[2]['tools'] or []
+    }
+    assert 'read_file' in recovery_tools
+    assert '[ForgeCode Repair Target]' in recovery_system
+    assert 'src/app.ts' in recovery_system
+    assert 'Foo' in recovery_system
+    assert './lib' in recovery_system
+    assert [event.tool_call.name for event in events if isinstance(
+        event,
+        ToolExecutionCompleted,
+    )].count('read_file') == 2
+    assert all(
+        event.result.success
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.tool_call.name == 'read_file'
+    )
+
+
+def test_repeated_verify_after_failure_is_blocked_until_repair(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src' / 'app.ts').write_text(
+        "import { Foo } from './lib';\nconsole.log(Foo);\n",
+        encoding='utf-8',
+    )
+    (tmp_path / 'src' / 'lib.ts').write_text(
+        'export const Bar = 1;\n',
+        encoding='utf-8',
+    )
+    initialize_git_repository(tmp_path)
+    registry = create_default_registry(tmp_path)
+    registry.replace(FailingTsVerifyTool(tmp_path))
+    edit = ToolCall(
+        0,
+        'repeat-verify-edit',
+        'replace_text',
+        {
+            'path': 'src/app.ts',
+            'old_text': 'console.log(Foo);\n',
+            'new_text': 'console.log(Foo);\n// exercise verify\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'repeat-verify',
+        'verify',
+        {'command': 'npx tsc --noEmit'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(verify),
+        response_with_tool(verify),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=registry,
+        max_tool_protocol_recoveries=1,
+    )
+
+    async def collect_until_blocked_verify() -> list[ConversationEvent]:
+        events: list[ConversationEvent] = []
+        async for event in conversation.stream('请修复 src/app.ts 的导出错误'):
+            events.append(event)
+            if (
+                isinstance(event, ToolExecutionCompleted)
+                and event.tool_call.name == 'verify'
+                and event.result.error is not None
+                and event.result.error.code == 'tool_not_available_in_phase'
+            ):
+                break
+        return events
+
+    events = asyncio.run(collect_until_blocked_verify())
+
+    blocked_verify = [
+        event
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.tool_call.name == 'verify'
+        and event.result.error is not None
+        and event.result.error.code == 'tool_not_available_in_phase'
+    ]
+    assert blocked_verify
+    assert 'verify' not in {
+        str(tool.get('name')) for tool in client.calls[2]['tools'] or []
+    }
+
+
+def test_unrelated_change_after_failed_verify_does_not_enable_verify(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src' / 'app.ts').write_text(
+        "import { Foo } from './lib';\nconsole.log(Foo);\n",
+        encoding='utf-8',
+    )
+    (tmp_path / 'src' / 'lib.ts').write_text(
+        'export const Bar = 1;\n',
+        encoding='utf-8',
+    )
+    initialize_git_repository(tmp_path)
+    registry = create_default_registry(tmp_path)
+    registry.replace(FailingTsVerifyTool(tmp_path))
+    edit = ToolCall(
+        0,
+        'unrelated-reverify-edit',
+        'replace_text',
+        {
+            'path': 'src/app.ts',
+            'old_text': 'console.log(Foo);\n',
+            'new_text': 'console.log(Foo);\n// exercise verify\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'unrelated-reverify',
+        'verify',
+        {'command': 'npx tsc --noEmit'},
+    )
+    unrelated = ToolCall(
+        0,
+        'unrelated-command',
+        'run_command',
+        {'command': 'make unrelated change'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(verify),
+        response_with_tool(unrelated),
+        response_with_tool(verify),
+    )
+    conversation = Conversation(client=client, registry=registry)
+    registry.replace(UnrelatedRunCommandTool(tmp_path))
+
+    async def collect_until_blocked_verify() -> list[ConversationEvent]:
+        events: list[ConversationEvent] = []
+        async for event in conversation.stream('请修复 src/app.ts 的导出错误'):
+            events.append(event)
+            if (
+                isinstance(event, ToolExecutionCompleted)
+                and event.tool_call.name == 'verify'
+                and event.result.error is not None
+                and event.result.error.code == 'tool_not_available_in_phase'
+            ):
+                break
+        return events
+
+    events = asyncio.run(collect_until_blocked_verify())
+
+    assert (tmp_path / 'notes' / 'unrelated.txt').exists()
+    assert 'verify' not in {
+        str(tool.get('name')) for tool in client.calls[3]['tools'] or []
+    }
+    assert any(
+        isinstance(event, ToolExecutionCompleted)
+        and event.tool_call.name == 'verify'
+        and event.result.error is not None
+        and event.result.error.code == 'tool_not_available_in_phase'
+        for event in events
+    )
+
+
+def test_completion_rejects_relevant_change_with_tmp_file(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    registry = create_default_registry(tmp_path)
+    run = ToolCall(
+        0,
+        'mixed-change',
+        'run_command',
+        {'command': 'make mixed change'},
+    )
+    finish = finish_response(
+        'mixed-finish',
+        task_kind='change',
+        summary='Changed sample.txt.',
+    )
+    client = FakeModelClient(
+        response_with_tool(run),
+        finish,
+        finish,
+    )
+    conversation = Conversation(
+        client=client,
+        registry=registry,
+        max_completion_blocks=1,
+    )
+    registry.replace(MixedChangeRunCommandTool(tmp_path))
+
+    async def collect_until_tmp_block() -> list[ConversationEvent]:
+        events: list[ConversationEvent] = []
+        async for event in conversation.stream('Change sample.txt'):
+            events.append(event)
+            if (
+                isinstance(event, CompletionBlocked)
+                and any('tmp_check.txt' in reason for reason in event.reasons)
+            ):
+                break
+        return events
+
+    events = asyncio.run(collect_until_tmp_block())
+
+    assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
+    assert (tmp_path / 'tmp_check.txt').exists()
+    assert any(
+        isinstance(event, CompletionBlocked)
+        and any('tmp_check.txt' in reason for reason in event.reasons)
+        for event in events
+    )
+
+
+def test_turn_stops_when_tool_budget_is_exceeded(tmp_path: Path) -> None:
+    initialize_git_repository(tmp_path)
+    first_read = ToolCall(
+        0,
+        'budget-read-1',
+        'read_file',
+        {'path': 'sample.txt'},
+    )
+    second_read = ToolCall(
+        1,
+        'budget-read-2',
+        'read_file',
+        {'path': 'sample.txt'},
+    )
+    client = FakeModelClient(response_with_tools(first_read, second_read))
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        max_turn_tool_calls=1,
+    )
+
+    events = collect_turn(conversation, '分析 sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'stuck'
+    assert completed.result.completion_reasons == (
+        'tool call budget exceeded: 2/1',
+    )
+    executed = [
+        event
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+    ]
+    assert len(executed) == 1
+
+
+def test_new_development_task_does_not_enter_action_recovery(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    read = ToolCall(
+        0,
+        'new-dev-read',
+        'read_file',
+        {'path': 'sample.txt'},
+    )
+    client = FakeModelClient(
+        response_with_tool(read),
+        response_with_tool(read),
+        response_with_tool(read),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        pre_mutation_limit=1,
+    )
+
+    async def collect_three_calls() -> list[ConversationEvent]:
+        events: list[ConversationEvent] = []
+        calls_started = 0
+        async for event in conversation.stream('实现一个新的用户仪表盘功能'):
+            events.append(event)
+            if isinstance(event, ModelCallStarted):
+                calls_started += 1
+                if calls_started >= 3:
+                    break
+        return events
+
+    asyncio.run(collect_three_calls())
+
+    assert all(
+        '[ForgeCode Action Recovery]' not in (call['system'] or '')
+        for call in client.calls
+    )
 
 
 def test_agent_loop_rejects_early_answer_then_accepts_verify_evidence(
@@ -888,8 +1370,8 @@ def test_pending_write_failure_hides_finish_and_bounds_invalid_attempts(
         and event.tool_call.id == 'premature-finish-1'
     )
     assert finish_result.error is not None
-    assert finish_result.error.code == 'tool_not_available_in_phase'
-    assert 'finish_task' not in {
+    assert finish_result.error.code == 'finish_rejected'
+    assert 'finish_task' in {
         definition['name'] for definition in client.calls[2]['tools'] or ()
     }
     completed = events[-1]
@@ -897,7 +1379,7 @@ def test_pending_write_failure_hides_finish_and_bounds_invalid_attempts(
     assert completed.result.status == 'stuck'
     assert completed.result.model_calls == 5
     assert completed.result.verification is None
-    assert 'malformed or schema-invalid tool requests' in completed.result.text
+    assert 'completion declaration' in completed.result.text
     assert 'Finished despite the unresolved edit.' not in completed.result.text
 
 
@@ -1747,10 +2229,14 @@ def test_inspection_stagnation_does_not_enter_action_recovery(
     assert completed.result.model_calls == 10
     assert completed.result.changed_paths == ()
     assert client.responses == []
-    assert client.calls[-1]['tools'] is None
-    assert '[ForgeCode Stagnation Final Recovery]' in (
+    final_tools = {
+        str(tool.get('name')) for tool in client.calls[-1]['tools'] or []
+    }
+    assert '[ForgeCode Action Recovery]' not in (
         client.calls[-1]['system'] or ''
     )
+    assert 'write_file' not in final_tools
+    assert 'replace_text' not in final_tools
     assert all(
         '[ForgeCode Action Recovery]' not in (
             (call['system'] or '') + str(call['messages'])
@@ -1936,7 +2422,12 @@ def test_missing_verification_recovery_focuses_verify_after_package_change(
     verify_recovery_tool_names = {
         definition['name'] for definition in verify_recovery_request['tools']
     }
-    assert verify_recovery_tool_names == {'verify'}
+    assert verify_recovery_tool_names == {
+        'finish_task',
+        'git_diff',
+        'git_status',
+        'verify',
+    }
     assert '[ForgeCode Verification Recovery]' in (
         verify_recovery_request['system'] or ''
     )
@@ -2018,7 +2509,12 @@ def test_failed_verification_recovery_allows_fix_before_verify(
     ready_to_reverify_tools = {
         definition['name'] for definition in client.calls[3]['tools']
     }
-    assert ready_to_reverify_tools == {'verify'}
+    assert ready_to_reverify_tools == {
+        'finish_task',
+        'git_diff',
+        'git_status',
+        'verify',
+    }
 
 
 def test_failed_verification_recovery_limits_reads_then_forces_repair(
@@ -2054,11 +2550,11 @@ def test_failed_verification_recovery_limits_reads_then_forces_repair(
     )
     repair = ToolCall(
         0,
-        'create-tsconfig',
+        'repair-package-json',
         'write_file',
         {
-            'path': 'tsconfig.json',
-            'content': '{"compilerOptions":{"strict":true}}\n',
+            'path': 'package.json',
+            'content': '{"scripts":{"build":"echo ok","test":"echo ok"}}\n',
         },
     )
     passed_verify = ToolCall(
@@ -2097,10 +2593,7 @@ def test_failed_verification_recovery_limits_reads_then_forces_repair(
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'completed'
     assert completed.result.text == summary
-    assert completed.result.changed_paths == (
-        'package.json',
-        'tsconfig.json',
-    )
+    assert completed.result.changed_paths == ('package.json',)
     assert completed.result.verification is not None
     assert completed.result.verification.success is True
 
@@ -2119,7 +2612,12 @@ def test_failed_verification_recovery_limits_reads_then_forces_repair(
     ready_to_reverify_tools = {
         definition['name'] for definition in client.calls[4]['tools']
     }
-    assert ready_to_reverify_tools == {'verify'}
+    assert ready_to_reverify_tools == {
+        'finish_task',
+        'git_diff',
+        'git_status',
+        'verify',
+    }
     rejected_results = [
         event.result
         for event in events

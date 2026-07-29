@@ -166,9 +166,17 @@ class TodoPlanningHook:
         self.required = False
         self.planned = False
 
+    def configure(self, *, required: bool) -> None:
+        self.required = required
+        self.planned = False
+
     async def handle(self, context: HookContext) -> HookResult:
         if context.event == 'user_prompt_submit':
-            self.required = should_require_todo_plan(context.prompt or '')
+            metadata = context.metadata or {}
+            if 'todo_required' in metadata:
+                self.required = bool(metadata['todo_required'])
+            else:
+                self.required = False
             self.planned = False
             return HookResult(
                 metadata={'todo_required': self.required}

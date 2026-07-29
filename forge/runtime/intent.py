@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import re
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 
 TurnKind = Literal[
@@ -56,7 +57,11 @@ class ToolBudget:
 class SemanticTaskClassifier(Protocol):
     '''Optional semantic classifier used only after low-confidence routing.'''
 
-    def classify_task(self, prompt: str, baseline: 'TaskContract') -> 'TaskContract':
+    def classify_task(
+        self,
+        prompt: str,
+        baseline: 'TaskContract',
+    ) -> 'TaskContract':
         ...
 
 
@@ -75,6 +80,7 @@ class TaskContract:
     deliverables: tuple[str, ...] = ()
     acceptance_criteria: tuple[str, ...] = ()
     context_hints: tuple[str, ...] = ()
+    current_priority: str = ''
     allowed_paths: tuple[str, ...] = ()
     forbidden_paths: tuple[str, ...] = ()
     verification_policy: VerificationPolicy = field(
@@ -403,6 +409,68 @@ def refine_task_contract(
     return classifier.classify_task(prompt, contract)
 
 
+async def refine_task_contract_async(
+    prompt: str,
+    contract: TaskContract,
+    classifier: object | None = None,
+) -> TaskContract:
+    '''Async-aware variant used by the runtime production path.'''
+    if (
+        classifier is None
+        or contract.semantic_classification != 'recommended'
+        or contract.model_budget.max_semantic_classification_calls < 1
+    ):
+        return contract
+    classify = getattr(classifier, 'classify_task', None)
+    if classify is None:
+        return contract
+    try:
+        result = classify(prompt, contract)
+        if hasattr(result, '__await__'):
+            result = await result
+    except Exception:
+        return contract
+    return result if isinstance(result, TaskContract) else contract
+
+
+class ModelSemanticTaskClassifier:
+    '''Structured semantic classifier backed by the configured model client.'''
+
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    async def classify_task(
+        self,
+        prompt: str,
+        baseline: TaskContract,
+    ) -> TaskContract:
+        messages = [
+            {
+                'role': 'user',
+                'content': (
+                    'Classify this ForgeCode user request into a JSON task '
+                    'envelope. Return only JSON with keys: kind, goal, '
+                    'requires_change, requires_plan, deliverables, '
+                    'acceptance_criteria, context_hints, current_priority, '
+                    'allowed_paths, forbidden_paths, verification_policy, '
+                    'confidence. User request:\n'
+                    f'{prompt}'
+                ),
+            }
+        ]
+        system = (
+            'You are a conservative task router for a coding agent. '
+            'Do not infer workspace modification when the user asks only for '
+            'analysis, explanation, status, or says not to modify files.'
+        )
+        text_parts: list[str] = []
+        async for event in self.client.stream(messages, tools=None, system=system):
+            if event.__class__.__name__ == 'ModelTextDelta':
+                text_parts.append(str(getattr(event, 'text', '')))
+        payload = _parse_classifier_json(''.join(text_parts))
+        return _contract_from_classifier_payload(payload, baseline)
+
+
 def read_only_contract(
     kind: TurnKind,
     confidence: IntentConfidence,
@@ -465,6 +533,9 @@ def _task_contract(
             requires_plan=requires_plan,
         ),
         context_hints=paths,
+        current_priority='Create a plan before implementation.'
+        if requires_plan
+        else ('Modify the requested workspace target.' if requires_change else ''),
         allowed_paths=paths,
         forbidden_paths=(),
         verification_policy=verification,
@@ -555,3 +626,154 @@ def _acceptance_criteria(
     else:
         criteria.append('The response directly addresses the user request.')
     return tuple(criteria)
+
+
+def _parse_classifier_json(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError('empty semantic classification')
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find('{')
+        end = stripped.rfind('}')
+        if start < 0 or end <= start:
+            raise
+        payload = json.loads(stripped[start:end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError('semantic classification must be a JSON object')
+    return payload
+
+
+def _contract_from_classifier_payload(
+    payload: dict[str, Any],
+    baseline: TaskContract,
+) -> TaskContract:
+    confidence = _literal(
+        payload.get('confidence'),
+        {'low', 'medium', 'high'},
+        baseline.intent.confidence,
+    )
+    kind = _literal(
+        payload.get('kind'),
+        {
+            'answer',
+            'inspect',
+            'plan',
+            'implement',
+            'fix',
+            'refactor',
+            'verify',
+            'status',
+        },
+        baseline.intent.kind,
+    )
+    requires_change = bool(payload.get(
+        'requires_change',
+        baseline.requires_change,
+    ))
+    requires_plan = bool(payload.get('requires_plan', baseline.requires_plan))
+    completion_contract: CompletionContract = (
+        'change'
+        if requires_change
+        else 'inspection'
+        if kind == 'inspect'
+        else 'none'
+    )
+    initial_phase: InitialPhase = (
+        'planning'
+        if requires_plan
+        else 'implementing'
+        if requires_change
+        else 'exploring'
+        if kind == 'inspect'
+        else 'answering'
+    )
+    initial_surface: InitialToolSurface = (
+        'all'
+        if requires_change and not requires_plan
+        else 'read_only'
+        if kind in {'inspect', 'plan', 'status'} or requires_plan
+        else 'none'
+    )
+    verification_payload = payload.get('verification_policy')
+    verification = baseline.verification_policy
+    if isinstance(verification_payload, dict):
+        policy_kind = _literal(
+            verification_payload.get('kind'),
+            {'none', 'optional', 'required'},
+            verification.kind,
+        )
+        verification = VerificationPolicy(
+            kind=policy_kind,
+            required=bool(
+                verification_payload.get(
+                    'required',
+                    policy_kind == 'required',
+                )
+            ),
+            allow_manual_summary=bool(
+                verification_payload.get(
+                    'allow_manual_summary',
+                    verification.allow_manual_summary,
+                )
+            ),
+            preferred_commands=_string_tuple(
+                verification_payload.get('preferred_commands')
+            ),
+        )
+    return TaskContract(
+        intent=TurnIntent(kind, confidence, 'semantic task classification'),
+        kind=kind,
+        goal=str(payload.get('goal') or baseline.goal),
+        requires_change=requires_change,
+        requires_plan=requires_plan,
+        completion_contract=completion_contract,
+        initial_phase=initial_phase,
+        initial_tool_surface=initial_surface,
+        deliverables=_string_tuple(
+            payload.get('deliverables'),
+            fallback=baseline.deliverables,
+        ),
+        acceptance_criteria=_string_tuple(
+            payload.get('acceptance_criteria'),
+            fallback=baseline.acceptance_criteria,
+        ),
+        context_hints=_string_tuple(
+            payload.get('context_hints'),
+            fallback=baseline.context_hints,
+        ),
+        current_priority=str(
+            payload.get('current_priority') or baseline.current_priority
+        ),
+        allowed_paths=_string_tuple(
+            payload.get('allowed_paths'),
+            fallback=baseline.allowed_paths,
+        ),
+        forbidden_paths=_string_tuple(
+            payload.get('forbidden_paths'),
+            fallback=baseline.forbidden_paths,
+        ),
+        verification_policy=verification,
+        model_budget=ModelBudget(max_semantic_classification_calls=1),
+        tool_budget=ToolBudget(initial_surface=initial_surface),
+        confidence=confidence,
+        semantic_classification='not_needed',
+    )
+
+
+def _literal(value: object, allowed: set[str], fallback: str) -> Any:
+    return value if isinstance(value, str) and value in allowed else fallback
+
+
+def _string_tuple(
+    value: object,
+    *,
+    fallback: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,) if value else fallback
+    if not isinstance(value, list | tuple):
+        return fallback
+    items = tuple(str(item) for item in value if str(item).strip())
+    return items or fallback

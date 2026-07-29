@@ -72,8 +72,6 @@ class CompletionChecker:
             mutation_attempted=mutation_attempted,
             reviewed_paths=reviewed_paths,
         )
-        if not decision.allowed:
-            return decision
         return self._with_relevance_reasons(
             decision,
             evidence_paths=evidence_paths,
@@ -133,14 +131,11 @@ class CompletionChecker:
                     mutation_attempted=True,
                     reviewed_paths=reviewed_paths,
                 )
+                decision = self._with_relevance_reasons(
+                    decision,
+                    evidence_paths=evidence_paths,
+                )
                 reasons.extend(decision.reasons)
-                if decision.allowed:
-                    reasons.extend(
-                        self._with_relevance_reasons(
-                            decision,
-                            evidence_paths=evidence_paths,
-                        ).reasons
-                    )
         elif mutation_attempted and not changed_paths:
             reasons.append(
                 'A workspace write was attempted but produced no final Diff; '

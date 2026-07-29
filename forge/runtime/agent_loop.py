@@ -28,10 +28,11 @@ from forge.mcp.client import (
     parse_mcp_config,
 )
 from forge.runtime.intent import (
+    ModelSemanticTaskClassifier,
     SemanticTaskClassifier,
     TaskContract,
     infer_task_contract,
-    refine_task_contract,
+    refine_task_contract_async,
 )
 from forge.runtime.agent_state import AgentPhase, AgentRunState
 from forge.runtime.agent_messages import (
@@ -175,6 +176,7 @@ PLAN_MODE_TOOLS = frozenset(
         'task_graph_get',
         'task_graph_plan',
         'todo_write',
+        'finish_task',
     }
 )
 
@@ -230,6 +232,7 @@ class Conversation:
         pre_mutation_limit: int = 4,
         action_recovery_limit: int = 3,
         max_turn_input_tokens: int | None = None,
+        max_turn_tool_calls: int | None = None,
         intent_classifier: SemanticTaskClassifier | None = None,
     ) -> None:
         if tools is not None and registry is not None:
@@ -264,6 +267,8 @@ class Conversation:
             raise ValueError('action_recovery_limit must be positive')
         if max_turn_input_tokens is not None and max_turn_input_tokens < 1:
             raise ValueError('max_turn_input_tokens must be positive')
+        if max_turn_tool_calls is not None and max_turn_tool_calls < 1:
+            raise ValueError('max_turn_tool_calls must be positive')
         config_root = (
             context_root
             or getattr(
@@ -419,7 +424,16 @@ class Conversation:
         self.pre_mutation_limit = pre_mutation_limit
         self.action_recovery_limit = action_recovery_limit
         self.max_turn_input_tokens = max_turn_input_tokens
-        self.intent_classifier = intent_classifier
+        self.max_turn_tool_calls = max_turn_tool_calls
+        self.intent_classifier = (
+            intent_classifier
+            if intent_classifier is not None
+            else (
+                None
+                if getattr(self.client, 'provider', '') == 'fake'
+                else ModelSemanticTaskClassifier(self.client)
+            )
+        )
         self._last_repository_context = self.context.repository.system_suffix('')
         self._last_task_context = ''
 
@@ -517,19 +531,24 @@ class Conversation:
         if not prompt.strip():
             raise ValueError('prompt must not be empty')
 
+        self.task_manager.begin_turn(prompt)
+        self.working_state = WorkingState()
+        self.run_state = AgentRunState()
+        task_contract = await self._resolved_task_contract(prompt)
+        self.agent_controller.begin_turn(task_contract)
+        runtime = self.agent_controller.snapshot()
+        runtime.budget.max_model_calls = self.max_iterations
+        runtime.budget.max_tool_calls = self.max_turn_tool_calls
+        self.todo_planning.configure(required=task_contract.requires_plan)
         await self.hook_registry.run(
             HookContext(
                 event='user_prompt_submit',
                 root=self.task_manager.root,
                 prompt=prompt,
                 permission_mode=self.permission.mode,
+                metadata={'todo_required': task_contract.requires_plan},
             )
         )
-        self.task_manager.begin_turn(prompt)
-        self.working_state = WorkingState()
-        self.run_state = AgentRunState()
-        task_contract = self._initial_task_contract(prompt)
-        self.agent_controller.begin_turn(task_contract)
         self._last_task_context = self.task_manager.system_suffix()
         user_message = {'role': 'user', 'content': prompt}
         request_messages = (
@@ -564,7 +583,7 @@ class Conversation:
         verification_fix_recovery = False
         verification_fix_required = False
         verification_failed_revision: int | None = None
-        verification_read_used = False
+        verification_read_count = 0
         verification_recovery_calls = 0
         last_verification_failure_signature = ''
         token_limit_recovery = False
@@ -664,7 +683,30 @@ class Conversation:
                     )
                 )
 
+            runtime = self.agent_controller.snapshot()
+            runtime.latest_verification = latest_verification
+            runtime.repair_target = verification_repair_target
+            runtime.verification_failed_revision = (
+                verification_failed_revision
+            )
+            runtime.verification_read_count = verification_read_count
+            runtime.mutation_recovery_context = mutation_recovery_context
+            runtime.mutation_failures = tuple(mutation_failures)
+            runtime.mutation_read_used = mutation_recovery_read_used
+            runtime.completion_ready_context = completion_ready_context
+            runtime.action_recovery_calls = action_recovery_calls
+            runtime.action_read_used = action_read_used
+            runtime.synthesis_mode = (
+                'finalization'
+                if finalization_recovery
+                else 'stagnation_final'
+                if stagnation_final_recovery
+                else 'token_limit'
+                if token_limit_recovery
+                else ''
+            )
             request_state = RequestState(
+                runtime=runtime,
                 control_state=self.agent_controller.state,
                 force_synthesis=force_synthesis,
                 mutation_recovery_context=mutation_recovery_context,
@@ -675,7 +717,7 @@ class Conversation:
                 verification_recovery=verification_recovery,
                 verification_fix_recovery=verification_fix_recovery,
                 verification_fix_required=verification_fix_required,
-                verification_read_used=verification_read_used,
+                verification_read_count=verification_read_count,
                 latest_verification=latest_verification,
                 verification_repair_target=verification_repair_target,
                 planning_recovery=self.agent_controller.planning_recovery,
@@ -748,6 +790,30 @@ class Conversation:
                     transcript_path=compaction_report.transcript_path,
                     automatic=compaction_report.automatic,
                 )
+            runtime.budget.observe_model_call()
+            budget_reasons = runtime.budget.exceeded()
+            if budget_reasons:
+                self.task_manager.stuck(budget_reasons)
+                self.messages[:] = request_messages
+                self.context.capture_explicit_memory(prompt)
+                yield TurnCompleted(
+                    result=TurnResult(
+                        text='Stopped after exceeding turn budget.',
+                        usage=completed_usage,
+                        last_request_usage=request_usage,
+                        model_calls=iteration,
+                        tool_calls=tuple(all_tool_calls),
+                        status='stuck',
+                        changed_paths=(
+                            self.workspace_tracker.changed_paths
+                            if self.workspace_tracker is not None
+                            else ()
+                        ),
+                        verification=latest_verification,
+                        completion_reasons=budget_reasons,
+                    )
+                )
+                return
             yield ModelCallStarted(iteration=iteration)
             model_run = self.model_runner.run(
                 messages=self.context.prepare(request_messages),
@@ -1363,6 +1429,30 @@ class Conversation:
             for tool_position, tool_call in enumerate(tool_calls):
                 finish_rejection: tuple[str, ...] = ()
                 tool_effect = self.tool_runner.effect(tool_call.name)
+                runtime.budget.observe_tool_call(tool_effect, tool_call.name)
+                budget_reasons = runtime.budget.exceeded()
+                if budget_reasons:
+                    self.task_manager.stuck(budget_reasons)
+                    self.messages[:] = request_messages
+                    self.context.capture_explicit_memory(prompt)
+                    yield TurnCompleted(
+                        result=TurnResult(
+                            text='Stopped after exceeding turn budget.',
+                            usage=completed_usage,
+                            last_request_usage=request_usage,
+                            model_calls=iteration,
+                            tool_calls=tuple(all_tool_calls),
+                            status='stuck',
+                            changed_paths=(
+                                self.workspace_tracker.changed_paths
+                                if self.workspace_tracker is not None
+                                else ()
+                            ),
+                            verification=latest_verification,
+                            completion_reasons=budget_reasons,
+                        )
+                    )
+                    return
                 if tool_effect == 'workspace_write':
                     mutation_attempted = True
                     change_required = True
@@ -1394,11 +1484,20 @@ class Conversation:
                     and verification_fix_recovery
                     and tool_call.name in VERIFICATION_RECOVERY_READ_TOOLS
                 )
-                verification_read_exhausted = (
-                    verification_read_call and verification_read_used
+                verification_read_budget = (
+                    self.recovery_manager.verification_read_budget(
+                        verification_repair_target
+                    )
                 )
-                if verification_read_call and not verification_read_used:
-                    verification_read_used = True
+                verification_read_exhausted = (
+                    verification_read_call
+                    and verification_read_count >= verification_read_budget
+                )
+                if (
+                    verification_read_call
+                    and verification_read_count < verification_read_budget
+                ):
+                    verification_read_count += 1
                 yield ToolExecutionStarted(tool_call=tool_call)
                 phase_event = self._transition(
                     AgentPhase.EXECUTING_TOOLS,
@@ -1667,7 +1766,7 @@ class Conversation:
                         verification_fix_recovery = False
                         verification_fix_required = False
                         verification_failed_revision = None
-                        verification_read_used = False
+                        verification_read_count = 0
                         verification_repair_target = None
                         verification_recovery_calls = 0
                         last_verification_failure_signature = ''
@@ -1724,7 +1823,7 @@ class Conversation:
                             if latest_verification is not None
                             else None
                         )
-                        verification_read_used = False
+                        verification_read_count = 0
                     if latest_verification is not None:
                         batch.verification_progressed = True
                         yield VerificationCompleted(
@@ -1809,12 +1908,31 @@ class Conversation:
             if batch_reverted_to_baseline:
                 workspace_progressed = False
             if workspace_progressed:
+                had_verification_fix_required = verification_fix_required
+                verification_repair_relevant = True
+                if (
+                    verification_fix_required
+                    and self.workspace_tracker is not None
+                ):
+                    repair_patterns = (
+                        (
+                            *verification_repair_target.paths,
+                            *verification_repair_target.direct_dependencies,
+                        )
+                        if verification_repair_target is not None
+                        else self._static_task_scope_patterns(task_contract)
+                    )
+                    verification_repair_relevant = evaluate_change_relevance(
+                        self.workspace_tracker.changed_paths,
+                        TaskScope(patterns=repair_patterns),
+                    ).relevant
                 verification_repair_progressed = (
                     verification_fix_required
                     and self.workspace_tracker is not None
                     and verification_failed_revision is not None
                     and self.workspace_tracker.revision
                     > verification_failed_revision
+                    and verification_repair_relevant
                 )
                 mutation_failure_count = 0
                 mutation_failures.clear()
@@ -1826,15 +1944,21 @@ class Conversation:
                 force_synthesis = False
                 synthesis_retries = 0
                 stagnation_final_recovery = False
-                verification_recovery = verification_repair_progressed
-                verification_fix_recovery = False
-                verification_fix_required = False
-                verification_failed_revision = None
-                verification_read_used = False
-                verification_repair_target = None
+                if had_verification_fix_required and not verification_repair_progressed:
+                    verification_recovery = True
+                    verification_fix_recovery = True
+                    verification_fix_required = True
+                    self.agent_controller.enter_fix_required()
+                else:
+                    verification_recovery = verification_repair_progressed
+                    verification_fix_recovery = False
+                    verification_fix_required = False
+                    verification_failed_revision = None
+                    verification_read_count = 0
+                    verification_repair_target = None
+                    self.agent_controller.enter_ready_to_verify()
                 if not verification_recovery:
                     verification_recovery_calls = 0
-                self.agent_controller.enter_ready_to_verify()
                 completion_ready_revision = None
                 completion_decision_calls = 0
                 completion_ready_context = ''
@@ -1954,7 +2078,12 @@ class Conversation:
                     pre_mutation_calls = 0
                 else:
                     pre_mutation_calls += 1
-                    if pre_mutation_calls > self.pre_mutation_limit:
+                    if (
+                        pre_mutation_calls > self.pre_mutation_limit
+                        and _can_enter_pre_mutation_action_recovery(
+                            task_contract
+                        )
+                    ):
                         self.agent_controller.enter_targeted_analysis()
                         action_recovery_calls = 0
                         action_read_used = False
@@ -2151,6 +2280,9 @@ class Conversation:
                     and self._pending_required_change(
                         change_required,
                         mutation_attempted=mutation_attempted,
+                    )
+                    and _can_enter_pre_mutation_action_recovery(
+                        task_contract
                     )
                 ):
                     self.agent_controller.enter_targeted_analysis()
@@ -2386,13 +2518,20 @@ class Conversation:
         return self._initial_task_contract(prompt).requires_change
 
     def _initial_task_contract(self, prompt: str) -> TaskContract:
-        contract = infer_task_contract(
+        return infer_task_contract(
             prompt,
             interaction_mode=self.interaction_mode,
             workspace_available=self.workspace_tracker is not None,
             policy_requires_change=self.completion_checker.requires_changes,
         )
-        return refine_task_contract(prompt, contract, self.intent_classifier)
+
+    async def _resolved_task_contract(self, prompt: str) -> TaskContract:
+        contract = self._initial_task_contract(prompt)
+        return await refine_task_contract_async(
+            prompt,
+            contract,
+            self.intent_classifier,
+        )
 
     def _plan_mode_tools(self) -> list[dict[str, Any]] | None:
         if self.tools is None:
@@ -2706,6 +2845,18 @@ def early_mutation_relevance_failure(
             'reasons': list(relevance.reasons),
         },
         metadata={'irrelevant_mutation_target': True},
+    )
+
+
+def _can_enter_pre_mutation_action_recovery(
+    contract: TaskContract,
+) -> bool:
+    if contract.kind != 'implement':
+        return True
+    return bool(
+        contract.allowed_paths
+        or contract.context_hints
+        or '.' in contract.goal
     )
 
 

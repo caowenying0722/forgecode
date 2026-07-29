@@ -323,6 +323,7 @@ def test_todo_planning_hook_blocks_complex_write_before_todo(
                 event='user_prompt_submit',
                 root=tmp_path,
                 prompt='帮我完整实现权限 hook 系统',
+                metadata={'todo_required': True},
             )
         )
     )

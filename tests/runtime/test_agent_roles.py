@@ -10,7 +10,11 @@ from forge.runtime.agent_loop import (
     tool_call_signature,
 )
 from forge.runtime.intent import infer_task_contract
-from forge.runtime.agent_controller import AgentControlState, AgentController
+from forge.runtime.agent_controller import (
+    AgentControlState,
+    AgentController,
+    TurnRuntimeState,
+)
 from forge.runtime.agent_state import AgentPhase, AgentRunState
 from forge.runtime.model_runner import ModelRunner
 from forge.runtime.model_failure import (
@@ -447,6 +451,48 @@ def test_request_builder_control_state_overrides_conflicting_booleans() -> None:
     assert '[ForgeCode Planning Recovery]' not in spec.system_prompt
 
 
+def test_request_builder_runtime_snapshot_overrides_legacy_booleans() -> None:
+    tools = [
+        {'name': 'read_file'},
+        {'name': 'todo_write'},
+        {'name': 'write_file'},
+        {'name': 'finish_task'},
+    ]
+    recovery = RecoveryManager(
+        tools,
+        EffectByName({'write_file'}),
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    contract = infer_task_contract('请重构多个模块的架构并更新相关代码')
+    runtime = TurnRuntimeState(
+        control_state=AgentControlState.PLANNING,
+        contract=contract,
+    )
+
+    spec = RequestBuilder(recovery, action_recovery_limit=3).build(
+        state=RequestState(
+            runtime=runtime,
+            control_state=AgentControlState.FIX_REQUIRED,
+            finalization_recovery=True,
+            verification_recovery=True,
+            planning_recovery=True,
+            action_recovery=True,
+            task_contract=contract,
+        ),
+        interaction_mode='auto',
+        all_tools=tools,
+        plan_tools=[tools[0], tools[1]],
+        base_system_prompt='base',
+        repository_context='',
+        changed_paths=(),
+    )
+
+    assert spec.tool_names == frozenset({'read_file', 'todo_write'})
+    assert '[ForgeCode Finalization Recovery]' not in spec.system_prompt
+    assert '[ForgeCode Verification Recovery]' not in spec.system_prompt
+
+
 def test_request_builder_injects_runtime_task_model_for_change() -> None:
     tools = [{'name': 'read_file'}, {'name': 'write_file'}]
     recovery = RecoveryManager(
@@ -649,6 +695,40 @@ def test_recovery_manager_extracts_verification_repair_target() -> None:
     assert target.expected_action == (
         'repair the failing changed code or project configuration'
     )
+
+
+def test_recovery_manager_extracts_ts2305_repair_target() -> None:
+    recovery = RecoveryManager(
+        [{'name': 'read_file'}],
+        None,
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    result = ToolResult.fail(
+        'verification_failed',
+        'Verification exited with code 2.',
+        content=(
+            "src/app.ts:1:10 - error TS2305: Module './lib' has no "
+            "exported member 'Foo'."
+        ),
+        metadata={
+            'verification_status': 'failed',
+            'failure_signature': 'ts2305',
+        },
+    )
+
+    target = recovery.verification_repair_target_from_result(
+        result,
+        changed_paths=('src/app.ts',),
+    )
+
+    assert target.paths == ('src/app.ts',)
+    assert target.line_numbers == (1,)
+    assert target.symbols == ('Foo',)
+    assert target.missing_exports == ('Foo',)
+    assert target.modules == ('./lib',)
+    assert 'src/lib.ts' in target.direct_dependencies
+    assert recovery.verification_read_budget(target) > 1
 
 
 def test_recovery_manager_extracts_mutation_repair_target() -> None:

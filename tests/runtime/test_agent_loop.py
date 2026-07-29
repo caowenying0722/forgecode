@@ -410,10 +410,11 @@ def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(
         'task_graph_get',
         'task_graph_plan',
         'memory_list',
-        'memory_read',
-        'task',
-        'todo_write',
-    }
+            'memory_read',
+            'task',
+            'todo_write',
+            'finish_task',
+        }
 
 
 def test_subagent_delegate_tools_share_conversation_permission(
@@ -536,7 +537,6 @@ def test_todo_required_does_not_count_as_workspace_write_failure(
         {'command': 'git diff --check'},
     )
     client = FakeModelClient(
-        tool_response(tool_call),
         tool_response(todo_call),
         tool_response(tool_call),
         tool_response(verify_call),
@@ -558,20 +558,22 @@ def test_todo_required_does_not_count_as_workspace_write_failure(
         client=client,
         registry=create_default_registry(tmp_path),
         mutation_recovery_limit=1,
-        max_tool_protocol_recoveries=1,
     )
 
     events = collect_turn(conversation, '帮我先按最高优先级P0进行修复')
 
-    completed = [
-        event for event in events if isinstance(event, ToolExecutionCompleted)
-    ][0]
-    assert completed.result.success is False
-    assert completed.result.error is not None
-    assert completed.result.error.code == 'todo_required'
     assert {
-        str(tool.get('name')) for tool in client.calls[1]['tools'] or []
-    } == {'todo_write'}
+        str(tool.get('name')) for tool in client.calls[0]['tools'] or []
+    } >= {'todo_write'}
+    assert not any(
+        isinstance(event, ToolExecutionCompleted)
+        and event.result.error is not None
+        and event.result.error.code in {
+            'todo_required',
+            'no_workspace_change',
+        }
+        for event in events
+    )
     final = events[-1]
     assert isinstance(final, TurnCompleted)
     assert 'workspace-write attempt' not in final.result.text

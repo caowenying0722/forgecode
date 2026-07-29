@@ -130,6 +130,19 @@ class ToolRunner:
                 'Complete other actions first, then declare the outcome in a '
                 'separate response.',
             )
+        registry = getattr(self.executor, 'registry', None)
+        if (
+            registry is not None
+            and tool_call.name not in registry.names
+        ):
+            execution = await self.execute(tool_call)
+            return ToolRunResult(execution.result, executed=True)
+        if tool_call.name not in policy.available_tools:
+            return unavailable_in_phase(
+                tool_call,
+                policy,
+                'the current AgentController state',
+            )
         if (
             policy.planning_recovery
             and tool_call.name not in policy.available_tools
@@ -164,10 +177,11 @@ class ToolRunner:
         if policy.verification_read_exhausted:
             return synthetic_failure(
                 'verification_read_limit_reached',
-                'Verification Recovery permits only one targeted repository '
-                'read or search after a failed verify result. Use the latest '
-                'verification output and existing evidence to repair the '
-                'workspace, run the concrete repair command, or call verify.',
+                'Verification Recovery has used its targeted repository '
+                'read/search budget for the current repair target. Use the '
+                'latest verification output and existing evidence to repair '
+                'the workspace, run the concrete repair command, or call '
+                'verify after a relevant repair.',
             )
         if policy.semantic_repeat is not None:
             return ToolRunResult(policy.semantic_repeat, executed=False)

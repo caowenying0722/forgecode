@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from pathlib import PurePosixPath
 import re
 from typing import Any
 
@@ -29,6 +30,11 @@ SYMBOL_PATTERNS = (
     re.compile(r"Cannot find name '([^']+)'"),
     re.compile(r'undefined: ([A-Za-z_][A-Za-z0-9_]*)'),
     re.compile(r'NameError:\s+(?!name\b)([A-Za-z_][A-Za-z0-9_]*)'),
+    re.compile(r"TS2305: Module '[^']+' has no exported member '([^']+)'"),
+)
+MODULE_PATTERNS = (
+    re.compile(r"TS2305: Module '([^']+)' has no exported member"),
+    re.compile(r"Cannot find module '([^']+)'"),
 )
 
 
@@ -41,6 +47,9 @@ class RepairTarget:
     paths: tuple[str, ...] = ()
     line_numbers: tuple[int, ...] = ()
     symbols: tuple[str, ...] = ()
+    modules: tuple[str, ...] = ()
+    missing_exports: tuple[str, ...] = ()
+    direct_dependencies: tuple[str, ...] = ()
     failure_signature: str = ''
     diagnostic_excerpt: str = ''
 
@@ -190,8 +199,10 @@ class RecoveryManager:
         if self.tools is None:
             return None
         allowed: set[str] = set()
+        allowed.add('finish_task')
         if verify_available:
             allowed.add('verify')
+            allowed.update({'git_status', 'git_diff'})
         if fix_available:
             allowed.add('run_command')
             if read_available:
@@ -260,6 +271,22 @@ class RecoveryManager:
             changed_paths=changed_paths,
         )
 
+    def verification_read_budget(self, target: RepairTarget | None) -> int:
+        if target is None:
+            return 1
+        focus_count = len(
+            set(
+                [
+                    *target.paths,
+                    *target.symbols,
+                    *target.modules,
+                    *target.missing_exports,
+                    *target.direct_dependencies,
+                ]
+            )
+        )
+        return max(1, min(4, focus_count or 1))
+
 
 def repair_target_from_tool_failure(
     tool_call: ToolCall,
@@ -281,6 +308,8 @@ def repair_target_from_tool_failure(
         paths=paths,
         line_numbers=_extract_line_numbers(diagnostic),
         symbols=_extract_symbols(diagnostic),
+        modules=_extract_modules(diagnostic),
+        missing_exports=_extract_missing_exports(diagnostic),
         failure_signature=str(result.metadata.get('failure_signature', '')),
         diagnostic_excerpt=_excerpt(diagnostic),
     )
@@ -300,10 +329,13 @@ def repair_target_from_verification(
         if part
     )
     paths = _changed_paths_for_verification(changed_paths)
+    modules = _extract_modules(diagnostic)
     return RepairTarget(
         source=f'verify:{verification.status}',
         expected_action=_expected_action_for_verification(verification),
         paths=paths,
+        modules=modules,
+        direct_dependencies=_direct_dependencies(paths, modules),
         failure_signature=verification.failure_signature,
         diagnostic_excerpt=_excerpt(diagnostic),
     )
@@ -316,19 +348,24 @@ def repair_target_from_verification_result(
 ) -> RepairTarget:
     status = str(result.metadata.get('verification_status', 'failed'))
     diagnostic = _diagnostic_text(result)
+    paths = tuple(
+        dict.fromkeys(
+            [
+                *_extract_paths(diagnostic),
+                *_changed_paths_for_verification(changed_paths),
+            ]
+        )
+    )
+    modules = _extract_modules(diagnostic)
     return RepairTarget(
         source=f'verify:{status}',
         expected_action=_expected_action_for_verification_status(status),
-        paths=tuple(
-            dict.fromkeys(
-                [
-                    *_extract_paths(diagnostic),
-                    *_changed_paths_for_verification(changed_paths),
-                ]
-            )
-        ),
+        paths=paths,
         line_numbers=_extract_line_numbers(diagnostic),
         symbols=_extract_symbols(diagnostic),
+        modules=modules,
+        missing_exports=_extract_missing_exports(diagnostic),
+        direct_dependencies=_direct_dependencies(paths, modules),
         failure_signature=_failure_signature_from_result(result),
         diagnostic_excerpt=_excerpt(diagnostic),
     )
@@ -351,6 +388,17 @@ def render_repair_target_context(target: RepairTarget | None) -> str:
         )
     if target.symbols:
         lines.append(f'- symbols: {", ".join(target.symbols)}')
+    if target.missing_exports:
+        lines.append(
+            f'- missing exports: {", ".join(target.missing_exports)}'
+        )
+    if target.modules:
+        lines.append(f'- modules: {", ".join(target.modules)}')
+    if target.direct_dependencies:
+        lines.append(
+            '- direct dependencies: '
+            + ', '.join(target.direct_dependencies)
+        )
     if target.failure_signature:
         lines.append(f'- failure signature: {target.failure_signature}')
     if target.diagnostic_excerpt:
@@ -405,6 +453,55 @@ def _extract_symbols(text: str) -> tuple[str, ...]:
             if symbol not in symbols:
                 symbols.append(symbol)
     return tuple(symbols[:8])
+
+
+def _extract_modules(text: str) -> tuple[str, ...]:
+    modules: list[str] = []
+    for pattern in MODULE_PATTERNS:
+        for match in pattern.finditer(text):
+            module = match.group(1)
+            if module not in modules:
+                modules.append(module)
+    return tuple(modules[:8])
+
+
+def _extract_missing_exports(text: str) -> tuple[str, ...]:
+    exports: list[str] = []
+    pattern = re.compile(
+        r"TS2305: Module '[^']+' has no exported member '([^']+)'"
+    )
+    for match in pattern.finditer(text):
+        export = match.group(1)
+        if export not in exports:
+            exports.append(export)
+    return tuple(exports[:8])
+
+
+def _direct_dependencies(
+    paths: tuple[str, ...],
+    modules: tuple[str, ...],
+) -> tuple[str, ...]:
+    dependencies: list[str] = []
+    for path in paths:
+        if path not in dependencies:
+            dependencies.append(path)
+    for module in modules:
+        if module.startswith('.'):
+            parents = tuple(
+                PurePosixPath(path).parent.as_posix()
+                for path in paths
+                if PurePosixPath(path).parent.as_posix() != '.'
+            )
+            bases = parents or ('',)
+            for suffix in ('.ts', '.tsx', '.js', '.jsx'):
+                for base in bases:
+                    candidate = PurePosixPath(base, module).as_posix()
+                    candidate = candidate.removeprefix('./') + suffix
+                    if candidate not in dependencies:
+                        dependencies.append(candidate)
+        elif module not in dependencies:
+            dependencies.append(module)
+    return tuple(dependencies[:8])
 
 
 def _changed_paths_for_verification(
