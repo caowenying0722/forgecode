@@ -812,6 +812,106 @@ def tool_result_annotation(result: ToolResult) -> str:
     return f' — {result.summary}'
 
 
+SENSITIVE_ARGUMENT_KEYS = frozenset(
+    {
+        'api_key',
+        'apikey',
+        'authorization',
+        'auth',
+        'content',
+        'new_text',
+        'old_text',
+        'password',
+        'secret',
+        'token',
+    }
+)
+
+
+def summarize_tool_arguments(
+    arguments: dict[str, Any],
+    *,
+    max_characters: int = 120,
+) -> str:
+    '''Render compact, terminal-safe tool arguments.'''
+    summarized = summarize_argument_value(arguments)
+    rendered = json.dumps(summarized, ensure_ascii=False, default=str)
+    return truncate_middle(rendered, max_characters)
+
+
+def summarize_argument_value(value: object) -> object:
+    if isinstance(value, dict):
+        compact: dict[str, object] = {}
+        for key, item in value.items():
+            normalized = str(key).casefold()
+            if normalized in SENSITIVE_ARGUMENT_KEYS:
+                compact[str(key)] = summarize_sensitive_value(item)
+            else:
+                compact[str(key)] = summarize_argument_value(item)
+        return compact
+    if isinstance(value, list):
+        if len(value) > 6:
+            return [
+                *(summarize_argument_value(item) for item in value[:5]),
+                f'... {len(value) - 5} more',
+            ]
+        return [summarize_argument_value(item) for item in value]
+    if isinstance(value, str):
+        if '\n' in value:
+            lines = value.count('\n') + 1
+            return f'<{len(value)} chars, {lines} lines>'
+        if len(value) > 80:
+            return truncate_middle(value, 80)
+        return value
+    return value
+
+
+def summarize_sensitive_value(value: object) -> str:
+    if isinstance(value, str):
+        lines = value.count('\n') + 1
+        return f'<redacted {len(value)} chars, {lines} lines>'
+    return '<redacted>'
+
+
+def truncate_middle(text: str, max_characters: int) -> str:
+    if len(text) <= max_characters:
+        return text
+    if max_characters <= 12:
+        return text[:max_characters]
+    head = max_characters // 2 - 2
+    tail = max_characters - head - 5
+    return f'{text[:head]} ... {text[-tail:]}'
+
+
+def summarize_diagnostic(
+    diagnostic: str,
+    *,
+    max_lines: int = 10,
+    max_characters: int = 800,
+) -> str:
+    '''Keep actionable failure output visible without taking over the frame.'''
+    text = diagnostic.strip()
+    if not text:
+        return ''
+    lines = text.splitlines()
+    truncated = False
+    if len(lines) > max_lines:
+        kept = max(1, max_lines // 2)
+        lines = [
+            *lines[:kept],
+            f'... {len(text.splitlines()) - kept * 2} lines omitted ...',
+            *lines[-kept:],
+        ]
+        truncated = True
+    text = '\n'.join(lines)
+    if len(text) > max_characters:
+        text = truncate_middle(text, max_characters)
+        truncated = True
+    if truncated:
+        text += '\n...[diagnostic shortened]...'
+    return text
+
+
 class StreamingResponseView:
     '''Update streamed Markdown and exact usage in place.'''
 
@@ -1179,23 +1279,14 @@ class StreamingResponseView:
             else:
                 rendered.append('× ', style='red')
             rendered.append(activity.tool_call.name, style='bold')
-            arguments = json.dumps(
-                activity.tool_call.arguments,
-                ensure_ascii=False,
-                default=str,
+            arguments = summarize_tool_arguments(
+                activity.tool_call.arguments
             )
-            if len(arguments) > 120:
-                arguments = f'{arguments[:117]}...'
             rendered.append(f' {arguments}', style='dim')
             if result is not None:
                 rendered.append(tool_result_annotation(result), style='dim')
-                diagnostic = result.content.strip()
+                diagnostic = summarize_diagnostic(result.content)
                 if not result.success and diagnostic:
-                    if len(diagnostic) > 800:
-                        diagnostic = (
-                            diagnostic[:800]
-                            + '\n...[diagnostic shortened]...'
-                        )
                     diagnostic = diagnostic.replace('\n', '\n       ')
                     rendered.append(
                         f'\n       {diagnostic}',

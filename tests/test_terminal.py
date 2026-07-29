@@ -25,6 +25,8 @@ from forge.terminal import (
     TerminalUI,
     permission_answer_allows,
     repair_input_text,
+    summarize_diagnostic,
+    summarize_tool_arguments,
     streaming_preview,
     token_usage_summary,
 )
@@ -508,6 +510,49 @@ def test_terminal_renders_tool_arguments_and_result_status() -> None:
     assert '×' in rendered
     assert 'Command exited with code 1.' in rendered
     assert 'pytest: assertion failed at test_game.py:42' in rendered
+
+
+def test_tool_argument_summary_redacts_large_edit_content() -> None:
+    rendered = summarize_tool_arguments(
+        {
+            'path': 'src/app.py',
+            'old_text': 'secret old text\n' * 20,
+            'new_text': 'secret new text\n' * 20,
+            'token': 'sk-test-token',
+        }
+    )
+
+    assert 'src/app.py' in rendered
+    assert 'secret old text' not in rendered
+    assert 'secret new text' not in rendered
+    assert 'sk-test-token' not in rendered
+    assert '<redacted' in rendered
+
+
+def test_tool_argument_summary_keeps_long_command_head_and_tail() -> None:
+    command = 'pytest ' + ('very-long-option ' * 20) + 'tests/test_app.py'
+
+    rendered = summarize_tool_arguments({'command': command})
+
+    assert 'pytest' in rendered
+    assert 'tests/test_app.py' in rendered
+    assert len(rendered) <= 120
+
+
+def test_diagnostic_summary_keeps_head_tail_without_flooding_terminal() -> None:
+    diagnostic = '\n'.join(f'line {index}' for index in range(30))
+
+    rendered = summarize_diagnostic(
+        diagnostic,
+        max_lines=6,
+        max_characters=200,
+    )
+
+    assert 'line 0' in rendered
+    assert 'line 29' in rendered
+    assert 'lines omitted' in rendered
+    assert 'diagnostic shortened' in rendered
+    assert 'line 15' not in rendered
 
 
 def test_terminal_renders_friendly_phase_status() -> None:
