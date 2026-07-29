@@ -5,9 +5,6 @@ from pathlib import Path
 
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
-from prompt_toolkit.input.defaults import create_pipe_input
-from prompt_toolkit.output import DummyOutput
-from prompt_toolkit import PromptSession
 from rich.console import Console
 
 from forge.runtime.state import (
@@ -18,12 +15,12 @@ from forge.runtime.state import (
     VerificationEvidence,
 )
 from forge.runtime.agent_state import AgentPhase
+from forge.permissions.policy import ApprovalResponse, PermissionRequest
 from forge.terminal import (
     EncodingSafeTextIO,
     ForgePromptCompleter,
     SLASH_COMMAND_COMPLETER,
     TerminalUI,
-    permission_answer_allows,
     repair_input_text,
     summarize_diagnostic,
     summarize_tool_arguments,
@@ -282,27 +279,17 @@ def test_workspace_file_index_refreshes_between_prompts(tmp_path: Path) -> None:
     ]
 
 
-def test_permission_answer_accepts_common_yes_values() -> None:
-    assert permission_answer_allows('y')
-    assert permission_answer_allows('yes')
-    assert permission_answer_allows('是')
-    assert permission_answer_allows('同意')
-    assert permission_answer_allows('allow')
-    assert not permission_answer_allows('')
-    assert not permission_answer_allows('no')
-
-
 def test_permission_picker_uses_injected_selector() -> None:
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=100)
     terminal = TerminalUI(
         console=console,
         permission_selector=lambda current: (
-            'auto' if current == 'strict' else None
+            'auto' if current == 'supervised' else None
         ),
     )
 
-    assert terminal.select_permission_mode('strict') == 'auto'
+    assert terminal.select_permission_mode('supervised') == 'auto'
 
 
 def test_permission_picker_uses_inline_completion_menu() -> None:
@@ -312,39 +299,88 @@ def test_permission_picker_uses_inline_completion_menu() -> None:
         force_terminal=True,
         width=100,
     )
-    with create_pipe_input() as pipe_input:
-        prompt_session = PromptSession(
-            input=pipe_input,
-            output=DummyOutput(),
-        )
-        terminal = TerminalUI(
-            console=console,
-            prompt_session=prompt_session,
-        )
-        pipe_input.send_text('\x1b[B\r')
+    terminal = TerminalUI(
+        console=console,
+        prompt_session=FakePromptSession('plan'),
+    )
 
-        selected = terminal.select_permission_mode('strict')
+    selected = terminal.select_permission_mode('supervised')
 
-    assert selected == 'readonly'
+    assert selected == 'plan'
 
 
-def test_approval_dialog_uses_injected_selector() -> None:
+def test_permission_request_dialog_uses_injected_selector() -> None:
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=100)
-    observed: list[tuple[str, object]] = []
+    observed: list[PermissionRequest] = []
 
-    def approve(tool_call: ToolCall, effect: object) -> str:
-        observed.append((tool_call.name, effect))
-        return 'allow_session'
+    def approve(request: PermissionRequest) -> ApprovalResponse:
+        observed.append(request)
+        return ApprovalResponse('allow_session')
 
     terminal = TerminalUI(console=console, approval_selector=approve)
-    call = ToolCall(0, 'toolu_command', 'run_command', {'command': 'pytest'})
+    request = PermissionRequest(
+        'run_command',
+        'process.exec',
+        'low',
+        ('tests',),
+        preview='pytest',
+    )
 
     with terminal.stream_response() as response:
-        decision = response.request_permission(call, 'process')
+        decision = response.request_permission(request)
 
-    assert decision == 'allow_session'
-    assert observed == [('run_command', 'process')]
+    assert decision == ApprovalResponse('allow_session')
+    assert observed == [request]
+
+
+def test_permission_request_dialog_renders_scoped_choices() -> None:
+    output = StringIO()
+    terminal = TerminalUI(
+        console=Console(file=output, force_terminal=True, width=100),
+        prompt_session=FakePromptSession(''),
+    )
+
+    response = terminal.select_permission(
+        PermissionRequest(
+            'run_command',
+            'dependency.install',
+            'high',
+            ('package.json',),
+            'The command installs dependencies.',
+            'npm install',
+        )
+    )
+
+    rendered = output.getvalue()
+    assert response.choice == 'deny'
+    assert 'Permission Required' in rendered
+    assert 'Install dependencies' in rendered
+    assert 'risk: High' in rendered
+    assert 'package.json' in rendered
+    assert 'Remember for this project' in rendered
+
+
+def test_delete_permission_dialog_does_not_offer_project_memory() -> None:
+    output = StringIO()
+    terminal = TerminalUI(
+        console=Console(file=output, force_terminal=True, width=100),
+        prompt_session=FakePromptSession(''),
+    )
+
+    terminal.select_permission(
+        PermissionRequest(
+            'apply_patch',
+            'file.delete',
+            'high',
+            ('src/old.py', 'src/dead.py'),
+            'The patch deletes files.',
+        )
+    )
+
+    rendered = output.getvalue()
+    assert 'Delete files' in rendered
+    assert 'Remember for this project' not in rendered
 
 
 def test_terminal_renders_session_header_and_markdown_response() -> None:

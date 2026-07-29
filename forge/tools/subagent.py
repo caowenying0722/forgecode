@@ -208,7 +208,7 @@ class TaskSubagent:
             agent_id=agent_id,
             control_root=self.control_root,
         )
-        self.permission = permission or PermissionHook('trusted')
+        self.permission = permission or PermissionHook('auto')
         self.logger = ToolLoggingHook(self.control_root, agent=agent_id)
         self.hooks = hooks or HookRegistry([self.permission, self.logger])
         self.executor = ToolExecutor(

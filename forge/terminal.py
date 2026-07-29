@@ -31,6 +31,7 @@ from rich.table import Table
 from rich.text import Text
 
 from forge import __version__
+from forge.permissions.policy import ApprovalResponse, PermissionRequest
 from forge.runtime.agent_state import AgentPhase
 from forge.runtime.state import ContextCompacted, TokenUsage, ToolCall, TurnResult
 from forge.context.manager import ContextStats
@@ -40,47 +41,24 @@ from forge.tools.search import iter_files
 
 
 PermissionSelector = Callable[[str], str | None]
-ApprovalSelector = Callable[[ToolCall, object], str]
+ApprovalSelector = Callable[[PermissionRequest], ApprovalResponse | str]
 
 
 PERMISSION_CHOICES = (
     (
-        'readonly',
-        'Read Only',
-        'Inspect files and repository state; block writes and commands.',
+        'plan',
+        'Plan',
+        'Read repository context only; block writes and commands.',
     ),
     (
-        'strict',
-        'Ask for approval',
-        'Ask before every write or process action.',
+        'supervised',
+        'Supervised',
+        'Ask before writes, commands, installs, network, and deletes.',
     ),
     (
         'auto',
-        'Approve for me',
-        'Auto-approve workspace edits and low-risk local commands.',
-    ),
-    (
-        'trusted',
-        'Full Access',
-        'Run available tools without approval prompts.',
-    ),
-)
-
-APPROVAL_CHOICES = (
-    (
-        'allow_once',
-        'Allow once',
-        'Run only this operation.',
-    ),
-    (
-        'allow_session',
-        'Allow similar this session',
-        'Reuse approval for the same command or tool target.',
-    ),
-    (
-        'deny',
-        'Deny',
-        'Do not run this operation.',
+        'Auto',
+        'Run low-risk work automatically; ask for high-risk actions.',
     ),
 )
 
@@ -516,7 +494,7 @@ class TerminalUI:
         return StreamingResponseView(
             self.console,
             approval_selector=(
-                self.approval_selector or self.select_tool_approval
+                self.approval_selector or self.select_permission
             ),
         )
 
@@ -536,38 +514,109 @@ class TerminalUI:
             start=1,
         ):
             self.console.print(f'{index}. {label} — {description}')
-        answer = self.console.input('Select 1-4 (blank to cancel): ').strip()
+        answer = self.console.input('Select 1-3 (blank to cancel): ').strip()
         if answer.isdigit() and 1 <= int(answer) <= len(PERMISSION_CHOICES):
             return PERMISSION_CHOICES[int(answer) - 1][0]
         return None
 
-    def select_tool_approval(
+    def select_permission(
         self,
-        tool_call: ToolCall,
-        effect: object,
-    ) -> str:
-        '''Ask for one tool approval in an inline terminal completion menu.'''
-        details = permission_request_details(tool_call, effect)
+        request: PermissionRequest,
+    ) -> ApprovalResponse:
+        '''Ask for one explicit, scoped permission decision.'''
+        target_lines = list(request.targets[:8]) or ['current repository']
+        if len(request.targets) > 8:
+            target_lines.append(f'... {len(request.targets) - 8} more targets')
+        risk_labels = {
+            'low': 'Low',
+            'medium': 'Medium',
+            'high': 'High',
+            'critical': 'Critical',
+        }
+        action_labels = {
+            'file.delete': 'Delete files',
+            'file.write': 'Modify files',
+            'process.exec': 'Run command',
+            'process.privileged': 'Run privileged command',
+            'dependency.install': 'Install dependencies',
+            'network.access': 'Access network',
+        }
+        detail = request.preview.strip()
+        if detail in {'', '{}'}:
+            detail = request.reason or 'This operation needs approval.'
+        raw_choices = [('allow_once', 'Allow once', 'Run this operation only.')]
+        if request.capability == 'file.delete':
+            if len(request.targets) == 1:
+                raw_choices.append(
+                    (
+                        'allow_session',
+                        'Allow target this session',
+                        'Reuse approval for this exact delete target.',
+                    )
+                )
+        else:
+            raw_choices.extend(
+                [
+                    (
+                        'allow_session',
+                        'Allow similar this session',
+                        'Reuse approval for the same scope.',
+                    ),
+                    (
+                        'allow_project',
+                        'Remember for this project',
+                        'Persist this scoped approval in .forge.',
+                    ),
+                ]
+            )
+        raw_choices.append(('deny', 'Deny', 'Do not run this operation.'))
+        choices = tuple(raw_choices)
+        self.console.print(
+            Panel.fit(
+                (
+                    f'[bold]{escape(action_labels.get(request.capability, request.tool_name))}[/bold]'
+                    f'  risk: {escape(risk_labels.get(request.risk, request.risk))}\n'
+                    f'targets ({max(1, len(request.targets))}):\n'
+                    + '\n'.join(
+                        f'  - {escape(target)}' for target in target_lines
+                    )
+                    + '\n\n'
+                    + escape(detail)
+                    + '\n\n[bold]Choices[/bold]\n'
+                    + '\n'.join(
+                        f'  {index}. {label}'
+                        for index, (_, label, _) in enumerate(
+                            choices,
+                            start=1,
+                        )
+                    )
+                    + '\n\n[bold green]Enter/Y/1: allow once[/bold green]\n'
+                    + 'N/Esc: deny'
+                ),
+                title='Permission Required',
+                border_style='yellow',
+            )
+        )
         if self.console.is_terminal:
-            self.console.print('[bold yellow]Approval required[/]')
-            self.console.print(Text(details))
-            return self._select_inline(
+            selected = self._select_inline(
                 'Approval \u276f ',
-                APPROVAL_CHOICES,
-                current='deny',
-            ) or 'deny'
-        self.console.print('[bold yellow]Permission required[/]')
-        self.console.print(Text(details))
-        self.console.print('1. Allow once')
-        self.console.print('2. Allow similar actions this session')
-        self.console.print('3. Deny')
-        answer = self.console.input('Select 1-3 (default 3): ')
-        return {
-            '1': 'allow_once',
-            '2': 'allow_session',
-            'y': 'allow_once',
-            'yes': 'allow_once',
-        }.get(answer.strip().casefold(), 'deny')
+                choices,
+                current='allow_once',
+            )
+            return ApprovalResponse(selected or 'deny')
+        answer = self.console.input(
+            f'Select 1-{len(choices)} (default {len(choices)}): '
+        )
+        normalized = answer.strip().casefold()
+        if normalized in {'y', 'yes'}:
+            selected = 'allow_once'
+        elif normalized in {'n', 'no', ''}:
+            selected = 'deny'
+        elif normalized.isdigit() and 1 <= int(normalized) <= len(choices):
+            selected = choices[int(normalized) - 1][0]
+        else:
+            selected = 'deny'
+        return ApprovalResponse(selected)
 
     def _select_inline(
         self,
@@ -1063,27 +1112,16 @@ class StreamingResponseView:
         self.phase_reason = reason
         self._schedule_update()
 
-    def request_permission(self, tool_call: ToolCall, effect: object) -> str:
+    def request_permission(
+        self,
+        request: PermissionRequest,
+    ) -> ApprovalResponse | str:
         '''Pause live rendering and ask whether one sensitive tool may run.'''
         self.live.stop()
         try:
             if self.approval_selector is not None:
-                return self.approval_selector(tool_call, effect)
-            details = permission_request_details(tool_call, effect)
-            self.console.print('[bold yellow]Permission required[/]')
-            self.console.print(Text(details))
-            self.console.print('1. Allow once')
-            self.console.print('2. Allow similar actions this session')
-            self.console.print('3. Deny')
-            answer = self.console.input(
-                'Select 1-3 (default 3): '
-            )
-            return {
-                '1': 'allow_once',
-                '2': 'allow_session',
-                'y': 'allow_once',
-                'yes': 'allow_once',
-            }.get(answer.strip().casefold(), 'deny')
+                return self.approval_selector(request)
+            return ApprovalResponse('deny')
         finally:
             self.live.start(refresh=True)
 
@@ -1357,38 +1395,6 @@ def terminal_cbreak(file_descriptor: int) -> Iterator[None]:
         yield
     finally:
         termios.tcsetattr(file_descriptor, termios.TCSADRAIN, previous)
-
-
-def permission_answer_allows(answer: str) -> bool:
-    '''Return whether an interactive permission answer approves a tool call.'''
-    return answer.strip().casefold() in {
-        'y',
-        'yes',
-        '是',
-        '同意',
-        '允许',
-        '可以',
-        '确认',
-        'approve',
-        'allow',
-    }
-
-
-def permission_request_details(tool_call: ToolCall, effect: object) -> str:
-    arguments = json.dumps(
-        tool_call.arguments,
-        ensure_ascii=False,
-        indent=2,
-        default=str,
-    )
-    if len(arguments) > 3_000:
-        arguments = arguments[:2_997] + '...'
-    return (
-        f'Tool: {tool_call.name}\n'
-        f'Effect: {effect}\n\n'
-        f'Arguments:\n{arguments}\n\n'
-        'Allow this operation?'
-    )
 
 
 def token_usage_summary(

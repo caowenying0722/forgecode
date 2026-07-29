@@ -20,7 +20,7 @@ def test_session_store_saves_current_and_lists_latest(tmp_path: Path) -> None:
         [{'role': 'user', 'content': 'hello'}],
         active_task=task,
         interaction_mode='plan',
-        permission_mode='readonly',
+        permission_mode='plan',
     )
 
     current = store.load_current()
@@ -31,7 +31,7 @@ def test_session_store_saves_current_and_lists_latest(tmp_path: Path) -> None:
     assert current.active_task is not None
     assert current.active_task.goal == 'Fix bug'
     assert current.interaction_mode == 'plan'
-    assert current.permission_mode == 'readonly'
+    assert current.permission_mode == 'plan'
     assert listed[0].id == snapshot.id
 
 
@@ -79,7 +79,7 @@ def test_rollout_repairs_completed_tool_after_interrupted_batch(
         session_id=None,
         active_task=None,
         interaction_mode='auto',
-        permission_mode='trusted',
+        permission_mode='auto',
     )
     store.record_event(
         ToolExecutionStarted(tool_call=call),
@@ -87,7 +87,7 @@ def test_rollout_repairs_completed_tool_after_interrupted_batch(
         session_id=started.id,
         active_task=None,
         interaction_mode='auto',
-        permission_mode='trusted',
+        permission_mode='auto',
     )
     store.record_event(
         ToolExecutionCompleted(
@@ -98,7 +98,7 @@ def test_rollout_repairs_completed_tool_after_interrupted_batch(
         session_id=started.id,
         active_task=None,
         interaction_mode='auto',
-        permission_mode='trusted',
+        permission_mode='auto',
     )
 
     resumed = store.load(started.id)
@@ -157,7 +157,7 @@ def test_rollout_marks_unfinished_tools_as_interrupted(tmp_path: Path) -> None:
         session_id=None,
         active_task=None,
         interaction_mode='auto',
-        permission_mode='trusted',
+        permission_mode='auto',
     )
     store.record_event(
         ToolExecutionCompleted(
@@ -168,7 +168,7 @@ def test_rollout_marks_unfinished_tools_as_interrupted(tmp_path: Path) -> None:
         session_id=snapshot.id,
         active_task=None,
         interaction_mode='auto',
-        permission_mode='trusted',
+        permission_mode='auto',
     )
 
     resumed = store.load(snapshot.id)
@@ -204,7 +204,7 @@ def test_first_rollout_event_bootstraps_legacy_snapshot(tmp_path: Path) -> None:
         session_id=legacy.id,
         active_task=None,
         interaction_mode='auto',
-        permission_mode='trusted',
+        permission_mode='auto',
     )
 
     resumed = store.load(legacy.id)
