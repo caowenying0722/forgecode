@@ -1201,6 +1201,65 @@ def test_required_change_stagnation_enters_action_recovery_and_can_finish(
     assert executed_names[-3:] == ['replace_text', 'verify', 'finish_task']
 
 
+def test_off_scope_workspace_write_is_blocked_before_execution(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    off_scope = ToolCall(
+        0,
+        'off-scope-write',
+        'write_file',
+        {'path': 'notes/unrelated.txt', 'content': 'noise\n'},
+    )
+    repair = ToolCall(
+        0,
+        'repair-sample',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'repair-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    summary = 'Changed sample.txt after rejecting the unrelated write.'
+    client = FakeModelClient(
+        response_with_tool(off_scope),
+        response_with_tool(repair),
+        response_with_tool(verify),
+        finish_response(
+            'repair-finish',
+            task_kind='change',
+            summary=summary,
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(conversation, 'Change sample.txt')
+
+    first_tool = next(
+        event for event in events if isinstance(event, ToolExecutionCompleted)
+    )
+    assert first_tool.result.success is False
+    assert first_tool.result.error is not None
+    assert first_tool.result.error.code == 'irrelevant_mutation_target'
+    assert not (tmp_path / 'notes' / 'unrelated.txt').exists()
+    assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert '[Failed Mutation Recovery]' in (client.calls[1]['system'] or '')
+
+
 def test_cli_fix_intent_keeps_normal_analysis_for_novel_reads(
     tmp_path: Path,
 ) -> None:

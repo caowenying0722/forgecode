@@ -113,6 +113,12 @@ from forge.runtime.state import (
     VerificationEvidence,
     WorkspaceChanged,
 )
+from forge.runtime.task_scope import (
+    TaskScope,
+    evaluate_change_relevance,
+    infer_task_scope,
+)
+from forge.runtime.tool_targets import mutation_target_paths
 from forge.runtime.tool_executor import (
     PermissionMiddleware,
     ToolExecutionLogger,
@@ -1413,6 +1419,14 @@ class Conversation:
                     signature,
                     (0, True),
                 )
+                early_relevance_failure = early_mutation_relevance_failure(
+                    tool_call,
+                    tool_effect=tool_effect,
+                    change_required=change_required,
+                    task_scope_patterns=(
+                        self._static_task_scope_patterns(task_contract)
+                    ),
+                )
                 semantic_repeat = self.working_state.preflight(
                     tool_call,
                     revision,
@@ -1434,7 +1448,9 @@ class Conversation:
                         verification_read_exhausted=(
                             verification_read_exhausted
                         ),
-                        semantic_repeat=semantic_repeat,
+                        semantic_repeat=(
+                            early_relevance_failure or semantic_repeat
+                        ),
                         previous_count=previous_count,
                         previous_success=previous_success,
                         repeated_limit=self.repeated_tool_limit,
@@ -2055,9 +2071,7 @@ class Conversation:
                 mutation_recovery_active=bool(mutation_failures),
                 requires_change=change_required,
                 task_scope_patterns=(
-                    self.completion_checker.task_scope_patterns(
-                        evidence_paths=(),
-                    )
+                    self._static_task_scope_patterns(task_contract)
                 ),
                 changed_paths=(
                     self.workspace_tracker.changed_paths
@@ -2417,6 +2431,20 @@ class Conversation:
             and (not mutation_attempted or not tracker.changed_paths)
         )
 
+    def _static_task_scope_patterns(
+        self,
+        contract: TaskContract,
+    ) -> tuple[str, ...]:
+        patterns = self.completion_checker.task_scope_patterns(
+            evidence_paths=(),
+        )
+        if patterns:
+            return patterns
+        return infer_task_scope(
+            contract.goal,
+            scope_hints=contract.allowed_paths,
+        ).patterns
+
     async def compact(self) -> CompactionReport:
         '''Manually summarize committed history for the /compact command.'''
         if not self.messages:
@@ -2645,6 +2673,57 @@ def tool_call_signature(tool_call: ToolCall, revision: int) -> str:
     )
     digest = hashlib.sha256(arguments.encode('utf-8')).hexdigest()[:24]
     return f'{revision}:{tool_call.name}:{digest}'
+
+
+def early_mutation_relevance_failure(
+    tool_call: ToolCall,
+    *,
+    tool_effect: str | None,
+    change_required: bool,
+    task_scope_patterns: tuple[str, ...],
+) -> ToolResult | None:
+    '''Block statically obvious off-goal workspace edits before execution.'''
+    if (
+        not change_required
+        or tool_effect != 'workspace_write'
+        or not task_scope_patterns
+    ):
+        return None
+    targets = mutation_target_paths(tool_call)
+    if not targets:
+        return None
+    relevance_targets = _scope_probe_paths(targets)
+    relevance = evaluate_change_relevance(
+        relevance_targets,
+        TaskScope(patterns=task_scope_patterns),
+    )
+    if relevance.relevant:
+        return None
+    return ToolResult.fail(
+        'irrelevant_mutation_target',
+        (
+            f'{tool_call.name} targets paths outside the current task scope: '
+            + ', '.join(targets)
+            + '. Choose a task-relevant edit target instead.'
+        ),
+        details={
+            'targets': list(targets),
+            'task_scope_patterns': list(task_scope_patterns[:16]),
+            'reasons': list(relevance.reasons),
+        },
+        metadata={'irrelevant_mutation_target': True},
+    )
+
+
+def _scope_probe_paths(paths: tuple[str, ...]) -> tuple[str, ...]:
+    expanded: list[str] = []
+    for path in paths:
+        normalized = path.replace('\\', '/').rstrip('/')
+        expanded.append(normalized)
+        name = normalized.rsplit('/', 1)[-1]
+        if '.' not in name:
+            expanded.append(f'{normalized}/__forge_scope_probe__')
+    return tuple(dict.fromkeys(expanded))
 
 
 def normalize_tool_arguments(

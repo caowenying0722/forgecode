@@ -91,10 +91,27 @@ Validation:
 
 ## Milestone 4 - Earlier Completion Relevance Guards
 
-Status: pending.
+Status: complete.
 
-Goal:
+Completed changes:
 - Prevent unrelated workspace modifications before late completion checks.
+- Added an early mutation relevance guard before tool execution for statically
+  targetable workspace-write tools.
+- Reused existing task-scope relevance checks instead of creating a parallel
+  policy path.
+- Blocked clearly off-scope edits with `irrelevant_mutation_target`, feeding
+  the result into existing mutation recovery instead of allowing unrelated
+  files to be changed and rejected only at completion.
+- Allowed scoped directory setup such as creating `game` when the task scope is
+  `game/**`.
+- Added unit and loop regression coverage proving off-scope writes are blocked
+  before execution and relevant writes still complete.
+
+Validation:
+- `uv lock --check`
+- `uv run python -m compileall -q forge tests`
+- `uv run pytest -q`
+- `git diff --check`
 
 ## Milestone 5 - Context Replay After Compaction
 

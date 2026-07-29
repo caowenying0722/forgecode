@@ -5,7 +5,10 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from forge.runtime.agent_loop import tool_call_signature
+from forge.runtime.agent_loop import (
+    early_mutation_relevance_failure,
+    tool_call_signature,
+)
 from forge.runtime.intent import infer_task_contract
 from forge.runtime.agent_controller import AgentControlState, AgentController
 from forge.runtime.agent_state import AgentPhase, AgentRunState
@@ -202,6 +205,56 @@ def test_tool_signature_normalizes_defaults_and_paths() -> None:
     )
 
     assert tool_call_signature(explicit, 4) == tool_call_signature(implicit, 4)
+
+
+def test_early_mutation_relevance_guard_blocks_off_scope_target() -> None:
+    result = early_mutation_relevance_failure(
+        ToolCall(
+            0,
+            'write',
+            'write_file',
+            {'path': 'notes/unrelated.txt', 'content': 'x'},
+        ),
+        tool_effect='workspace_write',
+        change_required=True,
+        task_scope_patterns=('src/app.py',),
+    )
+
+    assert result is not None
+    assert result.error is not None
+    assert result.error.code == 'irrelevant_mutation_target'
+
+
+def test_early_mutation_relevance_guard_allows_in_scope_target() -> None:
+    result = early_mutation_relevance_failure(
+        ToolCall(
+            0,
+            'write',
+            'write_file',
+            {'path': 'src/app.py', 'content': 'x'},
+        ),
+        tool_effect='workspace_write',
+        change_required=True,
+        task_scope_patterns=('src/app.py',),
+    )
+
+    assert result is None
+
+
+def test_early_mutation_relevance_guard_allows_scoped_directory_target() -> None:
+    result = early_mutation_relevance_failure(
+        ToolCall(
+            0,
+            'mkdir',
+            'create_directory',
+            {'path': 'game'},
+        ),
+        tool_effect='workspace_write',
+        change_required=True,
+        task_scope_patterns=('game/**',),
+    )
+
+    assert result is None
 
 
 def test_grep_signature_normalizes_file_types() -> None:
