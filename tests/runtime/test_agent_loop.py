@@ -56,9 +56,14 @@ class FakeModelClient:
 
     provider = 'fake'
 
-    def __init__(self, *responses: list[ModelStreamEvent]) -> None:
+    def __init__(
+        self,
+        *responses: list[ModelStreamEvent],
+        model: str = 'fake-model',
+    ) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, Any]] = []
+        self.model = model
 
     async def stream(
         self,
@@ -105,6 +110,28 @@ def collect_turn(
         return [event async for event in conversation.stream(prompt)]
 
     return asyncio.run(collect())
+
+
+def test_model_set_updates_current_client_and_global_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / 'home'
+    monkeypatch.setenv('FORGE_HOME', str(home))
+    client = FakeModelClient(model='gpt-5.3-codex-spark')
+    conversation = Conversation(
+        client=client,
+        context_root=tmp_path,
+    )
+
+    notice = conversation.model_set('gpt-5.6-sol')
+
+    assert client.model == 'gpt-5.6-sol'
+    assert 'Model: gpt-5.6-sol.' in notice
+    assert 'Global default updated:' in notice
+    assert 'model_id = "gpt-5.6-sol"' in (
+        home / 'config.toml'
+    ).read_text(encoding='utf-8')
 
 
 class ReadFileInput(ToolInput):

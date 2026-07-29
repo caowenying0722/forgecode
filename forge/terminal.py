@@ -31,6 +31,7 @@ from rich.table import Table
 from rich.text import Text
 
 from forge import __version__
+from forge.config import SUPPORTED_MODEL_IDS
 from forge.runtime.agent_state import AgentPhase
 from forge.runtime.state import ContextCompacted, TokenUsage, ToolCall, TurnResult
 from forge.context.manager import ContextStats
@@ -40,6 +41,7 @@ from forge.tools.search import iter_files
 
 
 PermissionSelector = Callable[[str], str | None]
+ModelSelector = Callable[[str], str | None]
 ApprovalSelector = Callable[[ToolCall, object], str]
 
 
@@ -82,6 +84,11 @@ APPROVAL_CHOICES = (
         'Deny',
         'Do not run this operation.',
     ),
+)
+
+MODEL_CHOICES = tuple(
+    (model_id, model_id, 'Set as the current and global default model.')
+    for model_id in SUPPORTED_MODEL_IDS
 )
 
 
@@ -158,6 +165,12 @@ SLASH_COMMANDS = (
     ),
     SlashCommandSpec('/plan', '/plan', '切换到只读计划模式'),
     SlashCommandSpec('/code', '/code', '切换到代码执行模式'),
+    SlashCommandSpec('/model', '/model', '选择当前和全局默认模型'),
+    SlashCommandSpec(
+        '/model ',
+        '/model model-id',
+        '直接切换当前和全局默认模型',
+    ),
     SlashCommandSpec(
         '/permissions',
         '/permissions',
@@ -437,6 +450,7 @@ class TerminalUI:
         prompt_session: _InteractivePrompt | None = None,
         workspace_root: Path | None = None,
         permission_selector: PermissionSelector | None = None,
+        model_selector: ModelSelector | None = None,
         approval_selector: ApprovalSelector | None = None,
     ) -> None:
         self.console = (
@@ -448,6 +462,7 @@ class TerminalUI:
         self.prompt_completer = ForgePromptCompleter(self.workspace_root)
         self.prompt_session = prompt_session
         self.permission_selector = permission_selector
+        self.model_selector = model_selector
         self.approval_selector = approval_selector
         if self.prompt_session is None and self.console.is_terminal:
             self.prompt_session = PromptSession(
@@ -539,6 +554,29 @@ class TerminalUI:
         answer = self.console.input('Select 1-4 (blank to cancel): ').strip()
         if answer.isdigit() and 1 <= int(answer) <= len(PERMISSION_CHOICES):
             return PERMISSION_CHOICES[int(answer) - 1][0]
+        return None
+
+    def select_model(self, current: str) -> str | None:
+        '''Open a keyboard-first model picker.'''
+        if self.model_selector is not None:
+            return self.model_selector(current)
+        if self.console.is_terminal:
+            return self._select_inline(
+                'Model \u276f ',
+                MODEL_CHOICES,
+                current=current,
+            )
+        self.console.print('[bold]ForgeCode Model[/]')
+        for index, (model_id, _, description) in enumerate(
+            MODEL_CHOICES,
+            start=1,
+        ):
+            self.console.print(f'{index}. {model_id} — {description}')
+        answer = self.console.input(
+            f'Select 1-{len(MODEL_CHOICES)} (blank to cancel): '
+        ).strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(MODEL_CHOICES):
+            return MODEL_CHOICES[int(answer) - 1][0]
         return None
 
     def select_tool_approval(

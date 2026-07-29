@@ -77,8 +77,14 @@ class FakeConversation:
             stored_tool_result_characters=457_675,
         )
         self.rollout_enabled = False
+        self.client = type(
+            'FakeClient',
+            (),
+            {'model': 'gpt-5.3-codex-spark'},
+        )()
         self.permission_mode = 'trusted'
         self.permission_modes: list[str] = []
+        self.model_ids: list[str] = []
 
     def enable_rollout_persistence(self) -> None:
         self.rollout_enabled = True
@@ -155,6 +161,14 @@ class FakeConversation:
         self.permission_mode = mode
         self.permission_modes.append(mode)
         return f'Permission: {mode}.'
+
+    def model_show(self) -> str:
+        return f'Model: {self.client.model}.'
+
+    def model_set(self, model_id: str) -> str:
+        self.client.model = model_id
+        self.model_ids.append(model_id)
+        return f'Model: {model_id}.'
 
 
 class FakeResponseView:
@@ -562,6 +576,43 @@ def test_mode_commands_do_not_call_model(
     assert 'Mode: auto.' in result.output
     assert 'Mode: plan.' in result.output
     assert 'Mode: code.' in result.output
+    assert conversation.prompts == []
+
+
+def test_model_command_switches_model_without_calling_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(app, input='/model gpt-5.6-sol\n')
+
+    assert result.exit_code == 0
+    assert 'Model: gpt-5.6-sol.' in result.output
+    assert conversation.model_ids == ['gpt-5.6-sol']
+    assert conversation.prompts == []
+
+
+def test_model_picker_switches_model_without_calling_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = FakeConversation()
+    monkeypatch.setattr(
+        cli_module,
+        'Conversation',
+        lambda **_kwargs: conversation,
+    )
+
+    result = runner.invoke(app, input='/model\n2\n')
+
+    assert result.exit_code == 0
+    assert 'ForgeCode Model' in result.output
+    assert 'gpt-5.6-sol' in result.output
+    assert conversation.model_ids == ['gpt-5.6-sol']
     assert conversation.prompts == []
 
 

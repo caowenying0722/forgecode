@@ -11,6 +11,7 @@ from forge.config import (
     ConfigurationError,
     ForgeConfig,
     initialize_user_config,
+    update_user_model_id,
     write_user_config,
 )
 
@@ -149,6 +150,45 @@ def test_write_user_config_round_trips_without_exposing_key(
     loaded = ForgeConfig.from_env(cwd=tmp_path / 'project', home=tmp_path)
 
     assert loaded == original
+
+
+def test_update_user_model_id_updates_global_default_from_any_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / 'home'
+    project = tmp_path / 'project'
+    project.mkdir()
+    home.mkdir()
+    (home / 'config.toml').write_text(
+        '[model]\n'
+        'model_id = "gpt-5.3-codex-spark"\n'
+        'base_url = "http://localhost:63962"\n'
+        'max_tokens = 8192\n'
+        'context_window = 128000\n'
+        'request_timeout_seconds = 120\n',
+        encoding='utf-8',
+    )
+    (home / '.env').write_text(
+        'ANTHROPIC_API_KEY=user-key\n',
+        encoding='utf-8',
+    )
+    monkeypatch.delenv('MODEL_ID', raising=False)
+    monkeypatch.delenv('ANTHROPIC_API_KEY', raising=False)
+
+    config_path = update_user_model_id('gpt-5.6-sol', home=home)
+    loaded = ForgeConfig.from_env(cwd=project, home=home)
+
+    assert config_path == home / 'config.toml'
+    assert loaded.model_id == 'gpt-5.6-sol'
+    assert loaded.base_url == 'http://localhost:63962'
+    assert loaded.context_window == 128000
+    assert 'ANTHROPIC_API_KEY' not in config_path.read_text(encoding='utf-8')
+
+
+def test_update_user_model_id_rejects_unknown_model(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match='MODEL_ID must be one of'):
+        update_user_model_id('unknown-model', home=tmp_path)
 
 
 def test_config_rejects_missing_api_key() -> None:

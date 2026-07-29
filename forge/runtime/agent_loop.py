@@ -17,7 +17,13 @@ from forge.context.manager import (
     ContextStats,
 )
 from forge.context.working import WorkingState
-from forge.config import forge_home
+from forge.config import (
+    ForgeConfig,
+    SUPPORTED_MODEL_IDS,
+    forge_home,
+    normalize_supported_model_id,
+    update_user_model_id,
+)
 from forge.hooks import TodoPlanningHook
 from forge.hooks.registry import HookRegistry
 from forge.hooks.state import HookContext
@@ -279,6 +285,7 @@ class Conversation:
             )
             or Path.cwd()
         )
+        self.config_root = config_root
         self.client = (
             client
             if client is not None
@@ -426,6 +433,7 @@ class Conversation:
         self.action_recovery_limit = action_recovery_limit
         self.max_turn_input_tokens = max_turn_input_tokens
         self.max_turn_tool_calls = max_turn_tool_calls
+        self._intent_classifier_overridden = intent_classifier is not None
         self.intent_classifier = (
             intent_classifier
             if intent_classifier is not None
@@ -2678,6 +2686,39 @@ class Conversation:
         normalized = normalize_permission_mode(mode)
         self.permission.set_mode(normalized)
         return render_permission_notice(normalized)
+
+    def model_show(self) -> str:
+        current = getattr(self.client, 'model', 'configured model')
+        choices = ', '.join(SUPPORTED_MODEL_IDS)
+        return f'Model: {current}.\nAvailable: {choices}.'
+
+    def model_set(self, model_id: str) -> str:
+        normalized = normalize_supported_model_id(model_id)
+        config_path = update_user_model_id(normalized)
+        if isinstance(self.client, AnthropicModelClient):
+            current = ForgeConfig.from_env(cwd=self.config_root)
+            config = ForgeConfig(
+                api_key=current.api_key,
+                model_id=normalized,
+                base_url=current.base_url,
+                max_tokens=current.max_tokens,
+                context_window=current.context_window,
+                request_timeout_seconds=current.request_timeout_seconds,
+            )
+            self.client = AnthropicModelClient.from_config(config=config)
+        elif hasattr(self.client, 'model'):
+            setattr(self.client, 'model', normalized)
+        self.model_runner = ModelRunner(self.client)
+        if not self._intent_classifier_overridden:
+            self.intent_classifier = (
+                None
+                if getattr(self.client, 'provider', '') == 'fake'
+                else ModelSemanticTaskClassifier(self.client)
+            )
+        return (
+            f'Model: {normalized}.\n'
+            f'Global default updated: {config_path}'
+        )
 
     def set_permission_approver(self, approver: Any | None) -> None:
         self.permission.approver = approver

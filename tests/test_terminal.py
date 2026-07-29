@@ -305,6 +305,21 @@ def test_permission_picker_uses_injected_selector() -> None:
     assert terminal.select_permission_mode('strict') == 'auto'
 
 
+def test_model_picker_uses_injected_selector() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=100)
+    terminal = TerminalUI(
+        console=console,
+        model_selector=lambda current: (
+            'gpt-5.6-sol'
+            if current == 'gpt-5.3-codex-spark'
+            else None
+        ),
+    )
+
+    assert terminal.select_model('gpt-5.3-codex-spark') == 'gpt-5.6-sol'
+
+
 def test_permission_picker_uses_inline_completion_menu() -> None:
     output = StringIO()
     console = Console(

@@ -305,6 +305,47 @@ def run_interactive_chat(
                     resolved_terminal.show_error(error)
             continue
 
+        if prompt.strip() == '/model':
+            current_model = getattr(
+                getattr(resolved_session, 'client', None),
+                'model',
+                '',
+            )
+            selected = resolved_terminal.select_model(current_model)
+            if selected is None:
+                model_show = getattr(resolved_session, 'model_show', None)
+                notice = (
+                    model_show()
+                    if model_show is not None
+                    else 'Model selection cancelled.'
+                )
+                resolved_terminal.show_notice('Model', notice)
+            else:
+                try:
+                    resolved_terminal.show_notice(
+                        'Model',
+                        resolved_session.model_set(selected),
+                    )
+                except ValueError as error:
+                    resolved_terminal.show_error(error)
+            continue
+
+        if prompt.strip().startswith('/model '):
+            model_id = prompt.strip()[len('/model '):].strip()
+            if not model_id:
+                resolved_terminal.show_error(
+                    ValueError('Usage: /model model-id')
+                )
+            else:
+                try:
+                    resolved_terminal.show_notice(
+                        'Model',
+                        resolved_session.model_set(model_id),
+                    )
+                except ValueError as error:
+                    resolved_terminal.show_error(error)
+            continue
+
         if prompt.strip() == '/mode':
             resolved_terminal.show_notice(
                 'Mode',

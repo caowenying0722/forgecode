@@ -15,6 +15,10 @@ from dotenv import dotenv_values
 DEFAULT_ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
 DEFAULT_MODEL_MAX_TOKENS = 8_192
 DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS = 120.0
+SUPPORTED_MODEL_IDS = (
+    'gpt-5.3-codex-spark',
+    'gpt-5.6-sol',
+)
 USER_CONFIG_TEMPLATE = '''# ForgeCode user defaults
 [model]
 model_id = ""
@@ -39,6 +43,15 @@ CONFIG_KEYS = {
 
 class ConfigurationError(ValueError):
     '''Raised when ForgeCode model configuration is incomplete or invalid.'''
+
+
+def normalize_supported_model_id(model_id: str) -> str:
+    '''Return a supported model id or raise a user-facing config error.'''
+    normalized = model_id.strip()
+    if normalized not in SUPPORTED_MODEL_IDS:
+        choices = ', '.join(SUPPORTED_MODEL_IDS)
+        raise ConfigurationError(f'MODEL_ID must be one of: {choices}.')
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,12 +233,69 @@ def write_user_config(
     directory.mkdir(parents=True, exist_ok=True)
     config_path = directory / 'config.toml'
     env_path = directory / '.env'
+    _write_user_model_config(config_path, config)
+    env_path.write_text(
+        f'ANTHROPIC_API_KEY={dotenv_string(config.api_key)}\n',
+        encoding='utf-8',
+    )
+    if os.name != 'nt':
+        env_path.chmod(0o600)
+    return config_path, env_path
+
+
+def update_user_model_id(
+    model_id: str,
+    *,
+    home: Path | None = None,
+) -> Path:
+    '''Persist the selected model as the user-level default model.'''
+    normalized = normalize_supported_model_id(model_id)
+    directory = forge_home(home=home)
+    directory.mkdir(parents=True, exist_ok=True)
+    config_path = directory / 'config.toml'
+    existing = read_config_file(config_path)
+    raw_max_tokens = existing.get(
+        'MODEL_MAX_TOKENS',
+        DEFAULT_MODEL_MAX_TOKENS,
+    )
+    raw_context_window = existing.get('MODEL_CONTEXT_WINDOW')
+    raw_timeout = existing.get(
+        'MODEL_REQUEST_TIMEOUT_SECONDS',
+        DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS,
+    )
+    try:
+        max_tokens = int(raw_max_tokens)
+        context_window = (
+            int(raw_context_window)
+            if raw_context_window not in (None, '')
+            else None
+        )
+        request_timeout_seconds = float(raw_timeout)
+    except (TypeError, ValueError) as error:
+        raise ConfigurationError(
+            f'Invalid ForgeCode config: {config_path}: {error}'
+        ) from error
+    config = ForgeConfig(
+        api_key='placeholder',
+        model_id=normalized,
+        base_url=str(
+            existing.get('ANTHROPIC_BASE_URL', DEFAULT_ANTHROPIC_BASE_URL)
+        ),
+        max_tokens=max_tokens,
+        context_window=context_window,
+        request_timeout_seconds=request_timeout_seconds,
+    )
+    _write_user_model_config(config_path, config)
+    return config_path
+
+
+def _write_user_model_config(path: Path, config: ForgeConfig) -> None:
     context_line = (
         f'context_window = {config.context_window}\n'
         if config.context_window is not None
         else ''
     )
-    config_path.write_text(
+    path.write_text(
         '# ForgeCode user defaults\n'
         '[model]\n'
         f'model_id = {toml_string(config.model_id)}\n'
@@ -235,13 +305,6 @@ def write_user_config(
         f'request_timeout_seconds = {config.request_timeout_seconds:g}\n',
         encoding='utf-8',
     )
-    env_path.write_text(
-        f'ANTHROPIC_API_KEY={dotenv_string(config.api_key)}\n',
-        encoding='utf-8',
-    )
-    if os.name != 'nt':
-        env_path.chmod(0o600)
-    return config_path, env_path
 
 
 def toml_string(value: str) -> str:
