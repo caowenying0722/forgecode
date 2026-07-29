@@ -26,6 +26,7 @@ from forge.runtime.state import (
     ModelUsageUpdate,
     TokenUsage,
     ToolCall,
+    VerificationEvidence,
 )
 from forge.runtime.tool_runner import ToolRunPolicy, ToolRunner
 from forge.tools.base import ToolResult
@@ -487,6 +488,123 @@ def test_action_recovery_excludes_directory_only_writes() -> None:
     selected = recovery.action_tools(read_available=False)
 
     assert selected == [{'name': 'write_file'}]
+
+
+def test_recovery_manager_extracts_verification_repair_target() -> None:
+    recovery = RecoveryManager(
+        [{'name': 'read_file'}],
+        None,
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    result = ToolResult.fail(
+        'verification_failed',
+        'Verification exited with code 1.',
+        content="src/app.py:12: NameError: name 'missing_value' is not defined",
+        metadata={
+            'verification_status': 'failed',
+            'failure_signature': 'abc123',
+        },
+    )
+
+    target = recovery.verification_repair_target_from_result(
+        result,
+        changed_paths=('src/app.py',),
+    )
+
+    assert target.source == 'verify:failed'
+    assert target.paths == ('src/app.py',)
+    assert target.line_numbers == (12,)
+    assert target.symbols == ('missing_value',)
+    assert target.failure_signature == 'abc123'
+    assert target.expected_action == (
+        'repair the failing changed code or project configuration'
+    )
+
+
+def test_recovery_manager_extracts_mutation_repair_target() -> None:
+    recovery = RecoveryManager(
+        [{'name': 'apply_patch'}],
+        None,
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    call = ToolCall(
+        0,
+        'patch',
+        'apply_patch',
+        {'patch': '*** Update File: src/app.py\n'},
+    )
+    result = ToolResult.fail(
+        'patch_context_not_found',
+        'Could not find context in src/app.py:7.',
+        content='Closest current text in src/app.py:7: return old_value',
+    )
+
+    target = recovery.mutation_repair_target(call, result)
+
+    assert target.source == 'apply_patch:patch_context_not_found'
+    assert 'src/app.py' in target.paths
+    assert target.line_numbers == (7,)
+    assert target.expected_action == (
+        'retry a smaller corrected patch against the same target'
+    )
+
+
+def test_request_builder_injects_verification_repair_target() -> None:
+    tools = [{'name': 'read_file'}, {'name': 'write_file'}, {'name': 'verify'}]
+    recovery = RecoveryManager(
+        tools,
+        EffectByName({'write_file'}),
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    failed = ToolResult.fail(
+        'verification_failed',
+        'Verification exited with code 1.',
+        content="src/app.py:12: NameError: name 'missing_value' is not defined",
+        metadata={
+            'verification_status': 'failed',
+            'failure_signature': 'abc123',
+        },
+    )
+    target = recovery.verification_repair_target_from_result(
+        failed,
+        changed_paths=('src/app.py',),
+    )
+    evidence = VerificationEvidence(
+        command='python -m pytest -q',
+        cwd='.',
+        exit_code=1,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=3,
+        status='failed',
+        failure_signature='abc123',
+    )
+
+    spec = RequestBuilder(recovery, action_recovery_limit=3).build(
+        state=RequestState(
+            control_state=AgentControlState.FIX_REQUIRED,
+            verification_recovery=True,
+            verification_fix_recovery=True,
+            verification_fix_required=True,
+            latest_verification=evidence,
+            verification_repair_target=target,
+        ),
+        interaction_mode='auto',
+        all_tools=tools,
+        plan_tools=[tools[0]],
+        base_system_prompt='base',
+        repository_context='',
+        changed_paths=('src/app.py',),
+    )
+
+    assert '[ForgeCode Verification Recovery]' in spec.system_prompt
+    assert '[ForgeCode Repair Target]' in spec.system_prompt
+    assert 'src/app.py' in spec.system_prompt
+    assert 'missing_value' in spec.system_prompt
+    assert 'verify' not in spec.tool_names
 
 
 def test_model_failure_handler_preserves_partial_output() -> None:

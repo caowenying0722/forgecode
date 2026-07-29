@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Any
 
+from forge.runtime.recovery_manager import render_repair_target_context
+from forge.runtime.recovery_manager import repair_target_from_tool_failure
 from forge.runtime.state import ToolCall
 from forge.runtime.tool_targets import mutation_target_paths
 from forge.tools.base import ToolResult
@@ -147,12 +149,14 @@ def mutation_failure_record(
             + '\n...[diagnostic shortened]...\n'
             + diagnostic[-1_000:]
         )
+    repair_target = repair_target_from_tool_failure(tool_call, result)
     return {
         'tool': tool_call.name,
         'code': error_code,
         'message': message,
         'targets': list(mutation_target_paths(tool_call)[:5]),
         'diagnostic': diagnostic,
+        'repair_target': repair_target,
     }
 
 
@@ -173,6 +177,11 @@ def render_mutation_recovery_context(
         diagnostic = str(failure.get('diagnostic', '')).strip()
         if diagnostic:
             lines.append(f'  diagnostic: {diagnostic}')
+        target_context = render_repair_target_context(
+            failure.get('repair_target')
+        )
+        if target_context:
+            lines.append(target_context)
     lines.append(mutation_recovery_instruction(failures))
     lines.append(
         'apply_patch accepts unified diff and Begin Patch; use replace_text '

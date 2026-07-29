@@ -44,12 +44,26 @@ Remaining duplicated state after this milestone:
 
 ## Milestone 2 - Repair Target Recovery
 
-Status: pending.
+Status: complete.
 
-Goal:
+Completed changes:
 - Generate targeted repair guidance from verification diagnostics and mutation
   failures, including likely files, line numbers, symbols, expected action, and
   failure signature.
+- Added `RepairTarget` in `RecoveryManager` as a focused recovery data object
+  instead of scattering ad hoc diagnostic text through the loop.
+- Added extraction from failed mutation tools and failed verification output.
+- Rendered repair targets into mutation recovery and verification recovery
+  prompts so the next model call starts from the relevant file, line, symbol,
+  and expected repair action before broad discovery.
+- Preserved existing tool surfaces, read quotas, repeated verification guards,
+  MCP, permission, session, sub-agent, and trajectory behavior.
+
+Validation:
+- `uv lock --check`
+- `uv run python -m compileall -q forge tests`
+- `uv run pytest -q`
+- `git diff --check`
 
 ## Milestone 3 - Relevant Progress Evaluation
 

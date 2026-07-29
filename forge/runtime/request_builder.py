@@ -8,7 +8,12 @@ from typing import Any
 from forge.runtime.agent_controller import AgentControlState
 from forge.runtime.intent import TaskContract
 from forge.runtime.recovery_feedback import render_action_recovery_context
-from forge.runtime.recovery_manager import RecoveryManager
+from forge.runtime.recovery_manager import (
+    RecoveryManager,
+    RepairTarget,
+    render_repair_target_context,
+)
+from forge.runtime.state import VerificationEvidence
 from forge.runtime.task_model import (
     build_runtime_task_model,
     render_runtime_task_model,
@@ -30,6 +35,8 @@ class RequestState:
     verification_fix_recovery: bool = False
     verification_fix_required: bool = False
     verification_read_used: bool = False
+    latest_verification: VerificationEvidence | None = None
+    verification_repair_target: RepairTarget | None = None
     planning_recovery: bool = False
     planning_recovery_calls: int = 0
     task_contract: TaskContract | None = None
@@ -189,9 +196,24 @@ class RequestBuilder:
             prompt += '\n\n' + state.mutation_recovery_context
         if state.completion_ready_context:
             prompt += '\n\n' + state.completion_ready_context
+        repair_target_context = ''
+        if (
+            state.verification_recovery
+            and state.latest_verification is not None
+        ):
+            target = state.verification_repair_target
+            if target is None:
+                target = self.recovery_manager.verification_repair_target(
+                    state.latest_verification,
+                    changed_paths=changed_paths,
+                )
+            repair_target_context = render_repair_target_context(
+                target
+            )
         prompt += recovery_system_suffix(
             state,
             action_recovery_limit=self.action_recovery_limit,
+            repair_target_context=repair_target_context,
         )
         return prompt
 
@@ -255,6 +277,7 @@ def recovery_system_suffix(
     state: RequestState,
     *,
     action_recovery_limit: int,
+    repair_target_context: str = '',
 ) -> str:
     if state.finalization_recovery:
         return (
@@ -328,6 +351,7 @@ def recovery_system_suffix(
             'files, or adjust project scripts. Verification repair permits '
             'at most one targeted read/search before editing or running the '
             f'concrete repair command. {verify_gate}'
+            f'{_prefixed_repair_target(repair_target_context)}'
         )
     if _action_recovery_active(state):
         return '\n\n' + render_action_recovery_context(
@@ -366,3 +390,7 @@ def _action_recovery_active(state: RequestState) -> bool:
         state.control_state is AgentControlState.TARGETED_ANALYSIS
         or (state.control_state is None and state.action_recovery)
     )
+
+
+def _prefixed_repair_target(context: str) -> str:
+    return f'\n\n{context}' if context else ''

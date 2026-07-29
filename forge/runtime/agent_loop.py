@@ -66,7 +66,7 @@ from forge.runtime.protocol_recovery import (
 )
 from forge.runtime.progress import evaluate_progress
 from forge.runtime.request_builder import RequestBuilder, RequestState
-from forge.runtime.recovery_manager import RecoveryManager
+from forge.runtime.recovery_manager import RecoveryManager, RepairTarget
 from forge.runtime.recovery_feedback import (
     action_recovery_stuck_reason,
     build_action_recovery_feedback,
@@ -534,6 +534,7 @@ class Conversation:
         completed_usage = TokenUsage(input_tokens=0, output_tokens=0)
         all_tool_calls: list[ToolCall] = []
         latest_verification: VerificationEvidence | None = None
+        verification_repair_target: RepairTarget | None = None
         mutation_attempted = False
         change_required = task_contract.requires_change
         tool_attempts: dict[str, tuple[int, bool]] = {}
@@ -671,6 +672,8 @@ class Conversation:
                 verification_fix_recovery=verification_fix_recovery,
                 verification_fix_required=verification_fix_required,
                 verification_read_used=verification_read_used,
+                latest_verification=latest_verification,
+                verification_repair_target=verification_repair_target,
                 planning_recovery=self.agent_controller.planning_recovery,
                 planning_recovery_calls=(
                     self.agent_controller.planning_recovery_calls
@@ -1650,9 +1653,21 @@ class Conversation:
                         verification_fix_required = False
                         verification_failed_revision = None
                         verification_read_used = False
+                        verification_repair_target = None
                         verification_recovery_calls = 0
                         last_verification_failure_signature = ''
                     else:
+                        verification_repair_target = (
+                            self.recovery_manager
+                            .verification_repair_target_from_result(
+                                result,
+                                changed_paths=(
+                                    self.workspace_tracker.changed_paths
+                                    if self.workspace_tracker is not None
+                                    else ()
+                                ),
+                            )
+                        )
                         if (
                             latest_verification is not None
                             and latest_verification.failure_signature
@@ -1802,6 +1817,7 @@ class Conversation:
                 verification_fix_required = False
                 verification_failed_revision = None
                 verification_read_used = False
+                verification_repair_target = None
                 if not verification_recovery:
                     verification_recovery_calls = 0
                 self.agent_controller.enter_ready_to_verify()
