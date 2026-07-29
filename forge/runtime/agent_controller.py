@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from forge.runtime.intent import InitialToolSurface, TaskContract
 from forge.tools.base import ToolResult
 
 
@@ -24,13 +25,20 @@ class AgentController:
     '''Map structured tool failures onto bounded runtime state transitions.'''
 
     state: AgentControlState = AgentControlState.INIT
+    contract: TaskContract | None = None
     planning_recovery: bool = False
     planning_recovery_calls: int = 0
 
-    def begin_turn(self) -> None:
-        self.state = AgentControlState.EXPLORING
+    def begin_turn(self, contract: TaskContract) -> None:
+        self.contract = contract
+        self.state = initial_state(contract)
         self.planning_recovery = False
         self.planning_recovery_calls = 0
+
+    def initial_tool_surface(self) -> InitialToolSurface:
+        if self.contract is None:
+            return 'all'
+        return self.contract.initial_tool_surface
 
     def enter_planning_recovery(self) -> None:
         self.state = AgentControlState.PLANNING
@@ -43,6 +51,14 @@ class AgentController:
             self.state = AgentControlState.IMPLEMENTING
         elif tool_name == 'verify' and result.success:
             self.state = AgentControlState.VERIFYING
+
+
+def initial_state(contract: TaskContract) -> AgentControlState:
+    if contract.initial_phase == 'planning':
+        return AgentControlState.PLANNING
+    if contract.initial_phase == 'implementing':
+        return AgentControlState.IMPLEMENTING
+    return AgentControlState.EXPLORING
 
 
 def is_todo_required_result(result: ToolResult) -> bool:

@@ -21,7 +21,7 @@ from forge.hooks import TodoPlanningHook
 from forge.hooks.registry import HookRegistry
 from forge.hooks.state import HookContext
 from forge.mcp.client import MCPConfigurationError, parse_mcp_config
-from forge.runtime.intent import infer_change_required
+from forge.runtime.intent import TaskContract, infer_task_contract
 from forge.runtime.agent_state import AgentPhase, AgentRunState
 from forge.runtime.agent_messages import (
     append_notification_message,
@@ -507,7 +507,8 @@ class Conversation:
         self.task_manager.begin_turn(prompt)
         self.working_state = WorkingState()
         self.run_state = AgentRunState()
-        self.agent_controller.begin_turn()
+        task_contract = self._initial_task_contract(prompt)
+        self.agent_controller.begin_turn(task_contract)
         self._last_task_context = self.task_manager.system_suffix()
         user_message = {'role': 'user', 'content': prompt}
         request_messages = (
@@ -519,7 +520,7 @@ class Conversation:
         all_tool_calls: list[ToolCall] = []
         latest_verification: VerificationEvidence | None = None
         mutation_attempted = False
-        change_required = self._initial_change_required(prompt)
+        change_required = task_contract.requires_change
         tool_attempts: dict[str, tuple[int, bool]] = {}
         calls_without_progress = 0
         pre_mutation_calls = 0
@@ -649,6 +650,7 @@ class Conversation:
                 planning_recovery_calls=(
                     self.agent_controller.planning_recovery_calls
                 ),
+                task_contract=task_contract,
                 token_limit_recovery=token_limit_recovery,
                 completion_ready_context=completion_ready_context,
                 change_required=change_required,
@@ -2253,18 +2255,14 @@ class Conversation:
         return '\n\n'.join(parts)
 
     def _initial_change_required(self, prompt: str) -> bool:
-        if self.interaction_mode == 'plan':
-            return False
-        if self.interaction_mode == 'code':
-            return self.workspace_tracker is not None
-        return bool(
-            (
-                self.completion_checker.requires_changes
-            )
-            or (
-                self.workspace_tracker is not None
-                and infer_change_required(prompt)
-            )
+        return self._initial_task_contract(prompt).requires_change
+
+    def _initial_task_contract(self, prompt: str) -> TaskContract:
+        return infer_task_contract(
+            prompt,
+            interaction_mode=self.interaction_mode,
+            workspace_available=self.workspace_tracker is not None,
+            policy_requires_change=self.completion_checker.requires_changes,
         )
 
     def _plan_mode_tools(self) -> list[dict[str, Any]] | None:

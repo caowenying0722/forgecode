@@ -630,7 +630,11 @@ def test_conversation_executes_tool_and_continues_until_final_text(
         )
     )
     assert tool.calls == ['README.md']
-    assert client.calls[0]['tools'] == registry.definitions
+    first_tool_names = {
+        definition['name'] for definition in client.calls[0]['tools'] or ()
+    }
+    assert 'read_file' in first_tool_names
+    assert 'write_file' not in first_tool_names
     second_request = client.calls[1]
     assert second_request['messages'][:2] == [
         {'role': 'user', 'content': 'Read the README'},

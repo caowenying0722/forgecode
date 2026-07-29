@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 
 from forge.runtime.agent_loop import tool_call_signature
+from forge.runtime.intent import infer_task_contract
 from forge.runtime.agent_state import AgentPhase, AgentRunState
 from forge.runtime.model_runner import ModelRunner
 from forge.runtime.model_failure import (
@@ -268,6 +269,31 @@ def test_request_builder_uses_plan_tool_surface() -> None:
 
     assert spec.tools == plan_tools
     assert spec.tool_names == frozenset({'read_file'})
+
+
+def test_request_builder_uses_contract_read_only_surface() -> None:
+    tools = [{'name': 'read_file'}, {'name': 'write_file'}]
+    plan_tools = [tools[0]]
+    recovery = RecoveryManager(
+        tools,
+        None,
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    contract = infer_task_contract('给出一个修复方案')
+
+    spec = RequestBuilder(recovery, action_recovery_limit=3).build(
+        state=RequestState(task_contract=contract),
+        interaction_mode='auto',
+        all_tools=tools,
+        plan_tools=plan_tools,
+        base_system_prompt='base',
+        repository_context='',
+        changed_paths=(),
+    )
+
+    assert spec.tools == plan_tools
+    assert '[ForgeCode Turn Task Contract]' in spec.system_prompt
 
 
 def test_action_recovery_excludes_directory_only_writes() -> None:

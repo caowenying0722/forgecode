@@ -2,12 +2,51 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
+from typing import Literal
+
+
+TurnKind = Literal[
+    'answer',
+    'inspect',
+    'plan',
+    'implement',
+    'fix',
+    'refactor',
+    'verify',
+    'status',
+]
+CompletionContract = Literal['none', 'inspection', 'change', 'verified_change']
+InitialPhase = Literal['answering', 'exploring', 'planning', 'implementing']
+InitialToolSurface = Literal['none', 'read_only', 'all']
+IntentConfidence = Literal['low', 'medium', 'high']
+
+
+@dataclass(frozen=True, slots=True)
+class TurnIntent:
+    kind: TurnKind
+    confidence: IntentConfidence
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskContract:
+    intent: TurnIntent
+    requires_change: bool
+    requires_plan: bool
+    completion_contract: CompletionContract
+    initial_phase: InitialPhase
+    initial_tool_surface: InitialToolSurface
+
+    @property
+    def requires_inspection_evidence(self) -> bool:
+        return self.completion_contract == 'inspection'
 
 
 _CHANGE_VERBS_ZH = (
     '修复|修好|解决|修改|改|实现|实施|执行|落地|处理|新增|添加|'
-    '删除|移除|创建|编写|写入|重写|重构|优化|更新|调整|调高|'
+    '新建|删除|移除|创建|编写|写入|重写|重构|优化|更新|调整|调高|'
     '调低|改进|完成|替换|继续|开始'
 )
 _DIRECT_CHANGE_ZH = re.compile(
@@ -68,7 +107,7 @@ _DIRECT_CHANGE_EN = re.compile(
     r'^\s*'
     r'(?:(?:please|kindly)\s+)?'
     r'(?:fix|implement|modify|update|add|remove|delete|create|write|'
-    r'refactor|optimize|change|resolve|rewrite|execute|apply|continue|'
+    r'make|refactor|optimize|change|resolve|rewrite|execute|apply|continue|'
     r'start)\b',
     re.IGNORECASE,
 )
@@ -79,7 +118,7 @@ _REQUESTED_CHANGE_EN = re.compile(
     r'i\s+need\s+you\s+to\s+'
     r')'
     r'(?:fix|implement|modify|update|add|remove|delete|create|write|'
-    r'refactor|optimize|change|resolve|rewrite|execute|apply|continue|'
+    r'make|refactor|optimize|change|resolve|rewrite|execute|apply|continue|'
     r'start)\b',
     re.IGNORECASE,
 )
@@ -107,6 +146,18 @@ _READ_ONLY_EN = re.compile(
     r'\b(?:plan|proposal|suggestion|checklist|roadmap)\b)',
     re.IGNORECASE,
 )
+_STATUS_ZH = re.compile(r'(?:进度|状态|情况|完成了吗|完成了?没有)')
+_STATUS_EN = re.compile(r'\b(?:status|progress|update me|done yet)\b', re.IGNORECASE)
+_PLAN_ZH = re.compile(r'(?:方案|计划|建议|规划|清单|列表|checklist|roadmap)', re.IGNORECASE)
+_PLAN_EN = re.compile(r'\b(?:plan|proposal|suggestion|checklist|roadmap)\b', re.IGNORECASE)
+_INSPECT_ZH = re.compile(r'^\s*(?:查看|列出|分析|审计|检查|阅读|读取|总结|扫描)')
+_INSPECT_EN = re.compile(r'^\s*(?:inspect|review|analyze|list|show|read|scan|summarize)\b', re.IGNORECASE)
+_FIX_ZH = re.compile(r'(?:修复|修好|解决|bug|报错|错误|失败)')
+_FIX_EN = re.compile(r'\b(?:fix|resolve|bug|error|failure|failing|broken)\b', re.IGNORECASE)
+_REFACTOR_ZH = re.compile(r'(?:重构|迁移|架构)')
+_REFACTOR_EN = re.compile(r'\b(?:refactor|migrate|architecture)\b', re.IGNORECASE)
+_VERIFY_ZH = re.compile(r'(?:验证|测试|构建|跑测试|检查构建)')
+_VERIFY_EN = re.compile(r'\b(?:verify|test|build|lint|typecheck|type-check)\b', re.IGNORECASE)
 _CLAUSE_SPLIT_EN = re.compile(
     r'[\n!?,;]+|\b(?:then|and\s+then|however|but)\b',
     re.IGNORECASE,
@@ -156,3 +207,91 @@ def infer_change_required(prompt: str) -> bool:
         ):
             return True
     return False
+
+
+def infer_task_contract(
+    prompt: str,
+    *,
+    interaction_mode: str = 'auto',
+    workspace_available: bool = True,
+    policy_requires_change: bool = False,
+) -> TaskContract:
+    '''Infer a conservative executable contract for one user turn.'''
+    if interaction_mode == 'plan':
+        return TaskContract(
+            intent=TurnIntent('plan', 'high', 'explicit plan mode'),
+            requires_change=False,
+            requires_plan=True,
+            completion_contract='none',
+            initial_phase='planning',
+            initial_tool_surface='read_only',
+        )
+    if interaction_mode == 'code':
+        return TaskContract(
+            intent=TurnIntent('implement', 'high', 'explicit code mode'),
+            requires_change=workspace_available,
+            requires_plan=False,
+            completion_contract='change' if workspace_available else 'none',
+            initial_phase='implementing',
+            initial_tool_surface='all',
+        )
+
+    text = prompt.strip()
+    requires_change = bool(
+        policy_requires_change
+        or (workspace_available and infer_change_required(text))
+    )
+    if requires_change:
+        kind: TurnKind = 'implement'
+        reason = 'explicit workspace-change request'
+        if _FIX_ZH.search(text) or _FIX_EN.search(text):
+            kind = 'fix'
+            reason = 'explicit fix request'
+        elif _REFACTOR_ZH.search(text) or _REFACTOR_EN.search(text):
+            kind = 'refactor'
+            reason = 'explicit refactor request'
+        elif _VERIFY_ZH.search(text) or _VERIFY_EN.search(text):
+            kind = 'verify'
+            reason = 'change request includes verification language'
+        return TaskContract(
+            intent=TurnIntent(kind, 'high', reason),
+            requires_change=True,
+            requires_plan=False,
+            completion_contract='change',
+            initial_phase='implementing',
+            initial_tool_surface='all',
+        )
+
+    if _STATUS_ZH.search(text) or _STATUS_EN.search(text):
+        return read_only_contract('status', 'high', 'status request')
+    if _PLAN_ZH.search(text) or _PLAN_EN.search(text):
+        return TaskContract(
+            intent=TurnIntent('plan', 'high', 'plan/checklist request'),
+            requires_change=False,
+            requires_plan=True,
+            completion_contract='none',
+            initial_phase='planning',
+            initial_tool_surface='read_only',
+        )
+    if _INSPECT_ZH.search(text) or _INSPECT_EN.search(text):
+        return read_only_contract('inspect', 'medium', 'inspection request')
+    return read_only_contract('answer', 'low', 'default non-change request')
+
+
+def read_only_contract(
+    kind: TurnKind,
+    confidence: IntentConfidence,
+    reason: str,
+) -> TaskContract:
+    completion: CompletionContract = (
+        'inspection' if kind == 'inspect' else 'none'
+    )
+    phase: InitialPhase = 'exploring' if kind == 'inspect' else 'answering'
+    return TaskContract(
+        intent=TurnIntent(kind, confidence, reason),
+        requires_change=False,
+        requires_plan=False,
+        completion_contract=completion,
+        initial_phase=phase,
+        initial_tool_surface='read_only',
+    )

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from forge.runtime.intent import TaskContract
 from forge.runtime.recovery_feedback import render_action_recovery_context
 from forge.runtime.recovery_manager import RecoveryManager
 
@@ -25,6 +26,7 @@ class RequestState:
     verification_read_used: bool = False
     planning_recovery: bool = False
     planning_recovery_calls: int = 0
+    task_contract: TaskContract | None = None
     change_required: bool = False
     mutation_attempted: bool = False
     action_recovery: bool = False
@@ -103,6 +105,16 @@ class RequestBuilder:
             return self.recovery_manager.planning_tools()
         if state.finalization_recovery:
             return self.recovery_manager.finalization_tools()
+        if (
+            state.task_contract is not None
+            and state.task_contract.initial_tool_surface == 'read_only'
+        ):
+            return plan_tools
+        if (
+            state.task_contract is not None
+            and state.task_contract.initial_tool_surface == 'none'
+        ):
+            return None
         if interaction_mode == 'plan':
             return plan_tools
         if state.verification_recovery:
@@ -138,6 +150,11 @@ class RequestBuilder:
             prompt += '\n\n' + render_change_contract_context(
                 changed_paths,
                 mutation_attempted=state.mutation_attempted,
+                contract=state.task_contract,
+            )
+        elif state.task_contract is not None:
+            prompt += '\n\n' + render_task_contract_context(
+                state.task_contract,
             )
         if state.mutation_recovery_context:
             prompt += '\n\n' + state.mutation_recovery_context
@@ -154,11 +171,14 @@ def render_change_contract_context(
     changed_paths: tuple[str, ...],
     *,
     mutation_attempted: bool,
+    contract: TaskContract | None = None,
 ) -> str:
     paths = ', '.join(changed_paths) if changed_paths else 'none'
     attempted = 'yes' if mutation_attempted else 'no'
+    intent = render_contract_summary(contract) if contract is not None else ''
     return (
         '[ForgeCode Turn Change Contract]\n'
+        f'{intent}'
         'The user requested an implemented workspace change; an explanation '
         'or inspection alone cannot complete this turn.\n'
         f'- task-local changed paths: {paths}\n'
@@ -167,6 +187,27 @@ def render_change_contract_context(
         'contract. Git HEAD changes or untracked files that already existed '
         'when the turn began are background context, not work completed in '
         'this turn.'
+    )
+
+
+def render_task_contract_context(contract: TaskContract) -> str:
+    return (
+        '[ForgeCode Turn Task Contract]\n'
+        f'{render_contract_summary(contract)}'
+        'The initial tool surface follows this contract. If the user asked '
+        'for planning, status, explanation, or inspection, do not perform '
+        'workspace edits unless a later explicit user request changes the '
+        'mode or objective.'
+    )
+
+
+def render_contract_summary(contract: TaskContract) -> str:
+    return (
+        f'- intent: {contract.intent.kind} '
+        f'({contract.intent.confidence}, {contract.intent.reason})\n'
+        f'- completion contract: {contract.completion_contract}\n'
+        f'- initial phase: {contract.initial_phase}\n'
+        f'- initial tool surface: {contract.initial_tool_surface}\n'
     )
 
 

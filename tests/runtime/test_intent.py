@@ -2,7 +2,7 @@
 
 import pytest
 
-from forge.runtime.intent import infer_change_required
+from forge.runtime.intent import infer_change_required, infer_task_contract
 
 
 @pytest.mark.parametrize(
@@ -25,6 +25,8 @@ from forge.runtime.intent import infer_change_required
         'Inspect and fix the rendering bug.',
         'Could you please update the CLI?',
         'Help me implement streaming output.',
+        'Make a real code change',
+        '帮我新建一个 game 目录',
     ],
 )
 def test_explicit_change_requests_require_a_workspace_diff(
@@ -62,3 +64,46 @@ def test_questions_and_plans_do_not_require_a_workspace_diff(
     prompt: str,
 ) -> None:
     assert infer_change_required(prompt) is False
+
+
+def test_auto_fix_prompt_creates_change_contract() -> None:
+    contract = infer_task_contract(
+        '继续补齐当前项目的核心游戏骨架',
+        workspace_available=True,
+    )
+
+    assert contract.intent.kind == 'implement'
+    assert contract.requires_change is True
+    assert contract.completion_contract == 'change'
+    assert contract.initial_phase == 'implementing'
+    assert contract.initial_tool_surface == 'all'
+
+
+def test_plan_prompt_creates_read_only_contract() -> None:
+    contract = infer_task_contract(
+        '给出一个修复方案，我再决定是否执行',
+        workspace_available=True,
+    )
+
+    assert contract.intent.kind == 'plan'
+    assert contract.requires_change is False
+    assert contract.requires_plan is True
+    assert contract.initial_tool_surface == 'read_only'
+
+
+def test_explicit_modes_override_prompt_intent() -> None:
+    plan = infer_task_contract(
+        '帮我修复 bug',
+        interaction_mode='plan',
+        workspace_available=True,
+    )
+    code = infer_task_contract(
+        '给我一个计划',
+        interaction_mode='code',
+        workspace_available=True,
+    )
+
+    assert plan.requires_change is False
+    assert plan.initial_tool_surface == 'read_only'
+    assert code.requires_change is True
+    assert code.initial_tool_surface == 'all'
