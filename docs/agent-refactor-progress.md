@@ -137,8 +137,31 @@ Validation:
 
 ## Milestone 6 - Loop State Consolidation
 
-Status: pending.
+Status: complete for this refactor pass.
 
-Goal:
+Completed changes:
 - Move remaining duplicated recovery booleans and counters out of the main loop
   into explicit control state or narrow state objects.
+- Removed the main loop's local `action_recovery` boolean. Action Recovery is
+  now derived from `AgentControlState.TARGETED_ANALYSIS` through
+  `AgentController.action_recovery`.
+- Kept `action_recovery_calls` and `action_read_used` as budget/accounting
+  fields rather than flow-state facts.
+- Added controller regression coverage proving Action Recovery is derived from
+  control state.
+
+Validation:
+- `uv lock --check`
+- `uv run python -m compileall -q forge tests`
+- `uv run pytest -q`
+- `git diff --check`
+
+Remaining state debt:
+- `verification_recovery`, `verification_fix_recovery`, and
+  `verification_fix_required` should become a verification recovery state
+  object keyed by revision and failure signature.
+- `mutation_recovery_read_used` and `mutation_recovery_context` should move
+  into an edit recovery state object that owns repair targets and read budgets.
+- `force_synthesis`, `finalization_recovery`, `stagnation_final_recovery`, and
+  `token_limit_recovery` should become a synthesis/finalization mode instead
+  of separate booleans.

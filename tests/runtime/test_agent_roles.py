@@ -512,6 +512,17 @@ def test_failed_verification_stays_out_of_exploring() -> None:
     assert controller.state is not AgentControlState.EXPLORING
 
 
+def test_action_recovery_is_derived_from_control_state() -> None:
+    controller = AgentController()
+    controller.begin_turn(infer_task_contract('请修复 src/app.py'))
+
+    assert controller.action_recovery is False
+    controller.enter_targeted_analysis()
+
+    assert controller.state is AgentControlState.TARGETED_ANALYSIS
+    assert controller.action_recovery is True
+
+
 def test_progress_evaluator_counts_verification_as_progress() -> None:
     progress = evaluate_progress(
         workspace_progressed=False,

@@ -42,6 +42,11 @@ class AgentController:
         '''Compatibility view; TASK_PLANNING is the source of truth.'''
         return self.state is AgentControlState.TASK_PLANNING
 
+    @property
+    def action_recovery(self) -> bool:
+        '''Compatibility view; TARGETED_ANALYSIS is the source of truth.'''
+        return self.state is AgentControlState.TARGETED_ANALYSIS
+
     def initial_tool_surface(self) -> InitialToolSurface:
         if self.contract is None:
             return 'all'

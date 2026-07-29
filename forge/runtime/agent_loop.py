@@ -546,7 +546,6 @@ class Conversation:
         tool_attempts: dict[str, tuple[int, bool]] = {}
         calls_without_progress = 0
         pre_mutation_calls = 0
-        action_recovery = False
         action_recovery_calls = 0
         action_read_used = False
         action_block_events = 0
@@ -593,8 +592,7 @@ class Conversation:
         for iteration in iterations:
             control_state = self.agent_controller.state
             is_recovering = (
-                action_recovery
-                or bool(mutation_failures)
+                bool(mutation_failures)
                 or self.agent_controller.planning_recovery
                 or verification_recovery
                 or finalization_recovery
@@ -689,7 +687,7 @@ class Conversation:
                 completion_ready_context=completion_ready_context,
                 change_required=change_required,
                 mutation_attempted=mutation_attempted,
-                action_recovery=action_recovery,
+                action_recovery=self.agent_controller.action_recovery,
                 action_recovery_calls=action_recovery_calls,
                 action_read_used=action_read_used,
                 task_scope_patterns=self.completion_checker.task_scope_patterns(
@@ -854,10 +852,10 @@ class Conversation:
                         completed_usage,
                         request_usage,
                     )
-                    if action_recovery:
+                    if self.agent_controller.action_recovery:
                         action_recovery_calls += 1
                     else:
-                        action_recovery = True
+                        self.agent_controller.enter_targeted_analysis()
                         action_recovery_calls = 0
                         action_read_used = False
                     action_block_events += 1
@@ -1090,10 +1088,10 @@ class Conversation:
                     change_required,
                     mutation_attempted=mutation_attempted,
                 ):
-                    if action_recovery:
+                    if self.agent_controller.action_recovery:
                         action_recovery_calls += 1
                     else:
-                        action_recovery = True
+                        self.agent_controller.enter_targeted_analysis()
                         action_recovery_calls = 0
                         action_read_used = False
                     action_block_events += 1
@@ -1374,7 +1372,7 @@ class Conversation:
                 ):
                     change_required = True
                 action_read_call = (
-                    action_recovery
+                    self.agent_controller.action_recovery
                     and tool_call.name in ACTION_RECOVERY_READ_TOOLS
                 )
                 action_read_exhausted = (
@@ -1437,7 +1435,7 @@ class Conversation:
                     ToolRunPolicy(
                         tool_count=len(tool_calls),
                         available_tools=frozenset(request_tool_names),
-                        action_recovery=action_recovery,
+                        action_recovery=self.agent_controller.action_recovery,
                         mutation_recovery=bool(mutation_failures),
                         planning_recovery=(
                             self.agent_controller.state
@@ -1823,7 +1821,6 @@ class Conversation:
                 mutation_recovery_read_used = False
                 mutation_recovery_context = ''
                 pre_mutation_calls = 0
-                action_recovery = False
                 action_recovery_calls = 0
                 action_read_used = False
                 force_synthesis = False
@@ -1868,7 +1865,6 @@ class Conversation:
                 mutation_failures = mutation_failures[-3:]
             if mutation_failures:
                 self.agent_controller.enter_fix_required()
-                action_recovery = False
                 action_recovery_calls = 0
                 action_read_used = False
                 mutation_recovery_context = (
@@ -1926,7 +1922,6 @@ class Conversation:
                 force_synthesis = False
                 synthesis_retries = 0
                 calls_without_progress = 0
-                action_recovery = False
                 action_recovery_calls = 0
                 action_read_used = False
                 request_messages.append(
@@ -1948,10 +1943,10 @@ class Conversation:
                 and not protocol_failure
             ):
                 entered_action_recovery = False
-                if action_recovery:
+                if self.agent_controller.action_recovery:
                     action_recovery_calls += 1
                 elif batch.required_change_rejected or batch_reverted_to_baseline:
-                    action_recovery = True
+                    self.agent_controller.enter_targeted_analysis()
                     action_recovery_calls = 0
                     action_read_used = False
                     entered_action_recovery = True
@@ -1960,12 +1955,11 @@ class Conversation:
                 else:
                     pre_mutation_calls += 1
                     if pre_mutation_calls > self.pre_mutation_limit:
-                        action_recovery = True
+                        self.agent_controller.enter_targeted_analysis()
                         action_recovery_calls = 0
                         action_read_used = False
                         entered_action_recovery = True
-                if action_recovery:
-                    self.agent_controller.enter_targeted_analysis()
+                if self.agent_controller.action_recovery:
                     force_synthesis = False
                     synthesis_retries = 0
                     stagnation_final_recovery = False
@@ -2159,7 +2153,7 @@ class Conversation:
                         mutation_attempted=mutation_attempted,
                     )
                 ):
-                    action_recovery = True
+                    self.agent_controller.enter_targeted_analysis()
                     action_recovery_calls = 0
                     action_read_used = False
                     force_synthesis = False
