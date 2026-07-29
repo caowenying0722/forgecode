@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from forge.runtime.agent_controller import AgentControlState
 from forge.runtime.intent import TaskContract
 from forge.runtime.recovery_feedback import render_action_recovery_context
 from forge.runtime.recovery_manager import RecoveryManager
@@ -16,6 +17,7 @@ from forge.runtime.task_model import (
 
 @dataclass(frozen=True, slots=True)
 class RequestState:
+    control_state: AgentControlState | None = None
     force_synthesis: bool = False
     mutation_recovery_context: str = ''
     mutation_failures: tuple[dict[str, Any], ...] = ()
@@ -107,10 +109,40 @@ class RequestBuilder:
     ) -> list[dict[str, Any]] | None:
         if state.tool_free_recovery:
             return None
-        if state.planning_recovery:
-            return self.recovery_manager.planning_tools()
         if state.finalization_recovery:
             return self.recovery_manager.finalization_tools()
+        if _planning_recovery_active(state):
+            return self.recovery_manager.planning_tools()
+        if state.verification_recovery:
+            return self.recovery_manager.verification_tools(
+                fix_available=state.verification_fix_recovery,
+                read_available=not state.verification_read_used,
+                verify_available=not state.verification_fix_required,
+            )
+        if (
+            state.control_state is AgentControlState.TARGETED_ANALYSIS
+            or (state.control_state is None and state.action_recovery)
+        ):
+            return self.recovery_manager.action_tools(
+                read_available=not state.action_read_used
+            )
+        if (
+            state.mutation_failures
+            or (
+                state.control_state is AgentControlState.FIX_REQUIRED
+                and state.mutation_failures
+            )
+        ):
+            return self.recovery_manager.mutation_tools(
+                list(state.mutation_failures),
+                read_available=not state.mutation_read_used,
+                include_finish=False,
+            )
+        if (
+            state.control_state is AgentControlState.PLANNING
+            or interaction_mode == 'plan'
+        ):
+            return plan_tools
         if (
             state.task_contract is not None
             and state.task_contract.initial_tool_surface == 'read_only'
@@ -121,24 +153,6 @@ class RequestBuilder:
             and state.task_contract.initial_tool_surface == 'none'
         ):
             return None
-        if interaction_mode == 'plan':
-            return plan_tools
-        if state.verification_recovery:
-            return self.recovery_manager.verification_tools(
-                fix_available=state.verification_fix_recovery,
-                read_available=not state.verification_read_used,
-                verify_available=not state.verification_fix_required,
-            )
-        if state.action_recovery:
-            return self.recovery_manager.action_tools(
-                read_available=not state.action_read_used
-            )
-        if state.mutation_failures:
-            return self.recovery_manager.mutation_tools(
-                list(state.mutation_failures),
-                read_available=not state.mutation_read_used,
-                include_finish=False,
-            )
         return all_tools
 
     def _system_prompt(
@@ -253,7 +267,7 @@ def recovery_system_suffix(
             'that was not semantically or visually verified. Do not request '
             'any tool except finish_task.'
         )
-    if state.planning_recovery:
+    if _planning_recovery_active(state):
         return (
             '\n\n[ForgeCode Planning Recovery]\n'
             'The previous tool call was rejected with TODO_REQUIRED. This '
@@ -288,12 +302,6 @@ def recovery_system_suffix(
             'specific next step a future turn should take. Do not request '
             'or describe another tool call.'
         )
-    if state.action_recovery:
-        return '\n\n' + render_action_recovery_context(
-            state.action_recovery_calls,
-            action_recovery_limit,
-            read_used=state.action_read_used,
-        )
     if state.verification_recovery:
         verify_gate = (
             'A previous verification failed and no later workspace revision '
@@ -321,6 +329,12 @@ def recovery_system_suffix(
             'at most one targeted read/search before editing or running the '
             f'concrete repair command. {verify_gate}'
         )
+    if _action_recovery_active(state):
+        return '\n\n' + render_action_recovery_context(
+            state.action_recovery_calls,
+            action_recovery_limit,
+            read_used=state.action_read_used,
+        )
     if state.force_synthesis:
         return (
             '\n\n[ForgeCode Recovery Checkpoint]\n'
@@ -338,3 +352,17 @@ def recovery_system_suffix(
             'paused repository tools.'
         )
     return ''
+
+
+def _planning_recovery_active(state: RequestState) -> bool:
+    return (
+        state.control_state is AgentControlState.TASK_PLANNING
+        or (state.control_state is None and state.planning_recovery)
+    )
+
+
+def _action_recovery_active(state: RequestState) -> bool:
+    return (
+        state.control_state is AgentControlState.TARGETED_ANALYSIS
+        or (state.control_state is None and state.action_recovery)
+    )

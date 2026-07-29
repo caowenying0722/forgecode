@@ -9,6 +9,7 @@ from time import time
 from typing import Callable, Literal
 
 from forge.hooks.state import HookContext, HookResult
+from forge.runtime.intent import infer_task_contract
 from forge.runtime.state import ToolCall
 from forge.runtime.tool_targets import mutation_target_paths
 from forge.tools.base import ToolEffect, ToolResult
@@ -218,20 +219,8 @@ def should_require_todo_plan(prompt: str) -> bool:
     text = prompt.strip()
     if not text:
         return False
-    lowered = text.casefold()
-    if re.search(r'\b(?:p0|p1|p2|priority|priorities|roadmap)\b', lowered):
-        return True
-    if re.search(
-        r'\b(?:implement|refactor|architecture|migrate|integration)\b',
-        lowered,
-    ):
-        return True
-    if re.search(
-        r'(?:实现|重构|迁移|架构|完整|逐一|优先级|规划|计划|系统|多代理|权限|hook|mcp)',
-        text,
-    ):
-        return True
-    return False
+    contract = infer_task_contract(text, workspace_available=True)
+    return contract.requires_change and contract.requires_plan
 
 
 def normalize_permission_mode(mode: str) -> PermissionMode:

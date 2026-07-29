@@ -27,7 +27,12 @@ from forge.mcp.client import (
     mcp_config_sources,
     parse_mcp_config,
 )
-from forge.runtime.intent import TaskContract, infer_task_contract
+from forge.runtime.intent import (
+    SemanticTaskClassifier,
+    TaskContract,
+    infer_task_contract,
+    refine_task_contract,
+)
 from forge.runtime.agent_state import AgentPhase, AgentRunState
 from forge.runtime.agent_messages import (
     append_notification_message,
@@ -35,6 +40,7 @@ from forge.runtime.agent_messages import (
     build_tool_result_message,
 )
 from forge.runtime.agent_controller import (
+    AgentControlState,
     AgentController,
     batch_requires_todo,
     build_planning_recovery_feedback,
@@ -218,6 +224,7 @@ class Conversation:
         pre_mutation_limit: int = 4,
         action_recovery_limit: int = 3,
         max_turn_input_tokens: int | None = None,
+        intent_classifier: SemanticTaskClassifier | None = None,
     ) -> None:
         if tools is not None and registry is not None:
             raise ValueError('Pass tools or registry, not both.')
@@ -406,6 +413,7 @@ class Conversation:
         self.pre_mutation_limit = pre_mutation_limit
         self.action_recovery_limit = action_recovery_limit
         self.max_turn_input_tokens = max_turn_input_tokens
+        self.intent_classifier = intent_classifier
         self._last_repository_context = self.context.repository.system_suffix('')
         self._last_task_context = ''
 
@@ -576,6 +584,7 @@ class Conversation:
             else range(1, self.max_iterations + 1)
         )
         for iteration in iterations:
+            control_state = self.agent_controller.state
             is_recovering = (
                 action_recovery
                 or bool(mutation_failures)
@@ -584,6 +593,14 @@ class Conversation:
                 or finalization_recovery
                 or stagnation_final_recovery
                 or token_limit_recovery
+                or (
+                    control_state
+                    in {
+                        AgentControlState.TASK_PLANNING,
+                        AgentControlState.TARGETED_ANALYSIS,
+                        AgentControlState.FIX_REQUIRED,
+                    }
+                )
             )
             phase_event = self._transition(
                 (
@@ -643,6 +660,7 @@ class Conversation:
                 )
 
             request_state = RequestState(
+                control_state=self.agent_controller.state,
                 force_synthesis=force_synthesis,
                 mutation_recovery_context=mutation_recovery_context,
                 mutation_failures=tuple(mutation_failures),
@@ -1250,6 +1268,10 @@ class Conversation:
                                 and latest_verification is not None
                                 else None
                             )
+                            if verification_fix_required:
+                                self.agent_controller.enter_fix_required()
+                            else:
+                                self.agent_controller.enter_ready_to_verify()
                             force_synthesis = False
                             synthesis_retries = 0
                             stagnation_final_recovery = False
@@ -1400,7 +1422,8 @@ class Conversation:
                         action_recovery=action_recovery,
                         mutation_recovery=bool(mutation_failures),
                         planning_recovery=(
-                            self.agent_controller.planning_recovery
+                            self.agent_controller.state
+                            is AgentControlState.TASK_PLANNING
                         ),
                         verification_recovery=verification_recovery,
                         action_read_exhausted=action_read_exhausted,
@@ -2188,6 +2211,10 @@ class Conversation:
                                     and latest_verification is not None
                                     else None
                                 )
+                                if verification_fix_required:
+                                    self.agent_controller.enter_fix_required()
+                                else:
+                                    self.agent_controller.enter_ready_to_verify()
                                 calls_without_progress = 0
                                 force_synthesis = False
                                 synthesis_retries = 0
@@ -2311,12 +2338,13 @@ class Conversation:
         return self._initial_task_contract(prompt).requires_change
 
     def _initial_task_contract(self, prompt: str) -> TaskContract:
-        return infer_task_contract(
+        contract = infer_task_contract(
             prompt,
             interaction_mode=self.interaction_mode,
             workspace_available=self.workspace_tracker is not None,
             policy_requires_change=self.completion_checker.requires_changes,
         )
+        return refine_task_contract(prompt, contract, self.intent_classifier)
 
     def _plan_mode_tools(self) -> list[dict[str, Any]] | None:
         if self.tools is None:

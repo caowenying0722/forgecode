@@ -1,8 +1,16 @@
 '''Tests for conservative workspace-change intent inference.'''
 
+from dataclasses import replace
+
 import pytest
 
-from forge.runtime.intent import infer_change_required, infer_task_contract
+from forge.runtime.intent import (
+    TaskContract,
+    TurnIntent,
+    infer_change_required,
+    infer_task_contract,
+    refine_task_contract,
+)
 
 
 @pytest.mark.parametrize(
@@ -110,3 +118,100 @@ def test_explicit_modes_override_prompt_intent() -> None:
     assert plan.initial_tool_surface == 'read_only'
     assert code.requires_change is True
     assert code.initial_tool_surface == 'all'
+
+
+@pytest.mark.parametrize(
+    ('prompt', 'expected_kind', 'tool_surface', 'requires_change'),
+    [
+        (
+            '解释一下 Python 里的生成器是什么',
+            'answer',
+            'none',
+            False,
+        ),
+        (
+            '分析 forge/runtime/intent.py 的职责',
+            'inspect',
+            'read_only',
+            False,
+        ),
+        (
+            '只分析 forge/runtime/intent.py，不要修改',
+            'inspect',
+            'read_only',
+            False,
+        ),
+        (
+            '请重构多个模块的架构并更新相关代码',
+            'refactor',
+            'all',
+            True,
+        ),
+    ],
+)
+def test_task_envelope_routes_obvious_requests(
+    prompt: str,
+    expected_kind: str,
+    tool_surface: str,
+    requires_change: bool,
+) -> None:
+    contract = infer_task_contract(prompt, workspace_available=True)
+
+    assert contract.kind == expected_kind
+    assert contract.goal == prompt
+    assert contract.initial_tool_surface == tool_surface
+    assert contract.requires_change is requires_change
+    assert contract.confidence in {'medium', 'high'} or expected_kind == 'answer'
+
+
+def test_task_envelope_records_paths_and_acceptance() -> None:
+    contract = infer_task_contract(
+        '分析 forge/runtime/intent.py 的职责',
+        workspace_available=True,
+    )
+
+    assert contract.allowed_paths == ('forge/runtime/intent.py',)
+    assert contract.context_hints == ('forge/runtime/intent.py',)
+    assert contract.completion_contract == 'inspection'
+    assert 'No workspace edit is made.' in contract.acceptance_criteria
+
+
+def test_multi_module_architecture_change_requires_plan() -> None:
+    contract = infer_task_contract(
+        '请重构多个模块的架构并更新相关代码',
+        workspace_available=True,
+    )
+
+    assert contract.requires_change is True
+    assert contract.requires_plan is True
+    assert contract.verification_policy.required is True
+
+
+def test_semantic_classifier_is_used_only_for_low_confidence() -> None:
+    class FakeClassifier:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def classify_task(
+            self,
+            prompt: str,
+            baseline: TaskContract,
+        ) -> TaskContract:
+            self.calls += 1
+            return replace(
+                baseline,
+                intent=TurnIntent('inspect', 'medium', f'classified:{prompt}'),
+                kind='inspect',
+                confidence='medium',
+                semantic_classification='not_needed',
+            )
+
+    classifier = FakeClassifier()
+    high = infer_task_contract('分析 forge/runtime/intent.py')
+    low = infer_task_contract('生成器是什么')
+
+    assert refine_task_contract('分析 forge/runtime/intent.py', high, classifier) is high
+    refined = refine_task_contract('生成器是什么', low, classifier)
+
+    assert classifier.calls == 1
+    assert refined.kind == 'inspect'

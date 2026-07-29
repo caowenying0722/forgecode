@@ -30,14 +30,17 @@ class AgentController:
 
     state: AgentControlState = AgentControlState.INIT
     contract: TaskContract | None = None
-    planning_recovery: bool = False
     planning_recovery_calls: int = 0
 
     def begin_turn(self, contract: TaskContract) -> None:
         self.contract = contract
         self.state = initial_state(contract)
-        self.planning_recovery = False
         self.planning_recovery_calls = 0
+
+    @property
+    def planning_recovery(self) -> bool:
+        '''Compatibility view; TASK_PLANNING is the source of truth.'''
+        return self.state is AgentControlState.TASK_PLANNING
 
     def initial_tool_surface(self) -> InitialToolSurface:
         if self.contract is None:
@@ -46,8 +49,10 @@ class AgentController:
 
     def enter_planning_recovery(self) -> None:
         self.state = AgentControlState.TASK_PLANNING
-        self.planning_recovery = True
         self.planning_recovery_calls += 1
+
+    def enter_implementing(self) -> None:
+        self.state = AgentControlState.IMPLEMENTING
 
     def enter_targeted_analysis(self) -> None:
         self.state = AgentControlState.TARGETED_ANALYSIS
@@ -60,17 +65,16 @@ class AgentController:
 
     def observe_tool_result(self, tool_name: str, result: ToolResult) -> None:
         if tool_name == 'todo_write' and result.success:
-            self.planning_recovery = False
             self.state = AgentControlState.IMPLEMENTING
         elif tool_name == 'verify' and result.success:
             self.state = AgentControlState.VERIFYING
         elif tool_name == 'verify' and not result.success:
-            self.enter_targeted_analysis()
+            self.enter_fix_required()
 
 
 def initial_state(contract: TaskContract) -> AgentControlState:
     if contract.initial_phase == 'planning':
-        return AgentControlState.TASK_PLANNING
+        return AgentControlState.PLANNING
     if contract.initial_phase == 'implementing':
         return AgentControlState.IMPLEMENTING
     return AgentControlState.EXPLORING

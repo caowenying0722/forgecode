@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 
 from forge.runtime.agent_loop import tool_call_signature
 from forge.runtime.intent import infer_task_contract
+from forge.runtime.agent_controller import AgentControlState, AgentController
 from forge.runtime.agent_state import AgentPhase, AgentRunState
 from forge.runtime.model_runner import ModelRunner
 from forge.runtime.model_failure import (
@@ -28,6 +29,7 @@ from forge.runtime.state import (
 )
 from forge.runtime.tool_runner import ToolRunPolicy, ToolRunner
 from forge.tools.base import ToolResult
+from forge.hooks.builtin import should_require_todo_plan
 
 
 class FakePermission:
@@ -297,6 +299,98 @@ def test_request_builder_uses_contract_read_only_surface() -> None:
     assert '[ForgeCode Turn Task Contract]' in spec.system_prompt
 
 
+def test_request_builder_uses_no_tool_surface_for_knowledge_answer() -> None:
+    tools = [{'name': 'read_file'}, {'name': 'write_file'}]
+    recovery = RecoveryManager(
+        tools,
+        None,
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    contract = infer_task_contract('解释一下 Python 里的生成器是什么')
+
+    spec = RequestBuilder(recovery, action_recovery_limit=3).build(
+        state=RequestState(
+            control_state=AgentControlState.EXPLORING,
+            task_contract=contract,
+        ),
+        interaction_mode='auto',
+        all_tools=tools,
+        plan_tools=[tools[0]],
+        base_system_prompt='base',
+        repository_context='',
+        changed_paths=(),
+    )
+
+    assert spec.tools is None
+    assert spec.tool_names == frozenset()
+
+
+def test_request_builder_allows_only_read_tools_for_file_analysis() -> None:
+    tools = [{'name': 'read_file'}, {'name': 'write_file'}]
+    plan_tools = [tools[0]]
+    recovery = RecoveryManager(
+        tools,
+        None,
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    contract = infer_task_contract('分析 forge/runtime/intent.py 的职责')
+
+    spec = RequestBuilder(recovery, action_recovery_limit=3).build(
+        state=RequestState(
+            control_state=AgentControlState.EXPLORING,
+            task_contract=contract,
+            change_required=contract.requires_change,
+        ),
+        interaction_mode='auto',
+        all_tools=tools,
+        plan_tools=plan_tools,
+        base_system_prompt='base',
+        repository_context='',
+        changed_paths=(),
+    )
+
+    assert spec.tools == plan_tools
+    assert contract.requires_change is False
+    assert '[ForgeCode Turn Change Contract]' not in spec.system_prompt
+
+
+def test_request_builder_control_state_overrides_conflicting_booleans() -> None:
+    tools = [
+        {'name': 'read_file'},
+        {'name': 'write_file'},
+        {'name': 'finish_task'},
+    ]
+    recovery = RecoveryManager(
+        tools,
+        EffectByName({'write_file'}),
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    contract = infer_task_contract('分析 forge/runtime/intent.py')
+
+    spec = RequestBuilder(recovery, action_recovery_limit=3).build(
+        state=RequestState(
+            control_state=AgentControlState.TARGETED_ANALYSIS,
+            task_contract=contract,
+            planning_recovery=True,
+            action_recovery=False,
+            action_read_used=True,
+        ),
+        interaction_mode='auto',
+        all_tools=tools,
+        plan_tools=[tools[0]],
+        base_system_prompt='base',
+        repository_context='',
+        changed_paths=(),
+    )
+
+    assert spec.tool_names == frozenset({'write_file', 'finish_task'})
+    assert '[ForgeCode Action Recovery]' in spec.system_prompt
+    assert '[ForgeCode Planning Recovery]' not in spec.system_prompt
+
+
 def test_request_builder_injects_runtime_task_model_for_change() -> None:
     tools = [{'name': 'read_file'}, {'name': 'write_file'}]
     recovery = RecoveryManager(
@@ -326,6 +420,40 @@ def test_request_builder_injects_runtime_task_model_for_change() -> None:
     assert 'Completion conditions:' in spec.system_prompt
     assert 'Expected impact scope:' in spec.system_prompt
     assert 'src/player.ts' in spec.system_prompt
+
+
+def test_single_file_fix_does_not_force_todo_plan() -> None:
+    assert should_require_todo_plan('请修复 forge/runtime/intent.py') is False
+
+
+def test_multi_module_architecture_forces_todo_plan() -> None:
+    assert should_require_todo_plan('请重构多个模块的架构并更新相关代码') is True
+
+
+def test_planning_completion_enters_implementing() -> None:
+    controller = AgentController()
+    controller.begin_turn(
+        infer_task_contract('请重构多个模块的架构并更新相关代码')
+    )
+    controller.enter_planning_recovery()
+
+    controller.observe_tool_result('todo_write', ToolResult.ok('planned'))
+
+    assert controller.state is AgentControlState.IMPLEMENTING
+    assert controller.planning_recovery is False
+
+
+def test_failed_verification_stays_out_of_exploring() -> None:
+    controller = AgentController()
+    controller.begin_turn(infer_task_contract('请修复 forge/runtime/intent.py'))
+
+    controller.observe_tool_result(
+        'verify',
+        ToolResult.fail('verification_failed', 'tests failed'),
+    )
+
+    assert controller.state is AgentControlState.FIX_REQUIRED
+    assert controller.state is not AgentControlState.EXPLORING
 
 
 def test_progress_evaluator_counts_verification_as_progress() -> None:
