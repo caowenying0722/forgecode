@@ -8,6 +8,7 @@ from forge.runtime.state import (
     ToolExecutionCompleted,
     ToolExecutionStarted,
 )
+from forge.runtime.session_manager import SessionManager
 from forge.sessions.store import SessionStore
 from forge.tasks.state import ActiveTask
 from forge.tools.base import ToolResult
@@ -49,6 +50,50 @@ def test_session_store_reuses_session_id_on_save(tmp_path: Path) -> None:
     assert second.id == first.id
     assert second.created_at == first.created_at
     assert len(store.load(first.id).messages) == 2
+
+
+def test_session_store_saves_full_history(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path)
+    messages = [
+        message
+        for index in range(16)
+        for message in (
+            {'role': 'user', 'content': f'user {index}'},
+            {'role': 'assistant', 'content': f'assistant {index}'},
+        )
+    ]
+
+    snapshot = store.save(messages)
+    resumed = store.load(snapshot.id)
+
+    assert resumed.messages[0] == {'role': 'user', 'content': 'user 0'}
+    assert resumed.messages[-1] == {
+        'role': 'assistant',
+        'content': 'assistant 15',
+    }
+    assert [
+        message['content']
+        for message in resumed.messages
+        if message.get('role') == 'user'
+    ] == [f'user {index}' for index in range(16)]
+
+
+def test_session_manager_choices_default_to_latest_15_sessions(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path)
+    manager = SessionManager(store)
+    saved_ids = [
+        store.save([{'role': 'user', 'content': f'user {index}'}]).id
+        for index in range(17)
+    ]
+
+    choices = manager.choices()
+
+    assert len(choices) == 15
+    assert [choice[0] for choice in choices] == list(reversed(saved_ids[-15:]))
 
 
 def test_rollout_repairs_completed_tool_after_interrupted_batch(

@@ -168,8 +168,8 @@ def test_slash_opens_command_completion_menu() -> None:
 
     assert '/context' in usages
     assert '/resume' in usages
-    assert '/resume session-id' in usages
-    assert '/sessions' in usages
+    assert '/resume session-id' not in usages
+    assert '/sessions' not in usages
     assert '/mode' in usages
     assert '/mode auto|plan|code' in usages
     assert '/plan' in usages
@@ -180,21 +180,27 @@ def test_slash_opens_command_completion_menu() -> None:
     assert '/hooks' in usages
     assert '/todo' in usages
     assert '/exit' in usages
-    assert '/remember name | content' in usages
-    assert '/memory consolidate' in usages
+    assert '/fork session-id' not in usages
+    assert '/model model-id' not in usages
+    assert '/remember name | content' not in usages
+    assert '/memory list' in usages
+    assert '/memory show name' not in usages
+    assert '/memory forget name' not in usages
+    assert '/memory rebuild' not in usages
+    assert '/memory consolidate' not in usages
     assert '/task' in usages
-    assert '/task history' in usages
-    assert '/task resume task-id' in usages
+    assert '/task history' not in usages
+    assert '/task resume task-id' not in usages
     assert '查看当前上下文统计' in descriptions
 
 
 def test_slash_completion_filters_and_replaces_current_input() -> None:
-    completions = completions_for('/memory s')
+    completions = completions_for('/memory l')
 
     assert [completion.text for completion in completions] == [
-        '/memory show '
+        '/memory list'
     ]
-    assert completions[0].start_position == -len('/memory s')
+    assert completions[0].start_position == -len('/memory l')
 
 
 def test_normal_prompt_does_not_offer_slash_commands() -> None:
@@ -318,6 +324,33 @@ def test_model_picker_uses_injected_selector() -> None:
     )
 
     assert terminal.select_model('gpt-5.3-codex-spark') == 'gpt-5.6-sol'
+
+
+def test_session_picker_uses_injected_selector() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=100)
+    choices = (
+        ('session-111111111111', 'session-111111111111', '2 message(s)'),
+    )
+    terminal = TerminalUI(
+        console=console,
+        session_selector=lambda offered: offered[0][0],
+    )
+
+    assert terminal.select_session(choices) == 'session-111111111111'
+
+
+def test_session_picker_uses_numeric_fallback(monkeypatch) -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=100)
+    monkeypatch.setattr('builtins.input', lambda *_args: '2')
+    choices = (
+        ('session-111111111111', 'session-111111111111', '2 message(s)'),
+        ('session-222222222222', 'session-222222222222', '4 message(s)'),
+    )
+    terminal = TerminalUI(console=console)
+
+    assert terminal.select_session(choices) == 'session-222222222222'
 
 
 def test_permission_picker_uses_inline_completion_menu() -> None:

@@ -85,6 +85,7 @@ class FakeConversation:
         self.permission_mode = 'trusted'
         self.permission_modes: list[str] = []
         self.model_ids: list[str] = []
+        self.resumed_session_ids: list[str | None] = []
 
     def enable_rollout_persistence(self) -> None:
         self.rollout_enabled = True
@@ -128,7 +129,22 @@ class FakeConversation:
         return f'Resumed {task_id}: Finish feature'
 
     def resume_session(self, session_id: str | None = None) -> str:
+        self.resumed_session_ids.append(session_id)
         return f'Resumed session {session_id or "latest"}'
+
+    def session_choices(self) -> tuple[tuple[str, str, str], ...]:
+        return (
+            (
+                'session-123456789abc',
+                'session-123456789abc  2026-01-01T00:00:00',
+                '2 message(s)',
+            ),
+            (
+                'session-abcdef123456',
+                'session-abcdef123456  2026-01-02T00:00:00',
+                '4 message(s)',
+            ),
+        )
 
     def fork_session(self, session_id: str | None = None) -> str:
         return f'Forked session {session_id or "latest"}'
@@ -487,22 +503,12 @@ def test_memory_commands_do_not_call_model(
 
     result = runner.invoke(
         app,
-        input=(
-            '/remember testing | Use pytest.\n'
-            '/memory list\n'
-            '/memory show testing\n'
-            '/memory forget testing\n'
-            '/memory rebuild\n'
-            '/memory consolidate\n'
-        ),
+        input='/memory list\n/memory show testing\n',
     )
 
     assert result.exit_code == 0
-    assert 'Remembered testing: Use pytest.' in result.output
-    assert 'Use pytest.' in result.output
-    assert 'Forgot testing.' in result.output
-    assert 'Rebuilt memory index.' in result.output
-    assert 'Consolidated memory' in result.output
+    assert '- testing [project]: test command' in result.output
+    assert 'Unknown command: /memory show testing' in result.output
     assert conversation.prompts == []
 
 
@@ -516,15 +522,11 @@ def test_task_commands_do_not_call_model(
         lambda **_kwargs: conversation,
     )
 
-    result = runner.invoke(
-        app,
-        input='/task\n/task history\n/task resume task-saved\n',
-    )
+    result = runner.invoke(app, input='/task\n/task history\n')
 
     assert result.exit_code == 0
     assert 'task-current' in result.output
-    assert 'task-saved [blocked]' in result.output
-    assert 'Resumed task-saved' in result.output
+    assert 'Unknown command: /task history' in result.output
     assert conversation.prompts == []
 
 
@@ -541,17 +543,19 @@ def test_session_commands_do_not_call_model(
     result = runner.invoke(
         app,
         input=(
-            '/sessions\n/resume\n/resume session-123456789abc\n'
+            '/resume\n2\n/resume session-123456789abc\n'
             '/fork\n/fork session-123456789abc\n/worktrees\n'
         ),
     )
 
     assert result.exit_code == 0
+    assert 'ForgeCode Sessions' in result.output
     assert 'session-123456789abc' in result.output
-    assert 'Resumed session latest' in result.output
-    assert 'Resumed session session-123456789abc' in result.output
+    assert 'Resumed session session-abcdef123456' in result.output
+    assert 'Use /resume and select a saved session.' in result.output
     assert 'Forked session latest' in result.output
-    assert 'Forked session session-123456789abc' in result.output
+    assert 'Unknown command: /fork session-123456789abc' in result.output
+    assert conversation.resumed_session_ids == ['session-abcdef123456']
     assert 'task-abcd' in result.output
     assert conversation.rollout_enabled is True
     assert conversation.prompts == []
@@ -579,7 +583,7 @@ def test_mode_commands_do_not_call_model(
     assert conversation.prompts == []
 
 
-def test_model_command_switches_model_without_calling_model(
+def test_model_id_command_is_removed_without_calling_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conversation = FakeConversation()
@@ -592,8 +596,8 @@ def test_model_command_switches_model_without_calling_model(
     result = runner.invoke(app, input='/model gpt-5.6-sol\n')
 
     assert result.exit_code == 0
-    assert 'Model: gpt-5.6-sol.' in result.output
-    assert conversation.model_ids == ['gpt-5.6-sol']
+    assert 'Unknown command: /model gpt-5.6-sol' in result.output
+    assert conversation.model_ids == []
     assert conversation.prompts == []
 
 
@@ -611,8 +615,11 @@ def test_model_picker_switches_model_without_calling_model(
 
     assert result.exit_code == 0
     assert 'ForgeCode Model' in result.output
+    assert 'gpt-5.4-mini' in result.output
+    assert 'gpt-5.4' in result.output
+    assert 'gpt-5.5' in result.output
     assert 'gpt-5.6-sol' in result.output
-    assert conversation.model_ids == ['gpt-5.6-sol']
+    assert conversation.model_ids == ['gpt-5.4-mini']
     assert conversation.prompts == []
 
 

@@ -142,6 +142,24 @@ def test_explicit_modes_override_prompt_intent() -> None:
             False,
         ),
         (
+            '厦门今天天气',
+            'inspect',
+            'read_only',
+            False,
+        ),
+        (
+            '联网查询厦门今天天气',
+            'inspect',
+            'read_only',
+            False,
+        ),
+        (
+            'Search the latest Python release',
+            'inspect',
+            'read_only',
+            False,
+        ),
+        (
             '请重构多个模块的架构并更新相关代码',
             'refactor',
             'all',

@@ -176,11 +176,11 @@ def test_update_user_model_id_updates_global_default_from_any_project(
     monkeypatch.delenv('MODEL_ID', raising=False)
     monkeypatch.delenv('ANTHROPIC_API_KEY', raising=False)
 
-    config_path = update_user_model_id('gpt-5.6-sol', home=home)
+    config_path = update_user_model_id('gpt-5.5', home=home)
     loaded = ForgeConfig.from_env(cwd=project, home=home)
 
     assert config_path == home / 'config.toml'
-    assert loaded.model_id == 'gpt-5.6-sol'
+    assert loaded.model_id == 'gpt-5.5'
     assert loaded.base_url == 'http://localhost:63962'
     assert loaded.context_window == 128000
     assert 'ANTHROPIC_API_KEY' not in config_path.read_text(encoding='utf-8')

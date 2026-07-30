@@ -201,28 +201,33 @@ def run_interactive_chat(
 
         if prompt.strip() == '/resume':
             try:
+                choices = resolved_session.session_choices()
+                if not choices:
+                    resolved_terminal.show_notice(
+                        'Session',
+                        'No saved sessions.',
+                    )
+                    continue
+                selected = resolved_terminal.select_session(choices)
+                if selected is None:
+                    resolved_terminal.show_notice(
+                        'Session',
+                        'Session selection cancelled.',
+                    )
+                    continue
                 resolved_terminal.show_notice(
                     'Session',
-                    resolved_session.resume_session(),
+                    resolved_session.resume_session(selected),
                 )
             except (OSError, ValueError) as error:
                 resolved_terminal.show_error(error)
             continue
 
         if prompt.strip().startswith('/resume '):
-            session_id = prompt.strip()[len('/resume '):].strip()
-            if not session_id:
-                resolved_terminal.show_error(
-                    ValueError('Usage: /resume session-id')
-                )
-            else:
-                try:
-                    resolved_terminal.show_notice(
-                        'Session',
-                        resolved_session.resume_session(session_id),
-                    )
-                except (OSError, ValueError) as error:
-                    resolved_terminal.show_error(error)
+            resolved_terminal.show_notice(
+                'Session',
+                'Use /resume and select a saved session.',
+            )
             continue
 
         if prompt.strip() == '/fork':
@@ -233,29 +238,6 @@ def run_interactive_chat(
                 )
             except (OSError, ValueError) as error:
                 resolved_terminal.show_error(error)
-            continue
-
-        if prompt.strip().startswith('/fork '):
-            session_id = prompt.strip()[len('/fork '):].strip()
-            if not session_id:
-                resolved_terminal.show_error(
-                    ValueError('Usage: /fork session-id')
-                )
-            else:
-                try:
-                    resolved_terminal.show_notice(
-                        'Session',
-                        resolved_session.fork_session(session_id),
-                    )
-                except (OSError, ValueError) as error:
-                    resolved_terminal.show_error(error)
-            continue
-
-        if prompt.strip() == '/sessions':
-            resolved_terminal.show_notice(
-                'Sessions',
-                resolved_session.session_history(),
-            )
             continue
 
         if prompt.strip() == '/worktrees':
@@ -330,22 +312,6 @@ def run_interactive_chat(
                     resolved_terminal.show_error(error)
             continue
 
-        if prompt.strip().startswith('/model '):
-            model_id = prompt.strip()[len('/model '):].strip()
-            if not model_id:
-                resolved_terminal.show_error(
-                    ValueError('Usage: /model model-id')
-                )
-            else:
-                try:
-                    resolved_terminal.show_notice(
-                        'Model',
-                        resolved_session.model_set(model_id),
-                    )
-                except ValueError as error:
-                    resolved_terminal.show_error(error)
-            continue
-
         if prompt.strip() == '/mode':
             resolved_terminal.show_notice(
                 'Mode',
@@ -382,75 +348,16 @@ def run_interactive_chat(
             resolved_terminal.show_notice('Task', resolved_session.task_show())
             continue
 
-        if prompt.strip() == '/task history':
-            resolved_terminal.show_notice(
-                'Task',
-                resolved_session.task_history(),
-            )
-            continue
-
-        if prompt.strip().startswith('/task resume '):
-            task_id = prompt.strip()[len('/task resume '):].strip()
-            if not task_id:
-                resolved_terminal.show_error(
-                    ValueError('Usage: /task resume task-id')
-                )
-            else:
-                try:
-                    notice = resolved_session.task_resume(task_id)
-                    resolved_terminal.show_notice('Task', notice)
-                except (OSError, ValueError) as error:
-                    resolved_terminal.show_error(error)
-            continue
-
-        if prompt.startswith('/remember '):
-            payload = prompt[len('/remember '):].strip()
-            name, separator, content = payload.partition('|')
-            if not separator:
-                resolved_terminal.show_error(
-                    ValueError('Usage: /remember name | content')
-                )
-            else:
-                try:
-                    notice = resolved_session.remember(name.strip(), content.strip())
-                    resolved_terminal.show_notice('Memory', notice)
-                except ValueError as error:
-                    resolved_terminal.show_error(error)
-            continue
-
         if prompt == '/memory list':
             resolved_terminal.show_notice(
                 'Memory', resolved_session.memory_list()
             )
             continue
 
-        if prompt.startswith('/memory show '):
+        if prompt.strip().startswith('/'):
             resolved_terminal.show_notice(
-                'Memory',
-                resolved_session.memory_show(
-                    prompt[len('/memory show '):].strip()
-                ),
-            )
-            continue
-
-        if prompt.startswith('/memory forget '):
-            resolved_terminal.show_notice(
-                'Memory',
-                resolved_session.memory_forget(
-                    prompt[len('/memory forget '):].strip()
-                ),
-            )
-            continue
-
-        if prompt == '/memory rebuild':
-            resolved_terminal.show_notice(
-                'Memory', resolved_session.memory_rebuild()
-            )
-            continue
-
-        if prompt == '/memory consolidate':
-            resolved_terminal.show_notice(
-                'Memory', resolved_session.memory_consolidate()
+                'Command',
+                f'Unknown command: {prompt.strip()}',
             )
             continue
 

@@ -82,3 +82,22 @@ class SessionManager:
                 f'{snapshot.updated_at}{parent}{suffix}'
             )
         return '\n'.join(lines)
+
+    def choices(self, limit: int | None = 15) -> tuple[tuple[str, str, str], ...]:
+        '''Return saved sessions as terminal picker choices.'''
+        choices: list[tuple[str, str, str]] = []
+        sessions = self.store.list()
+        if limit is not None:
+            sessions = sessions[:limit]
+        for snapshot in sessions:
+            task = snapshot.active_task.goal if snapshot.active_task else ''
+            label = f'{snapshot.id}  {snapshot.updated_at}'
+            details = [f'{len(snapshot.messages)} message(s)']
+            if snapshot.interaction_mode:
+                details.append(f'mode {snapshot.interaction_mode}')
+            if snapshot.parent_session_id:
+                details.append(f'forked from {snapshot.parent_session_id}')
+            if task:
+                details.append(task[:80])
+            choices.append((snapshot.id, label, ' · '.join(details)))
+        return tuple(choices)

@@ -2827,6 +2827,9 @@ class Conversation:
     def session_history(self) -> str:
         return self.session_manager.history()
 
+    def session_choices(self) -> tuple[tuple[str, str, str], ...]:
+        return self.session_manager.choices()
+
     def subagent_worktrees(self) -> str:
         from forge.runtime.worktree import SubagentWorktreeManager
 

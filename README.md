@@ -662,7 +662,7 @@ Working Layer
 - [x] 支持 `user`、`feedback`、`project`、`reference` 四类记忆；
 - [x] 使用确定性关键词相关度选择最多 5 条记忆，单条最多 4 KB、总计最多 20 KB；
 - [x] 相关记忆仅注入当前模型请求，不写入会话历史；
-- [x] `/remember name | content`、`/memory list/show/forget/rebuild/consolidate` 提供可解释的管理入口；
+- [x] `/memory list` 提供可解释的记忆查看入口；
 - [x] 模型可通过 `memory_list`、`memory_read`、`memory_write`、`memory_update`、`memory_delete` 主动管理仓库记忆；写入、更新和删除走 `ToolExecutor`、权限 Hook 和工具日志；
 - [x] 用户输入“记住：...”时自动保存显式事实；疑似 API Key、Token、密码和私钥的内容拒绝写入；
 - [x] 记忆达到 10 条后自动整理完全重复的内容并重建索引。
@@ -724,35 +724,24 @@ ForgeCode 在交互终端中提供 Slash Command，用于执行不需要交给�
 | --- | --- | --- |
 | `/context` | 查看 System、仓库上下文、工具 Schema、历史、预留输出和预计剩余窗口 | 否 |
 | `/compact` | 立即把当前会话压缩为结构化任务摘要 | 是 |
-| `/resume` | 恢复最近自动保存的对话上下文 | 否 |
-| `/resume session-id` | 恢复指定保存会话 | 否 |
+| `/resume` | 列出保存的对话上下文，并用方向键选择恢复 | 否 |
 | `/fork` | 从最近保存的会话创建独立分叉 | 否 |
-| `/fork session-id` | 从指定会话创建独立分叉 | 否 |
-| `/sessions` | 列出最近保存的会话 | 否 |
 | `/worktrees` | 列出因冲突或失败而保留的子 Agent worktree | 否 |
 | `/task` | 查看当前目标、状态和可选计划进度 | 否 |
-| `/task history` | 列出 `.forge/tasks/` 中保存的复杂任务 | 否 |
-| `/task resume task-id` | 恢复一个已保存的复杂任务 | 否 |
-| `/remember name \| content` | 将一条知识写入当前仓库的持久化记忆 | 否 |
 | `/memory list` | 列出当前仓库中的全部记忆 | 否 |
-| `/memory show name` | 查看指定记忆的描述和完整内容 | 否 |
-| `/memory forget name` | 删除指定记忆并更新索引 | 否 |
-| `/memory rebuild` | 根据记忆文件重新生成 `MEMORY.md` 索引 | 否 |
-| `/memory consolidate` | 删除内容完全相同的重复记忆并重建索引 | 否 |
 
 使用示例：
 
 ```text
 /context
 /compact
-/remember testing | 项目测试命令是 uv run pytest
-/memory show testing
-/memory forget testing
+/resume
+/memory list
 ```
 
-`/remember` 使用竖线分隔记忆名称和内容。记忆保存在当前仓库的 `.forge/memory/` 下，可以直接通过 Markdown 文件检查和编辑。疑似包含 API Key、Token、密码或私钥的内容会被拒绝写入。
+记忆保存在当前仓库的 `.forge/memory/` 下，可以直接通过 Markdown 文件检查和编辑。疑似包含 API Key、Token、密码或私钥的内容会被拒绝写入。
 
-会话恢复采用追加式 Rollout，而不是文件 Checkpoint。每条记录包含单调递增序号并在写入后刷新到磁盘；启动恢复时会忽略唯一一条被截断的末尾记录。若上一次进程停止在工具批次中间，已记录成功结果的工具会作为既有 `tool_result` 恢复，未完成工具会被标记为 `interrupted_tool_call`，由 Agent 先检查工作区再决定是否重试。`/resume` 不修改代码文件，只在 Git HEAD、分支或工作区摘要不一致时给出警告；`/fork` 复制对话状态并保留父 Session，代码隔离仍应使用 Git branch 或 worktree。
+会话恢复采用追加式 Rollout，而不是文件 Checkpoint。每条记录包含单调递增序号并在写入后刷新到磁盘；启动恢复时会忽略唯一一条被截断的末尾记录。若上一次进程停止在工具批次中间，已记录成功结果的工具会作为既有 `tool_result` 恢复，未完成工具会被标记为 `interrupted_tool_call`，由 Agent 先检查工作区再决定是否重试。`/resume` 选择器只展示最近 15 个保存会话，选中后完整恢复该会话的消息历史。`/resume` 不修改代码文件，只在 Git HEAD、分支或工作区摘要不一致时给出警告；`/fork` 复制对话状态并保留父 Session，代码隔离仍应使用 Git branch 或 worktree。
 
 `/context` 使用字符数近似估算 Token，同时展示本地保存的完整历史，以及经过大型工具结果落盘、旧工具结果缩短和中间消息裁剪后的实际请求历史。System Prompt、仓库规则/相关 Memory 和工具 Schema 会计入实际请求。预计剩余量按照下面的方式计算：
 

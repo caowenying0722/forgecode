@@ -228,6 +228,17 @@ _INSPECT_ZH = re.compile(
     r'^\s*(?:只\s*)?(?:查看|列出|分析|审计|检查|阅读|读取|总结|扫描)'
 )
 _INSPECT_EN = re.compile(r'^\s*(?:inspect|review|analyze|understand|list|show|read|scan|summarize)\b', re.IGNORECASE)
+_WEB_QUERY_ZH = re.compile(
+    r'(?:联网|搜索|检索|查询|查一下|查找|搜一下|实时|最新|当前|现在|'
+    r'今天|今日|明天|昨日|昨天|天气|新闻|价格|股价|汇率|航班|车次|'
+    r'票价|日程|赛程|排名|榜单|热搜|公告|发布|官网)'
+)
+_WEB_QUERY_EN = re.compile(
+    r'\b(?:web|internet|online|search|lookup|current|latest|recent|today|'
+    r'tomorrow|yesterday|weather|news|price|stock|exchange rate|schedule|'
+    r'standings|ranking|announcement|release|official site)\b',
+    re.IGNORECASE,
+)
 _FIX_ZH = re.compile(r'(?:修复|修好|解决|bug|报错|错误|失败)')
 _FIX_EN = re.compile(r'\b(?:fix|resolve|bug|error|failure|failing|broken)\b', re.IGNORECASE)
 _REFACTOR_ZH = re.compile(r'(?:重构|迁移|架构)')
@@ -375,6 +386,13 @@ def infer_task_contract(
             'inspect',
             'medium',
             'inspection request',
+            prompt=prompt,
+        )
+    if _WEB_QUERY_ZH.search(text) or _WEB_QUERY_EN.search(text):
+        return read_only_contract(
+            'inspect',
+            'medium',
+            'web/current-information request',
             prompt=prompt,
         )
     if _extract_path_hints(text) and (

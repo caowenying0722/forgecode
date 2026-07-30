@@ -17,6 +17,9 @@ DEFAULT_MODEL_MAX_TOKENS = 8_192
 DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS = 120.0
 SUPPORTED_MODEL_IDS = (
     'gpt-5.3-codex-spark',
+    'gpt-5.4-mini',
+    'gpt-5.4',
+    'gpt-5.5',
     'gpt-5.6-sol',
 )
 USER_CONFIG_TEMPLATE = '''# ForgeCode user defaults

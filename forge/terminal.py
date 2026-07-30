@@ -20,7 +20,8 @@ from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.shortcuts import CompleteStyle
+from prompt_toolkit.shortcuts import CompleteStyle, choice
+from prompt_toolkit.styles import Style
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -42,6 +43,8 @@ from forge.tools.search import iter_files
 
 PermissionSelector = Callable[[str], str | None]
 ModelSelector = Callable[[str], str | None]
+SessionChoice = tuple[str, str, str]
+SessionSelector = Callable[[tuple[SessionChoice, ...]], str | None]
 ApprovalSelector = Callable[[ToolCall, object], str]
 
 
@@ -143,19 +146,8 @@ class SlashCommandSpec:
 SLASH_COMMANDS = (
     SlashCommandSpec('/context', '/context', '查看当前上下文统计'),
     SlashCommandSpec('/compact', '/compact', '立即压缩当前会话'),
-    SlashCommandSpec('/resume', '/resume', '恢复最近保存的会话'),
-    SlashCommandSpec(
-        '/resume ',
-        '/resume session-id',
-        '恢复指定保存会话',
-    ),
+    SlashCommandSpec('/resume', '/resume', '选择并恢复保存的会话'),
     SlashCommandSpec('/fork', '/fork', '分叉最近保存的会话'),
-    SlashCommandSpec(
-        '/fork ',
-        '/fork session-id',
-        '分叉指定保存会话',
-    ),
-    SlashCommandSpec('/sessions', '/sessions', '列出已保存会话'),
     SlashCommandSpec('/worktrees', '/worktrees', '列出保留的子 Agent worktree'),
     SlashCommandSpec('/mode', '/mode', '查看当前交互模式'),
     SlashCommandSpec(
@@ -167,11 +159,6 @@ SLASH_COMMANDS = (
     SlashCommandSpec('/code', '/code', '切换到代码执行模式'),
     SlashCommandSpec('/model', '/model', '选择当前和全局默认模型'),
     SlashCommandSpec(
-        '/model ',
-        '/model model-id',
-        '直接切换当前和全局默认模型',
-    ),
-    SlashCommandSpec(
         '/permissions',
         '/permissions',
         '打开权限模式内联菜单',
@@ -181,38 +168,7 @@ SLASH_COMMANDS = (
     SlashCommandSpec('/todo', '/todo', '查看当前 TODO 计划'),
     SlashCommandSpec('/exit', '/exit', '退出 ForgeCode'),
     SlashCommandSpec('/task', '/task', '查看当前任务与计划'),
-    SlashCommandSpec('/task history', '/task history', '列出已保存的复杂任务'),
-    SlashCommandSpec(
-        '/task resume ',
-        '/task resume task-id',
-        '恢复一个已保存的复杂任务',
-    ),
-    SlashCommandSpec(
-        '/remember ',
-        '/remember name | content',
-        '保存一条仓库记忆',
-    ),
     SlashCommandSpec('/memory list', '/memory list', '列出仓库记忆'),
-    SlashCommandSpec(
-        '/memory show ',
-        '/memory show name',
-        '查看一条仓库记忆',
-    ),
-    SlashCommandSpec(
-        '/memory forget ',
-        '/memory forget name',
-        '删除一条仓库记忆',
-    ),
-    SlashCommandSpec(
-        '/memory rebuild',
-        '/memory rebuild',
-        '重建记忆索引',
-    ),
-    SlashCommandSpec(
-        '/memory consolidate',
-        '/memory consolidate',
-        '整理重复记忆',
-    ),
 )
 
 
@@ -451,6 +407,7 @@ class TerminalUI:
         workspace_root: Path | None = None,
         permission_selector: PermissionSelector | None = None,
         model_selector: ModelSelector | None = None,
+        session_selector: SessionSelector | None = None,
         approval_selector: ApprovalSelector | None = None,
     ) -> None:
         self.console = (
@@ -463,6 +420,7 @@ class TerminalUI:
         self.prompt_session = prompt_session
         self.permission_selector = permission_selector
         self.model_selector = model_selector
+        self.session_selector = session_selector
         self.approval_selector = approval_selector
         if self.prompt_session is None and self.console.is_terminal:
             self.prompt_session = PromptSession(
@@ -577,6 +535,70 @@ class TerminalUI:
         ).strip()
         if answer.isdigit() and 1 <= int(answer) <= len(MODEL_CHOICES):
             return MODEL_CHOICES[int(answer) - 1][0]
+        return None
+
+    def select_session(
+        self,
+        choices: tuple[SessionChoice, ...],
+    ) -> str | None:
+        '''Open a keyboard-first saved session picker.'''
+        if self.session_selector is not None:
+            return self.session_selector(choices)
+        if not choices:
+            return None
+        if self.console.is_terminal:
+            bindings = KeyBindings()
+
+            @bindings.add('escape')
+            def cancel(event: object) -> None:
+                event.app.exit(result=None)
+
+            style = Style.from_dict(
+                {
+                    'choice.label': '#f5f5f5 bold',
+                    'choice.meta': '#777777',
+                    'bottom-toolbar': 'bg:default #666666',
+                }
+            )
+            options = tuple(
+                (
+                    session_id,
+                    [
+                        ('class:choice.label', label),
+                        ('class:choice.meta', f'  {description}'),
+                    ],
+                )
+                for session_id, label, description in choices
+            )
+            try:
+                return choice(
+                    'Resume \u276f ',
+                    options=options,
+                    default=choices[0][0],
+                    symbol='\u25cf',
+                    show_frame=False,
+                    style=style,
+                    key_bindings=bindings,
+                    bottom_toolbar=(
+                        '\u2191/\u2193 select  Enter confirm  '
+                        'Esc cancel'
+                    ),
+                )
+            except (KeyboardInterrupt, EOFError):
+                return None
+        self.console.print('[bold]ForgeCode Sessions[/]')
+        for index, (session_id, label, description) in enumerate(
+            choices,
+            start=1,
+        ):
+            self.console.print(
+                f'{index}. {label} — {description or session_id}'
+            )
+        answer = self.console.input(
+            f'Select 1-{len(choices)} (blank to cancel): '
+        ).strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(choices):
+            return choices[int(answer) - 1][0]
         return None
 
     def select_tool_approval(
