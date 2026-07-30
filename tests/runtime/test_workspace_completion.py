@@ -14,9 +14,13 @@ from forge.runtime.completion import (
     matches_any,
 )
 from forge.runtime.completion_checker import CompletionChecker
+from forge.runtime.agent_tool_calls import early_mutation_relevance_failure
 from forge.runtime.state import VerificationEvidence
+from forge.runtime.state import ToolCall
+from forge.runtime.task_scope import evaluate_change_relevance, infer_task_scope
 from forge.runtime.workspace import WorkspaceTracker, should_skip_workspace_path
 from forge.tasks.manager import TaskManager
+from forge.tools.filesystem import CreateDirectoryTool
 
 
 def initialize_git_repository(root: Path) -> None:
@@ -143,6 +147,154 @@ def test_path_patterns_match_deep_source_files() -> None:
     assert matches_any('src/todo.ts', ('src/**',))
     assert matches_any('src/main/java/Order.java', ('src/main/**',))
     assert matches_any('tests/hidden/a/b.py', ('tests/hidden/**',))
+
+
+def test_prose_scope_hints_do_not_create_path_constraints() -> None:
+    scope = infer_task_scope(
+        '开始落地实现',
+        scope_hints=(
+            '当前目录为空项目，仅有 task.md',
+            '需要从零创建完整项目',
+        ),
+    )
+
+    assert scope.constrained is False
+    assert scope.patterns == ()
+
+
+def test_explicit_scope_globs_are_preserved() -> None:
+    scope = infer_task_scope(
+        '使用 Phaser 创建游戏',
+        scope_hints=('src/game/**', 'tests/**'),
+    )
+
+    assert 'src/game/**' in scope.patterns
+    assert 'tests/**' in scope.patterns
+    assert evaluate_change_relevance(
+        ('src/game/scenes/MainScene.ts',),
+        scope,
+    ).relevant
+    assert evaluate_change_relevance(
+        ('src/game/entities/Player.ts',),
+        scope,
+    ).relevant
+    assert evaluate_change_relevance(('tests/game.test.ts',), scope).relevant
+
+
+def test_paths_can_be_extracted_from_mixed_scope_hint_text() -> None:
+    scope = infer_task_scope(
+        '实现游戏',
+        scope_hints=('主要修改 src/game/** 和 tests/**',),
+    )
+
+    assert 'src/game/**' in scope.patterns
+    assert 'tests/**' in scope.patterns
+
+
+def test_invalid_scope_hints_leave_scope_unconstrained() -> None:
+    scope = infer_task_scope(
+        '开始落地实现',
+        scope_hints=('需要从零创建完整项目', '../outside', '/tmp/outside'),
+    )
+
+    assert scope.constrained is False
+
+
+def test_game_scaffold_paths_are_allowed_for_game_goal() -> None:
+    scope = infer_task_scope('使用 Phaser 创建游戏')
+    paths = (
+        'package.json',
+        'tsconfig.json',
+        'vite.config.ts',
+        'index.html',
+        'src/game/scenes/MainScene.ts',
+        'src/game/entities/Player.ts',
+        'src/game/systems/CollisionSystem.ts',
+        'src/game/configs/game.ts',
+        'tests/game.test.ts',
+        'public/assets/player.png',
+        'assets/sfx.wav',
+    )
+
+    assert all(
+        evaluate_change_relevance((path,), scope).relevant
+        for path in paths
+    )
+
+
+def test_explicit_allowed_paths_still_restrict_unrelated_targets() -> None:
+    scope = infer_task_scope(
+        '修复 sample.txt',
+        scope_hints=('sample.txt',),
+        scope_hint_source='allowed_path',
+    )
+
+    assert evaluate_change_relevance(('sample.txt',), scope).relevant
+    assert not evaluate_change_relevance(('user.txt',), scope).relevant
+
+
+def test_create_directory_allowed_when_only_scope_hints_are_prose() -> None:
+    scope = infer_task_scope(
+        '开始落地实现',
+        scope_hints=(
+            '当前目录为空项目，仅有 task.md',
+            '需要从零创建完整项目',
+        ),
+    )
+
+    result = early_mutation_relevance_failure(
+        ToolCall(
+            0,
+            'mkdir-scenes',
+            'create_directory',
+            {'path': 'src/game/scenes'},
+        ),
+        tool_effect='workspace_write',
+        change_required=True,
+        task_scope_patterns=scope.patterns,
+        task_scope_sources=scope.source_labels,
+    )
+
+    assert result is None
+
+
+def test_create_directory_rejected_by_real_explicit_scope() -> None:
+    scope = infer_task_scope(
+        '修复 sample.txt',
+        scope_hints=('sample.txt',),
+        scope_hint_source='allowed_path',
+    )
+
+    result = early_mutation_relevance_failure(
+        ToolCall(
+            0,
+            'mkdir-scenes',
+            'create_directory',
+            {'path': 'src/game/scenes'},
+        ),
+        tool_effect='workspace_write',
+        change_required=True,
+        task_scope_patterns=scope.patterns,
+        task_scope_sources=scope.source_labels,
+    )
+
+    assert result is not None
+    assert result.error is not None
+    assert result.error.code == 'irrelevant_mutation_target'
+
+
+def test_create_directory_still_rejects_workspace_escape(
+    tmp_path: Path,
+) -> None:
+    result = run(
+        CreateDirectoryTool(tmp_path).run(
+            {'path': '../outside-forge-test', 'parents': True}
+        )
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'path_outside_repository'
 
 
 def test_workspace_tracker_detects_untracked_files_and_reverts(

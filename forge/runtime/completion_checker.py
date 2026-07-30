@@ -11,6 +11,7 @@ from forge.runtime.completion import CompletionDecision, CompletionGate
 from forge.runtime.intent import TaskContract
 from forge.runtime.state import ToolCall, VerificationEvidence
 from forge.runtime.task_scope import (
+    TaskScope,
     evaluate_change_relevance,
     infer_task_scope,
 )
@@ -319,14 +320,21 @@ class CompletionChecker:
         *,
         evidence_paths: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
+        return self.task_scope(evidence_paths=evidence_paths).patterns
+
+    def task_scope(
+        self,
+        *,
+        evidence_paths: tuple[str, ...] = (),
+    ) -> TaskScope:
         task = self.task_manager.active
         if task is None:
-            return ()
+            return TaskScope()
         return infer_task_scope(
             task.goal,
             evidence_paths=evidence_paths,
             scope_hints=task.scope_hints,
-        ).patterns
+        )
 
     def _with_relevance_reasons(
         self,

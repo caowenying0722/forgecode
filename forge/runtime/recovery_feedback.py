@@ -150,6 +150,7 @@ def mutation_failure_record(
             + diagnostic[-1_000:]
         )
     repair_target = repair_target_from_tool_failure(tool_call, result)
+    details = result.error.details if result.error is not None else {}
     return {
         'tool': tool_call.name,
         'code': error_code,
@@ -157,7 +158,43 @@ def mutation_failure_record(
         'targets': list(mutation_target_paths(tool_call)[:5]),
         'diagnostic': diagnostic,
         'repair_target': repair_target,
+        'task_scope_patterns': list(details.get('task_scope_patterns', [])),
+        'scope_sources': list(details.get('scope_sources', [])),
+        'reasons': list(details.get('reasons', [])),
     }
+
+
+def mutation_failure_attempt_count(
+    failures: list[tuple[ToolCall, ToolResult]],
+) -> int:
+    '''Count one batch of write failures without overcounting one root cause.'''
+    signatures = {
+        mutation_failure_signature(tool_call, result)
+        for tool_call, result in failures
+    }
+    return len(signatures)
+
+
+def mutation_failure_signature(
+    tool_call: ToolCall,
+    result: ToolResult,
+) -> tuple[Any, ...]:
+    code = result.error.code if result.error is not None else 'no_workspace_change'
+    if code == 'irrelevant_mutation_target':
+        details = result.error.details if result.error is not None else {}
+        return (
+            code,
+            'static_task_scope',
+            tuple(details.get('task_scope_patterns', ())),
+            tuple(details.get('scope_sources', ())),
+        )
+    return (
+        code,
+        'workspace_write',
+        tool_call.id,
+        tool_call.name,
+        tuple(mutation_target_paths(tool_call)),
+    )
 
 
 def render_mutation_recovery_context(
@@ -177,6 +214,37 @@ def render_mutation_recovery_context(
         diagnostic = str(failure.get('diagnostic', '')).strip()
         if diagnostic:
             lines.append(f'  diagnostic: {diagnostic}')
+        if failure['code'] == 'irrelevant_mutation_target':
+            patterns = [
+                str(item)
+                for item in failure.get('task_scope_patterns', [])
+                if str(item).strip()
+            ]
+            sources = [
+                str(item)
+                for item in failure.get('scope_sources', [])
+                if str(item).strip()
+            ]
+            reasons = [
+                str(item)
+                for item in failure.get('reasons', [])
+                if str(item).strip()
+            ]
+            lines.append('  rejected target:')
+            for target in failure.get('targets', [])[:5]:
+                lines.append(f'  - {target}')
+            if patterns:
+                lines.append('  current inferred scope patterns:')
+                for pattern in patterns[:12]:
+                    lines.append(f'  - {pattern}')
+            if sources:
+                lines.append('  scope source:')
+                for source in sources:
+                    lines.append(f'  - {source}')
+            if reasons:
+                lines.append('  scope relevance reason:')
+                for reason in reasons[:3]:
+                    lines.append(f'  - {reason}')
         target_context = render_repair_target_context(
             failure.get('repair_target')
         )

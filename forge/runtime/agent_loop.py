@@ -86,6 +86,7 @@ from forge.runtime.recovery_feedback import (
     build_stagnation_feedback,
     build_stagnation_final_recovery_feedback,
     build_token_limit_recovery_feedback,
+    mutation_failure_attempt_count,
     mutation_failure_record,
     mutation_recovery_stuck_reason,
     render_mutation_recovery_context,
@@ -1658,13 +1659,13 @@ class Conversation:
                     signature,
                     (0, True),
                 )
+                static_task_scope = self._static_task_scope(task_contract)
                 early_relevance_failure = early_mutation_relevance_failure(
                     tool_call,
                     tool_effect=tool_effect,
                     change_required=change_required,
-                    task_scope_patterns=(
-                        self._static_task_scope_patterns(task_contract)
-                    ),
+                    task_scope_patterns=static_task_scope.patterns,
+                    task_scope_sources=static_task_scope.source_labels,
                 )
                 semantic_repeat = self.working_state.preflight(
                     tool_call,
@@ -2314,7 +2315,9 @@ class Conversation:
             )
             if pending_write_results:
                 edit_recovery.read_used = False
-                edit_recovery.failure_count += len(pending_write_results)
+                edit_recovery.failure_count += mutation_failure_attempt_count(
+                    pending_write_results
+                )
                 for failed_call, failed_result in pending_write_results:
                     edit_recovery.failures.append(
                         mutation_failure_record(
@@ -2972,15 +2975,20 @@ class Conversation:
         self,
         contract: TaskContract,
     ) -> tuple[str, ...]:
-        patterns = self.completion_checker.task_scope_patterns(
-            evidence_paths=(),
-        )
-        if patterns:
-            return patterns
+        return self._static_task_scope(contract).patterns
+
+    def _static_task_scope(
+        self,
+        contract: TaskContract,
+    ) -> TaskScope:
+        scope = self.completion_checker.task_scope(evidence_paths=())
+        if scope.constrained:
+            return scope
         return infer_task_scope(
             contract.goal,
             scope_hints=contract.allowed_paths,
-        ).patterns
+            scope_hint_source='allowed_path',
+        )
 
     async def compact(self) -> CompactionReport:
         '''Manually summarize committed history for the /compact command.'''

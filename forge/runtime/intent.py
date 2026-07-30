@@ -153,6 +153,36 @@ _START_TASK_WORK_ZH = re.compile(
     r'.{0,30}(?:后|并|然后|开始).{0,20}'
     r'(?:开始工作|开始实现|执行|实施|实现|落地|完成)'
 )
+_TASK_DOC_REF_ZH = re.compile(
+    r'(?:阅读|读取|查看|明确|理解|分析|先看看|按照|按|根据|严格按照)'
+    r'.{0,80}(?:task\.md|任务文档|需求文档|任务|需求|说明)'
+    r'|(?:task\.md|任务文档|需求文档)'
+)
+_TASK_DOC_CHANGE_ACTION_ZH = re.compile(
+    rf'(?:{_CHANGE_VERBS_ZH}|开始工作|开始实现)'
+)
+_TASK_DOC_ADVISORY_ZH = re.compile(
+    r'(?:总结|告诉我|怎么|如何|应该怎么|方案|建议|计划|规划|清单|'
+    r'我再决定|稍后再决定|先看看|先看一下|给出.{0,20}(?:方案|建议|计划)|'
+    r'实现方案|不要修改|不修改|无需修改|不用修改|不要写|不用写)'
+)
+_TASK_DOC_REF_EN = re.compile(
+    r'\b(?:read|inspect|review|understand|according to|based on)\b'
+    r'.{0,80}\b(?:task\.md|requirements?\.md|spec|requirements?)\b|'
+    r'\b(?:task\.md|requirements?\.md)\b',
+    re.IGNORECASE,
+)
+_TASK_DOC_CHANGE_ACTION_EN = re.compile(
+    r'\b(?:implement|build|create|write|complete|develop|apply|execute|'
+    r'start|continue)\b',
+    re.IGNORECASE,
+)
+_TASK_DOC_ADVISORY_EN = re.compile(
+    r'\b(?:summari[sz]e|tell me|how|what|proposal|suggestion|plan|'
+    r'advice|checklist|do not|don.t|without editing|no need to edit|'
+    r'decide later)\b',
+    re.IGNORECASE,
+)
 _AMBIGUOUS_FOLLOWUP_ZH = re.compile(
     r'^\s*(?:可以|好|好的|行|那就)?[，,、\s]*'
     r'(?:开始吧|开始|继续|继续吧|按刚才说的做|按刚才说的来)'
@@ -296,6 +326,8 @@ def infer_change_required(prompt: str) -> bool:
         or _AMBIGUOUS_FOLLOWUP_EN.search(text)
     ):
         return False
+    if _prompt_level_task_document_change(text):
+        return True
     clauses = [
         clause.strip()
         for part in _CLAUSE_SPLIT_ZH.split(text)
@@ -330,6 +362,23 @@ def infer_change_required(prompt: str) -> bool:
         ):
             return True
     return False
+
+
+def _prompt_level_task_document_change(text: str) -> bool:
+    '''Catch "read the task spec, then implement it" before clause splitting.'''
+    if _NEGATED_CHANGE_ZH.search(text) or _NEGATED_CHANGE_EN.search(text):
+        return False
+    if _TASK_DOC_ADVISORY_ZH.search(text) or _TASK_DOC_ADVISORY_EN.search(text):
+        return False
+    has_doc_reference = bool(
+        _TASK_DOC_REF_ZH.search(text) or _TASK_DOC_REF_EN.search(text)
+    )
+    if not has_doc_reference:
+        return False
+    return bool(
+        _TASK_DOC_CHANGE_ACTION_ZH.search(text)
+        or _TASK_DOC_CHANGE_ACTION_EN.search(text)
+    )
 
 
 def infer_task_contract(
@@ -574,6 +623,11 @@ def _task_contract(
 ) -> TaskContract:
     goal = prompt.strip()
     paths = _extract_path_hints(goal)
+    allowed_paths = _allowed_paths_for_goal(
+        goal,
+        paths,
+        requires_change=requires_change,
+    )
     verification = _verification_policy(
         completion_contract,
         requires_change=requires_change,
@@ -600,7 +654,7 @@ def _task_contract(
         current_priority='Create a plan before implementation.'
         if requires_plan
         else ('Modify the requested workspace target.' if requires_change else ''),
-        allowed_paths=paths,
+        allowed_paths=allowed_paths,
         forbidden_paths=(),
         verification_policy=verification,
         model_budget=ModelBudget(
@@ -622,6 +676,25 @@ def _extract_path_hints(prompt: str) -> tuple[str, ...]:
         if path not in paths:
             paths.append(path)
     return tuple(paths)
+
+
+def _allowed_paths_for_goal(
+    goal: str,
+    paths: tuple[str, ...],
+    *,
+    requires_change: bool,
+) -> tuple[str, ...]:
+    if not requires_change:
+        return paths
+    if not paths:
+        return ()
+    if _prompt_level_task_document_change(goal):
+        return tuple(
+            path
+            for path in paths
+            if not path.casefold().endswith(('.md', '.markdown'))
+        )
+    return paths
 
 
 def _requires_structured_plan(prompt: str) -> bool:

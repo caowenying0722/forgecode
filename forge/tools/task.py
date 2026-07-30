@@ -12,6 +12,7 @@ from forge.runtime.acceptance import (
     AcceptanceLedger,
     evidence_from_payload,
 )
+from forge.runtime.task_scope import scope_patterns_from_hints
 from forge.tasks.manager import TaskManager
 from forge.tools.base import Tool, ToolExecutionError, ToolInput, ToolResult
 
@@ -53,7 +54,15 @@ class TaskPlanStepInput(BaseModel):
 class TaskPlanInput(ToolInput):
     steps: list[str | TaskPlanStepInput] = Field(min_length=2, max_length=20)
     constraints: list[str] = Field(default_factory=list, max_length=20)
-    scope_hints: list[str] = Field(default_factory=list, max_length=20)
+    scope_hints: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            'Optional workspace-relative path or glob hints only. Examples: '
+            'src/**, tests/**, package.json. Do not put prose or task '
+            'descriptions here.'
+        ),
+    )
     replace: bool = False
 
 
@@ -78,11 +87,17 @@ class TaskPlanTool(Tool[TaskPlanInput]):
         titles, step_deliverables, step_criterion_ids = _plan_step_links(
             arguments.steps
         )
+        scope_patterns = scope_patterns_from_hints(tuple(arguments.scope_hints))
+        ignored_scope_hints = [
+            value
+            for value in arguments.scope_hints
+            if not scope_patterns_from_hints((value,))
+        ]
         try:
             task = self.manager.plan(
                 titles,
                 constraints=arguments.constraints,
-                scope_hints=arguments.scope_hints,
+                scope_hints=list(scope_patterns),
                 step_deliverables=step_deliverables,
                 step_criterion_ids=step_criterion_ids,
                 replace_existing=arguments.replace,
@@ -95,6 +110,7 @@ class TaskPlanTool(Tool[TaskPlanInput]):
             metadata={
                 'task_id': task.id,
                 'step_count': len(task.steps),
+                'ignored_scope_hints': ignored_scope_hints,
                 'step_criterion_ids': {
                     step.id: list(step.criterion_ids)
                     for step in task.steps

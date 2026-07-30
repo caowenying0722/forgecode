@@ -31,6 +31,7 @@ def early_mutation_relevance_failure(
     tool_effect: str | None,
     change_required: bool,
     task_scope_patterns: tuple[str, ...],
+    task_scope_sources: tuple[str, ...] = (),
 ) -> ToolResult | None:
     '''Block statically obvious off-goal workspace edits before execution.'''
     if (
@@ -59,6 +60,7 @@ def early_mutation_relevance_failure(
         details={
             'targets': list(targets),
             'task_scope_patterns': list(task_scope_patterns[:16]),
+            'scope_sources': list(task_scope_sources),
             'reasons': list(relevance.reasons),
         },
         metadata={'irrelevant_mutation_target': True},

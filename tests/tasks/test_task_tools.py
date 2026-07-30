@@ -42,6 +42,34 @@ def test_task_tools_create_and_advance_persistent_plan(
     assert manager.store.current_path.exists()
 
 
+def test_task_plan_ignores_prose_scope_hints(tmp_path: Path) -> None:
+    manager = TaskManager(tmp_path)
+    manager.start('开始落地实现')
+    registry = ToolRegistry(create_task_tools(tmp_path, manager))
+
+    result = asyncio.run(
+        registry.execute(
+            'task_plan',
+            {
+                'steps': ['初始化项目', '实现功能'],
+                'scope_hints': [
+                    '当前目录为空项目，仅有 task.md',
+                    '需要从零创建完整项目',
+                    '主要修改 src/game/** 和 tests/**',
+                ],
+            },
+        )
+    )
+
+    assert result.success is True
+    assert manager.active is not None
+    assert manager.active.scope_hints == ('src/game/**', 'tests/**')
+    assert result.metadata['ignored_scope_hints'] == [
+        '当前目录为空项目，仅有 task.md',
+        '需要从零创建完整项目',
+    ]
+
+
 def test_task_plan_rejects_simple_one_step_plan(tmp_path: Path) -> None:
     manager = TaskManager(tmp_path)
     manager.start('Read one file')

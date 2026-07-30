@@ -93,6 +93,69 @@ def test_auto_fix_prompt_creates_change_contract() -> None:
     assert contract.initial_tool_surface == 'all'
 
 
+@pytest.mark.parametrize(
+    'prompt',
+    [
+        '@task.md 阅读任务文档，在当前目录下实现',
+        '阅读 task.md，在当前项目实现',
+        '查看需求文档，完成其中要求',
+        '阅读说明并开始落地',
+        '先查看 task.md，然后创建完整项目',
+    ],
+)
+def test_read_task_document_then_implement_is_change_intent(
+    prompt: str,
+) -> None:
+    contract = infer_task_contract(prompt, workspace_available=True)
+
+    assert contract.requires_change is True
+    assert contract.completion_contract == 'change'
+    assert contract.initial_tool_surface == 'all'
+
+
+def test_read_task_document_in_current_directory_is_change_intent() -> None:
+    contract = infer_task_contract(
+        '@task.md 阅读任务文档，在当前目录下实现',
+        workspace_available=True,
+    )
+
+    assert contract.requires_change is True
+    assert contract.initial_tool_surface == 'all'
+    assert contract.allowed_paths == ()
+    assert contract.context_hints == ('task.md',)
+
+
+def test_read_task_document_and_summarize_remains_inspection() -> None:
+    contract = infer_task_contract(
+        '阅读 task.md 并总结',
+        workspace_available=True,
+    )
+
+    assert contract.requires_change is False
+    assert contract.initial_tool_surface == 'read_only'
+
+
+def test_task_document_implementation_plan_remains_advisory() -> None:
+    contract = infer_task_contract(
+        '阅读任务文档并给出实现方案',
+        workspace_available=True,
+    )
+
+    assert contract.requires_change is False
+    assert contract.requires_plan is True
+    assert contract.initial_tool_surface == 'read_only'
+
+
+def test_negated_task_document_change_remains_read_only() -> None:
+    contract = infer_task_contract(
+        '阅读 task.md，不要修改文件',
+        workspace_available=True,
+    )
+
+    assert contract.requires_change is False
+    assert contract.initial_tool_surface == 'read_only'
+
+
 def test_plan_prompt_creates_read_only_contract() -> None:
     contract = infer_task_contract(
         '给出一个修复方案，我再决定是否执行',

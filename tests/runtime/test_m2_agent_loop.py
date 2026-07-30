@@ -1651,6 +1651,330 @@ def test_empty_directory_scaffold_does_not_trigger_edit_recovery(
     assert 'no_workspace_change' not in failures
 
 
+def test_identical_batch_scope_failures_consume_one_recovery_attempt(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    directories = tuple(
+        ToolCall(
+            index,
+            f'off-scope-directory-{index}',
+            'create_directory',
+            {'path': path},
+        )
+        for index, path in enumerate(
+            (
+                'src/game/scenes',
+                'src/game/entities',
+                'src/game/systems',
+                'src/game/configs',
+                'tests',
+            )
+        )
+    )
+    edit = ToolCall(
+        0,
+        'recover-edit-sample',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'verify-recovered-edit',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    client = FakeModelClient(
+        response_with_tools(*directories),
+        response_with_tool(edit),
+        response_with_tool(verify),
+        finish_response(
+            'finish-recovered-edit',
+            task_kind='change',
+            summary='Recovered with a scoped edit.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        mutation_recovery_limit=5,
+    )
+
+    events = collect_turn(conversation, '修复 sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert '[Failed Mutation Recovery]' in client.calls[1]['system']
+    assert 'failed workspace writes: 1' in client.calls[1]['system']
+    assert 'current inferred scope patterns:' in client.calls[1]['system']
+    assert 'scope source:' in client.calls[1]['system']
+    assert 'irrelevant_mutation_target' in {
+        event.result.error.code
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.result.error is not None
+    }
+
+
+def test_distinct_workspace_write_failures_still_accumulate(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    failed_edits = (
+        ToolCall(
+            0,
+            'first-missing-text',
+            'replace_text',
+            {
+                'path': 'sample.txt',
+                'old_text': 'missing-one\n',
+                'new_text': 'one\n',
+            },
+        ),
+        ToolCall(
+            1,
+            'second-missing-text',
+            'replace_text',
+            {
+                'path': 'sample.txt',
+                'old_text': 'missing-two\n',
+                'new_text': 'two\n',
+            },
+        ),
+    )
+    client = FakeModelClient(response_with_tools(*failed_edits))
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        mutation_recovery_limit=2,
+    )
+
+    events = collect_turn(conversation, '修复 sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'stuck'
+    assert '2 workspace-write attempt(s)' in completed.result.text
+
+
+def test_task_document_initial_request_includes_write_tools(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(['git', 'init', '--quiet'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'forge@example.test'],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'ForgeCode Tests'],
+        cwd=tmp_path,
+        check=True,
+    )
+    (tmp_path / 'task.md').write_text('Create a tiny project.\n', encoding='utf-8')
+    subprocess.run(['git', 'add', '.'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'task spec'],
+        cwd=tmp_path,
+        check=True,
+    )
+    client = FakeModelClient(
+        response_with_tool(
+            ToolCall(0, 'read-task-spec', 'read_file', {'path': 'task.md'})
+        ),
+        response_with_tool(
+            ToolCall(
+                0,
+                'write-project-file',
+                'write_file',
+                {'path': 'package.json', 'content': '{"scripts":{}}\n'},
+            )
+        ),
+        response_with_tool(
+            ToolCall(
+                0,
+                'verify-project-file',
+                'verify',
+                {'command': 'git diff --check'},
+            )
+        ),
+        finish_response(
+            'finish-project-file',
+            task_kind='change',
+            summary='Created project metadata.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(
+        conversation,
+        '@task.md 阅读任务文档，在当前目录下实现',
+    )
+
+    first_tools = {str(tool.get('name')) for tool in client.calls[0]['tools'] or ()}
+    completed = events[-1]
+    assert 'read_file' in first_tools
+    assert 'write_file' in first_tools
+    assert 'create_directory' in first_tools
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+
+
+def test_task_document_followup_can_scaffold_new_project(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(['git', 'init', '--quiet'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'forge@example.test'],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'ForgeCode Tests'],
+        cwd=tmp_path,
+        check=True,
+    )
+    (tmp_path / 'task.md').write_text(
+        'Create a Phaser-style game scaffold.\n',
+        encoding='utf-8',
+    )
+    subprocess.run(['git', 'add', '.'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'task spec'],
+        cwd=tmp_path,
+        check=True,
+    )
+    directories = tuple(
+        ToolCall(
+            index + 1,
+            f'followup-directory-{index}',
+            'create_directory',
+            {'path': path},
+        )
+        for index, path in enumerate(
+            (
+                'src/game/scenes',
+                'src/game/entities',
+                'src/game/systems',
+                'src/game/configs',
+                'tests',
+            )
+        )
+    )
+    client = FakeModelClient(
+        response_with_tool(
+            ToolCall(0, 'read-task-followup', 'read_file', {'path': 'task.md'})
+        ),
+        finish_response(
+            'finish-read-task-followup',
+            task_kind='inspection',
+            summary='Read task.md; it requires creating a game scaffold.',
+        ),
+        response_with_tools(
+            ToolCall(
+                0,
+                'plan-followup-scaffold',
+                'task_plan',
+                {
+                    'replace': True,
+                    'steps': [
+                        '初始化项目骨架与构建配置',
+                        '实现游戏场景',
+                        '实现实体和系统',
+                        '补充测试',
+                        '运行验证',
+                    ],
+                    'scope_hints': [
+                        '当前目录为空项目，仅有 task.md',
+                        '需要从零创建完整项目',
+                    ],
+                },
+            ),
+            *directories,
+        ),
+        response_with_tool(
+            ToolCall(
+                0,
+                'write-followup-readme',
+                'write_file',
+                {
+                    'path': 'src/game/scenes/README.txt',
+                    'content': 'game scenes\n',
+                },
+            )
+        ),
+        response_with_tool(
+            ToolCall(
+                0,
+                'verify-followup-scaffold',
+                'verify',
+                {'command': 'git diff --check'},
+            )
+        ),
+        response_with_tools(
+            *(
+                ToolCall(
+                    index,
+                    f'complete-followup-step-{index}',
+                    'task_update',
+                    {
+                        'step_id': f'step-{index}',
+                        'status': 'completed',
+                        'evidence': ['Created scaffold source paths.'],
+                        'evidence_paths': ['src/game/scenes/README.txt'],
+                    },
+                )
+                for index in range(1, 6)
+            )
+        ),
+        finish_response(
+            'finish-followup-scaffold',
+            task_kind='change',
+            summary='Created scaffold directories and a scene file.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    first_events = collect_turn(
+        conversation,
+        '阅读 task.md 并总结',
+    )
+    second_events = collect_turn(
+        conversation,
+        '开始落地实现，严格按照我刚刚给你的任务文档',
+    )
+
+    first_completed = first_events[-1]
+    second_completed = second_events[-1]
+    assert isinstance(first_completed, TurnCompleted)
+    assert first_completed.result.status == 'completed'
+    assert isinstance(second_completed, TurnCompleted)
+    assert second_completed.result.status == 'completed'
+    assert (tmp_path / 'src' / 'game' / 'scenes').is_dir()
+    assert (tmp_path / 'src' / 'game' / 'entities').is_dir()
+    assert (tmp_path / 'src' / 'game' / 'systems').is_dir()
+    assert (tmp_path / 'src' / 'game' / 'configs').is_dir()
+    assert (tmp_path / 'tests').is_dir()
+    assert (tmp_path / 'src' / 'game' / 'scenes' / 'README.txt').is_file()
+    assert 'irrelevant_mutation_target' not in {
+        event.result.error.code
+        for event in second_events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.result.error is not None
+    }
+
+
 def test_existing_directory_scaffold_is_safe_to_resume(
     tmp_path: Path,
 ) -> None:
