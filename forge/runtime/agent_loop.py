@@ -126,6 +126,11 @@ from forge.runtime.state import (
     VerificationEvidence,
     WorkspaceChanged,
 )
+from forge.runtime.synthesis_evidence import (
+    CompletionEvidence,
+    answer_mentions_completion_evidence,
+    build_completion_fallback_summary,
+)
 from forge.runtime.task_scope import (
     TaskScope,
     evaluate_change_relevance,
@@ -1196,9 +1201,93 @@ class Conversation:
                         )
                     )
                     continue
-                if (
-                    synthesis_state.mode is not SynthesisMode.NORMAL
-                    and self.working_state.evidence_paths
+                if synthesis_state.mode is SynthesisMode.FINALIZATION:
+                    completion_evidence = _completion_evidence(
+                        self.workspace_tracker,
+                        verification_state.latest,
+                        self.working_state,
+                    )
+                    if (
+                        completion_evidence.has_authoritative_items
+                        and not answer_mentions_completion_evidence(
+                            complete_text,
+                            completion_evidence,
+                        )
+                    ):
+                        synthesis_state.retries += 1
+                        reason = (
+                            'The synthesis did not reference authoritative '
+                            'completion evidence.'
+                        )
+                        if synthesis_state.retries <= 1:
+                            request_messages.append(
+                                build_synthesis_retry_feedback(
+                                    self.task_manager.system_suffix(),
+                                    self.working_state.system_suffix(),
+                                    completion_evidence=completion_evidence,
+                                )
+                            )
+                            continue
+                        decision = await self.completion_checker.evaluate(
+                            verification_state.latest,
+                            mutation_attempted=True,
+                            reviewed_paths=completion_state.reviewed_paths,
+                            evidence_paths=self.working_state.evidence_paths,
+                        )
+                        if not decision.allowed:
+                            reasons = (reason, *decision.reasons)
+                            self.task_manager.stuck(reasons)
+                            self.messages[:] = request_messages
+                            yield TurnCompleted(
+                                result=TurnResult(
+                                    text=complete_text,
+                                    usage=completed_usage,
+                                    last_request_usage=request_usage,
+                                    model_calls=iteration,
+                                    tool_calls=tuple(all_tool_calls),
+                                    status='stuck',
+                                    changed_paths=(
+                                        self.workspace_tracker.changed_paths
+                                        if self.workspace_tracker is not None
+                                        else ()
+                                    ),
+                                    verification=verification_state.latest,
+                                    completion_reasons=reasons,
+                                )
+                            )
+                            return
+                        complete_text = build_completion_fallback_summary(
+                            completion_evidence
+                        )
+                        request_messages[-1] = {
+                            'role': 'assistant',
+                            'content': complete_text,
+                        }
+                        self.task_manager.complete()
+                        self.messages[:] = request_messages
+                        self.context.capture_explicit_memory(prompt)
+                        yield TurnCompleted(
+                            result=TurnResult(
+                                text=complete_text,
+                                usage=completed_usage,
+                                last_request_usage=request_usage,
+                                model_calls=iteration,
+                                tool_calls=tuple(all_tool_calls),
+                                changed_paths=(
+                                    self.workspace_tracker.changed_paths
+                                    if self.workspace_tracker is not None
+                                    else ()
+                                ),
+                                verification=verification_state.latest,
+                            )
+                        )
+                        return
+                elif (
+                    _requires_repository_synthesis_evidence(
+                        task_contract,
+                        synthesis_state.mode,
+                        self.working_state.evidence_paths,
+                    )
                     and not self.working_state.answer_mentions_evidence(
                         complete_text
                     )
@@ -1213,6 +1302,9 @@ class Conversation:
                             build_synthesis_retry_feedback(
                                 self.task_manager.system_suffix(),
                                 self.working_state.system_suffix(),
+                                repository_paths=(
+                                    self.working_state.evidence_paths
+                                ),
                             )
                         )
                         continue
@@ -3251,6 +3343,35 @@ def _verification_error_count(
         counted = text.casefold().count('error')
         return counted if counted > 0 else 1
     return 1
+
+
+def _completion_evidence(
+    tracker: WorkspaceTracker | None,
+    verification: VerificationEvidence | None,
+    working_state: WorkingState,
+) -> CompletionEvidence:
+    return CompletionEvidence.from_runtime(
+        changed_paths=(
+            tracker.changed_paths if tracker is not None else ()
+        ),
+        verification=verification,
+        repository_paths=working_state.evidence_paths,
+    )
+
+
+def _requires_repository_synthesis_evidence(
+    contract: TaskContract,
+    synthesis_mode: SynthesisMode,
+    evidence_paths: tuple[str, ...],
+) -> bool:
+    if not evidence_paths:
+        return False
+    if contract.kind == 'inspect':
+        return True
+    return synthesis_mode in {
+        SynthesisMode.CHECKPOINT,
+        SynthesisMode.STAGNATION_FINAL,
+    }
 
 
 def _paths_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:

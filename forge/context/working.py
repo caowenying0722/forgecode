@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
+import re
 from typing import Any
 
 from forge.runtime.paths import normalize_workspace_path
@@ -346,12 +347,7 @@ class WorkingState:
         return self.latest_failure_code in self.EXTERNAL_BLOCKER_CODES
 
     def answer_mentions_evidence(self, text: str) -> bool:
-        normalized = text.casefold()
-        return any(
-            candidate and candidate in normalized
-            for path in self.evidence_paths
-            for candidate in evidence_names(path)
-        )
+        return answer_mentions_any_path(text, self.evidence_paths)
 
     def _observe_read(
         self,
@@ -460,11 +456,32 @@ class WorkingState:
 
 
 def evidence_names(path: str) -> tuple[str, ...]:
-    item = PurePosixPath(path)
+    normalized_path = normalize_workspace_path(path)
+    item = PurePosixPath(normalized_path)
     return tuple(
         dict.fromkeys(
             value.casefold()
-            for value in (path, item.name, item.stem)
+            for value in (normalized_path, item.name)
             if value and value != '.'
         )
     )
+
+
+def answer_mentions_any_path(text: str, paths: tuple[str, ...]) -> bool:
+    normalized_text = text.replace('\\', '/').casefold()
+    return any(
+        _contains_path_candidate(normalized_text, candidate)
+        for path in paths
+        for candidate in evidence_names(path)
+    )
+
+
+def _contains_path_candidate(normalized_text: str, candidate: str) -> bool:
+    if not candidate:
+        return False
+    pattern = (
+        r'(?<![a-z0-9_./-])'
+        + re.escape(candidate)
+        + r'(?![a-z0-9_/-])'
+    )
+    return re.search(pattern, normalized_text) is not None

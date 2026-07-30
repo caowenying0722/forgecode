@@ -155,6 +155,63 @@ def test_working_evidence_is_small_and_answer_check_uses_paths() -> None:
     assert not state.answer_mentions_evidence('I am ForgeCode.')
 
 
+def test_evidence_match_accepts_exact_path() -> None:
+    state = WorkingState()
+    state.files[(0, 'src/main.js')] = FileEvidence(
+        path='src/main.js',
+        revision=0,
+        total_lines=1,
+        covered_ranges=[(1, 1)],
+    )
+
+    assert state.answer_mentions_evidence('Updated src/main.js.')
+
+
+def test_evidence_match_accepts_basename() -> None:
+    state = WorkingState()
+    state.files[(0, 'src/main.js')] = FileEvidence(
+        path='src/main.js',
+        revision=0,
+        total_lines=1,
+        covered_ranges=[(1, 1)],
+    )
+
+    assert state.answer_mentions_evidence('Updated main.js.')
+
+
+def test_evidence_match_rejects_incidental_stem_substring() -> None:
+    state = WorkingState()
+    state.files[(0, 'src/main.js')] = FileEvidence(
+        path='src/main.js',
+        revision=0,
+        total_lines=1,
+        covered_ranges=[(1, 1)],
+    )
+
+    assert not state.answer_mentions_evidence('The main issue is validation.')
+
+
+def test_short_file_stem_does_not_false_positive() -> None:
+    state = WorkingState()
+    state.files[(0, 'src/a.py')] = FileEvidence(
+        path='src/a.py',
+        revision=0,
+        total_lines=1,
+        covered_ranges=[(1, 1)],
+    )
+    state.files[(0, 'src/x.ts')] = FileEvidence(
+        path='src/x.ts',
+        revision=0,
+        total_lines=1,
+        covered_ranges=[(1, 1)],
+    )
+
+    assert not state.answer_mentions_evidence('A fix exists in the code.')
+    assert not state.answer_mentions_evidence('X marks the failing branch.')
+    assert state.answer_mentions_evidence('Updated a.py.')
+    assert state.answer_mentions_evidence('Updated src/x.ts.')
+
+
 def test_working_evidence_suffix_is_bounded() -> None:
     state = WorkingState()
     for index in range(75):

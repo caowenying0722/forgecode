@@ -123,6 +123,18 @@ class CompletionChecker:
                 'An inspection task requires repository evidence from '
                 'read_file, list_directory, grep, or find_files.'
             )
+        if (
+            task_kind == 'inspection'
+            and working_state.evidence_paths
+            and not working_state.answer_mentions_evidence(
+                str(metadata.get('summary', ''))
+            )
+        ):
+            reasons.append(
+                'An inspection completion must reference collected repository '
+                'evidence. Mention at least one of: '
+                + ', '.join(working_state.evidence_paths[:10])
+            )
         if task_kind != 'change' and changed_paths:
             reasons.append(
                 'The workspace changed during this turn; declare '

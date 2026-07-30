@@ -6,6 +6,11 @@ from typing import Any
 
 from forge.runtime.model_client import ModelProtocolError
 from forge.runtime.state import ToolCall
+from forge.runtime.synthesis_evidence import (
+    CompletionEvidence,
+    render_completion_evidence_requirements,
+    render_repository_evidence_requirements,
+)
 from forge.tools.base import ToolResult
 
 
@@ -45,16 +50,35 @@ def build_tool_protocol_feedback(
 def build_synthesis_retry_feedback(
     task_context: str,
     working_context: str,
+    *,
+    completion_evidence: CompletionEvidence | None = None,
+    repository_paths: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    if completion_evidence is not None:
+        requirements = render_completion_evidence_requirements(
+            completion_evidence
+        )
+        message = (
+            'The previous final summary did not reference the authoritative '
+            'completion evidence.\n\n'
+            f'{requirements}\n\n'
+            'Do not request another tool call.'
+        )
+    else:
+        requirements = render_repository_evidence_requirements(
+            repository_paths
+        )
+        message = (
+            'ForgeCode rejected the previous synthesis because it did not '
+            'reference collected repository evidence.\n\n'
+            f'{requirements}\n\n'
+            'All tools remain available. Answer the current goal using the '
+            'working evidence, or gather genuinely missing evidence before '
+            'answering.'
+        )
     return {
         'role': 'user',
-        'content': (
-            f'{task_context}\n\n{working_context}\n\n'
-            'ForgeCode rejected the previous synthesis because it did not '
-            'reference collected repository evidence. All tools remain '
-            'available. Answer the current goal using the working evidence, '
-            'or gather genuinely missing evidence before answering.'
-        ),
+        'content': f'{task_context}\n\n{working_context}\n\n{message}',
     }
 
 

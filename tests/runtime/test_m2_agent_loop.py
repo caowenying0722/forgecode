@@ -2973,6 +2973,176 @@ def test_verified_change_stagnation_allows_final_summary_recovery(
     )
 
 
+def test_change_finalization_accepts_changed_paths_and_verification(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(['git', 'init', '--quiet'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'forge@example.test'],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'ForgeCode Tests'],
+        cwd=tmp_path,
+        check=True,
+    )
+    (tmp_path / 'index.html').write_text(
+        '<!doctype html><link rel="stylesheet" href="style.css">\n',
+        encoding='utf-8',
+    )
+    subprocess.run(['git', 'add', '.'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'baseline'],
+        cwd=tmp_path,
+        check=True,
+    )
+    read = ToolCall(0, 'read-index', 'read_file', {'path': 'index.html'})
+    write_css = ToolCall(
+        0,
+        'write-css',
+        'write_file',
+        {'path': 'style.css', 'content': 'body { color: #111; }\n'},
+    )
+    write_js = ToolCall(
+        1,
+        'write-js',
+        'write_file',
+        {'path': 'main.js', 'content': 'console.log("ready");\n'},
+    )
+    verify = ToolCall(
+        0,
+        'style-main-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    summary = (
+        '已创建 style.css 和 main.js。已运行 git diff --check，退出码为 0。'
+        '尚未进行浏览器视觉和运行时交互测试。'
+    )
+    client = FakeModelClient(
+        response_with_tool(read),
+        response_with_tools(write_css, write_js),
+        response_with_tool(verify),
+        text_response(summary),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
+    )
+
+    events = collect_turn(
+        conversation,
+        'Create style.css and main.js based on index.html',
+    )
+
+    completed_events = [
+        event for event in events if isinstance(event, TurnCompleted)
+    ]
+    assert len(completed_events) == 1
+    completed = completed_events[0]
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert completed.result.changed_paths == ('main.js', 'style.css')
+    assert completed.result.verification is not None
+    assert completed.result.verification.success is True
+    assert not any(
+        'synthesis' in reason.casefold()
+        for reason in completed.result.completion_reasons
+    )
+
+
+def test_finalization_retry_lists_required_completion_evidence(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'retry-evidence-edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'retry-evidence-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(verify),
+        text_response('已经完成。'),
+        text_response('Updated sample.txt and verified it with git diff --check.'),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
+    )
+
+    events = collect_turn(conversation, 'Change and verify sample.txt')
+
+    assert events[-1].result.status == 'completed'
+    assert len(client.calls) == 4
+    retry_request = str(client.calls[3]['messages'])
+    assert 'authoritative completion evidence' in retry_request
+    assert 'Mention at least one changed path' in retry_request
+    assert 'sample.txt' in retry_request
+    assert 'git diff --check' in retry_request
+    assert 'exit code: 0' in retry_request
+    assert 'source revision:' in retry_request
+
+
+def test_completed_revision_is_not_downgraded_to_stuck_by_bad_summary(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'fallback-edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'fallback-verify',
+        'verify',
+        {'command': 'git diff --check'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(verify),
+        text_response('已经完成。'),
+        text_response('完成了。'),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
+    )
+
+    events = collect_turn(conversation, 'Change and verify sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert 'Task completed.' in completed.result.text
+    assert '- sample.txt' in completed.result.text
+    assert '- git diff --check' in completed.result.text
+    assert '- exit code: 0' in completed.result.text
+    assert completed.result.verification is not None
+    assert completed.result.verification.success is True
+
+
 def test_unverified_change_stagnation_recovers_before_completion(
     tmp_path: Path,
 ) -> None:
@@ -3364,7 +3534,7 @@ def test_invalid_grep_regex_recovers_as_tool_protocol_failure(
         finish_response(
             'toolu_regex_finish',
             task_kind='inspection',
-            summary='Found the literal text.',
+            summary='Found the literal text in sample.txt.',
         ),
     )
     conversation = Conversation(
@@ -3421,6 +3591,75 @@ def test_inspection_finish_requires_and_accepts_repository_evidence(
     assert isinstance(completed, TurnCompleted)
     assert completed.result.status == 'completed'
     assert completed.result.text == 'sample.txt contains the inspected value.'
+
+
+def test_inspection_synthesis_still_requires_repository_evidence(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    read = ToolCall(
+        0,
+        'toolu_inspect_text_read',
+        'read_file',
+        {'path': 'sample.txt'},
+    )
+    client = FakeModelClient(
+        response_with_tool(read),
+        text_response('代码有问题，建议修改。'),
+        text_response('sample.txt contains the inspected value.'),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(conversation, 'Inspect sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.text == 'sample.txt contains the inspected value.'
+    retry_request = str(client.calls[2]['messages'])
+    assert 'collected repository evidence' in retry_request
+    assert 'sample.txt' in retry_request
+
+
+def test_completion_evidence_does_not_bypass_completion_gate(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'no-gate-bypass-edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    summary = 'Updated sample.txt and ran git diff --check with exit code 0.'
+    client = FakeModelClient(
+        response_with_tool(edit),
+        text_response(summary),
+        text_response(summary),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
+        action_recovery_limit=1,
+    )
+
+    events = collect_turn(conversation, 'Change and verify sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'stuck'
+    assert any(
+        'verify tool' in reason
+        for reason in completed.result.completion_reasons
+    )
 
 
 def test_finish_task_must_be_called_alone(tmp_path: Path) -> None:
