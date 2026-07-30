@@ -328,7 +328,10 @@ def recovery_system_suffix(
             'that was not semantically or visually verified. Do not request '
             'any tool except finish_task.'
         )
-    if _planning_recovery_active(state):
+    if (
+        _planning_recovery_active(state)
+        and _planning_recovery_calls(state) > 0
+    ):
         return (
             '\n\n[ForgeCode Planning Recovery]\n'
             'The previous tool call was rejected with TODO_REQUIRED. This '
@@ -529,7 +532,11 @@ def _action_read_used(state: RequestState) -> bool:
 
 def _latest_verification(state: RequestState) -> VerificationEvidence | None:
     if state.runtime is not None:
-        return state.runtime.verification.latest
+        latest = state.runtime.verification.latest
+        ledger_evidence = state.runtime.verification_ledger.latest_evidence(
+            latest.source_revision if latest is not None else None
+        )
+        return ledger_evidence or latest
     return state.latest_verification
 
 

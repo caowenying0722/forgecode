@@ -8,20 +8,26 @@ from enum import Enum
 from forge.runtime.intent import InitialToolSurface, TaskContract
 from forge.runtime.recovery_manager import RepairTarget
 from forge.runtime.state import VerificationEvidence
+from forge.runtime.verification_ledger import VerificationLedger
 from forge.tools.base import ToolResult
 
 
 class AgentControlState(str, Enum):
     INIT = 'init'
+    UNDERSTANDING = 'understanding'
+    ANSWERING = 'answering'
+    ADVISING = 'advising'
     TASK_PLANNING = 'task_planning'
     EXPLORING = 'exploring'
     TARGETED_ANALYSIS = 'targeted_analysis'
+    DIAGNOSING = 'diagnosing'
     PLANNING = 'planning'
     IMPLEMENTING = 'implementing'
     FIX_REQUIRED = 'fix_required'
     READY_TO_VERIFY = 'ready_to_verify'
     VERIFYING = 'verifying'
     RECOVERING = 'recovering'
+    FINALIZING = 'finalizing'
     DONE = 'done'
     BLOCKED = 'blocked'
 
@@ -118,8 +124,16 @@ class AgentController:
 
 
 def initial_state(contract: TaskContract) -> AgentControlState:
-    if contract.requires_plan:
-        return AgentControlState.PLANNING
+    if contract.kind == 'answer':
+        return AgentControlState.ANSWERING
+    if contract.kind in {'advisory', 'status'}:
+        return AgentControlState.ADVISING
+    if contract.kind == 'inspect':
+        return AgentControlState.EXPLORING
+    if contract.kind == 'verify':
+        return AgentControlState.VERIFYING
+    if contract.requires_plan and contract.requires_change:
+        return AgentControlState.TASK_PLANNING
     if contract.initial_phase == 'planning':
         return AgentControlState.PLANNING
     if contract.initial_phase == 'implementing':
@@ -307,6 +321,9 @@ class TurnRuntimeState:
     failure_reasons: tuple[str, ...] = ()
     verification: VerificationRecoveryState = field(
         default_factory=VerificationRecoveryState
+    )
+    verification_ledger: VerificationLedger = field(
+        default_factory=VerificationLedger
     )
     planning_recovery_calls: int = 0
     requires_planning: bool = False

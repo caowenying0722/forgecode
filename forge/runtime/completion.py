@@ -49,7 +49,13 @@ PROJECT_VALIDATION_MARKERS = (
 class TaskPolicy:
     '''Explicit requirements supplied by a caller or evaluation case.'''
 
+    # Deprecated compatibility alias. It is honored by CompletionGate for
+    # already change-like evaluations, but Conversation no longer uses it to
+    # infer that every new turn must edit the workspace.
     require_changes: bool = False
+    require_changes_for_change_turns: bool = True
+    require_verification_for_change_turns: bool = True
+    forbid_changes_for_read_only_turns: bool = True
     require_verification: bool = False
     require_change_verification: bool = True
     require_diff_review: bool = False
@@ -86,9 +92,12 @@ class CompletionGate:
         reviewed_paths: set[str] | None = None,
     ) -> CompletionDecision:
         changed_paths = tracker.changed_paths
+        # ``mutation_attempted`` is the caller's turn-local declaration that
+        # this is a change turn. The deprecated policy.require_changes flag is
+        # intentionally not allowed to turn read-only/advisory turns into code
+        # tasks by itself.
         code_task = (
             mutation_attempted
-            or self.policy.require_changes
             or self.policy.require_verification
             or bool(changed_paths)
             or verification is not None
@@ -102,9 +111,10 @@ class CompletionGate:
                 'Git workspace tracking is unavailable for this task.'
             )
         if (
-            self.policy.require_changes
-            or mutation_attempted
-        ) and not changed_paths:
+            mutation_attempted
+            and self.policy.require_changes_for_change_turns
+            and not changed_paths
+        ):
             reasons.append(
                 'The task requires a code change, but the final Diff is empty.'
             )
@@ -119,7 +129,8 @@ class CompletionGate:
             )
 
         verification_required = self.policy.require_verification or (
-            self.policy.require_change_verification
+            self.policy.require_verification_for_change_turns
+            and self.policy.require_change_verification
             and (mutation_attempted or bool(changed_paths))
         )
         if verification_required:

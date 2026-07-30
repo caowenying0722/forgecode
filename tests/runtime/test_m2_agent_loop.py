@@ -335,6 +335,86 @@ def test_complex_task_starts_with_planning_tools_before_write(
     assert completed.result.changed_paths == ('sample.txt',)
 
 
+def test_advisory_turn_after_change_does_not_inherit_diff_requirement(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    first_edit = ToolCall(
+        0,
+        'toolu_edit_first',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    first_verify = ToolCall(
+        0, 'toolu_verify_first', 'verify', {'command': 'git diff --check'}
+    )
+    third_edit = ToolCall(
+        0,
+        'toolu_edit_third',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'new\n',
+            'new_text': 'new\npause=true\n',
+        },
+    )
+    third_verify = ToolCall(
+        0, 'toolu_verify_third', 'verify', {'command': 'git diff --check'}
+    )
+    client = FakeModelClient(
+        response_with_tool(first_edit),
+        response_with_tool(first_verify),
+        finish_response(
+            'finish_first',
+            task_kind='change',
+            summary='Updated sample.txt.',
+        ),
+        text_response('可以考虑暂停、存档和难度设置。'),
+        response_with_tool(third_edit),
+        response_with_tool(third_verify),
+        finish_response(
+            'finish_third',
+            task_kind='change',
+            summary='Added pause flag.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_changes=True),
+    )
+
+    first_events = collect_turn(conversation, '请把 sample.txt 改成 new')
+    second_events = collect_turn(
+        conversation,
+        '还有加入其他功能让整个项目更完善吗？',
+    )
+    third_events = collect_turn(conversation, '那就直接加入暂停功能')
+
+    assert isinstance(first_events[-1], TurnCompleted)
+    assert first_events[-1].result.status == 'completed'
+    assert isinstance(second_events[-1], TurnCompleted)
+    assert second_events[-1].result.status == 'completed'
+    assert second_events[-1].result.tool_calls == ()
+    assert not any(
+        isinstance(event, CompletionBlocked) for event in second_events
+    )
+    advisory_tools = {
+        str(tool.get('name')) for tool in client.calls[3]['tools'] or []
+    }
+    assert not (advisory_tools & {'write_file', 'replace_text', 'apply_patch'})
+    third_tools = {
+        str(tool.get('name')) for tool in client.calls[4]['tools'] or []
+    }
+    assert {'replace_text', 'verify'} <= third_tools
+    assert isinstance(third_events[-1], TurnCompleted)
+    assert third_events[-1].result.status == 'completed'
+
+
 def test_single_file_fix_is_not_forced_into_todo_planning(
     tmp_path: Path,
 ) -> None:
@@ -609,7 +689,7 @@ def test_unrelated_change_after_failed_verify_does_not_enable_verify(
 
     events = asyncio.run(collect_until_blocked_verify())
 
-    assert (tmp_path / 'notes' / 'unrelated.txt').exists()
+    assert not (tmp_path / 'notes' / 'unrelated.txt').exists()
     assert 'verify' not in {
         str(tool.get('name')) for tool in client.calls[3]['tools'] or []
     }
@@ -2500,7 +2580,7 @@ def test_failed_verification_recovery_allows_fix_before_verify(
         definition['name'] for definition in failed_recovery_request['tools']
     }
     assert 'verify' not in failed_recovery_tool_names
-    assert 'run_command' in failed_recovery_tool_names
+    assert 'run_command' not in failed_recovery_tool_names
     assert 'write_file' in failed_recovery_tool_names
     assert 'list_directory' not in failed_recovery_tool_names
     assert '[ForgeCode Verification Recovery]' in (
@@ -2604,10 +2684,9 @@ def test_failed_verification_recovery_limits_reads_then_forces_repair(
     second_repair_tools = {
         definition['name'] for definition in client.calls[3]['tools']
     }
-    assert 'find_files' not in second_repair_tools
-    assert 'read_file' not in second_repair_tools
-    assert 'grep' not in second_repair_tools
-    assert {'write_file', 'run_command'} <= second_repair_tools
+    assert {'find_files', 'read_file', 'grep'} <= second_repair_tools
+    assert 'write_file' in second_repair_tools
+    assert 'run_command' not in second_repair_tools
     assert 'verify' not in second_repair_tools
     ready_to_reverify_tools = {
         definition['name'] for definition in client.calls[4]['tools']
@@ -2625,9 +2704,8 @@ def test_failed_verification_recovery_limits_reads_then_forces_repair(
         and event.tool_call.id == 'repeat-tsconfig-search'
     ]
     assert rejected_results
-    assert rejected_results[0].success is False
-    assert rejected_results[0].error is not None
-    assert rejected_results[0].error.code == 'tool_not_available_in_phase'
+    assert rejected_results[0].success is True
+    assert rejected_results[0].metadata['cache_hit'] is True
 
 
 def test_repeated_verification_failure_stops_with_specific_report(

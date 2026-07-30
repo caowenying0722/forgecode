@@ -414,6 +414,45 @@ def test_replace_text_preserves_crlf_and_normalizes_replacement_lines(
     )
 
 
+def test_replace_text_rejects_duplicate_symbol_insertion(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / 'scene.ts'
+    path.write_text(
+        (
+            'class Scene {\n'
+            '  private paused = false;\n'
+            '\n'
+            '  refreshState() {\n'
+            '    this.paused = !this.paused;\n'
+            '  }\n'
+            '}\n'
+        ),
+        encoding='utf-8',
+    )
+
+    result = run(
+        ReplaceTextTool(tmp_path).run(
+            {
+                'path': 'scene.ts',
+                'old_text': '  private paused = false;\n',
+                'new_text': (
+                    '  private paused = false;\n'
+                    '\n'
+                    '  refreshState() {\n'
+                    '    this.paused = !this.paused;\n'
+                    '  }\n'
+                ),
+            }
+        )
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'duplicate_symbol'
+    assert path.read_text(encoding='utf-8').count('refreshState()') == 1
+
+
 def test_find_files_uses_globs_and_ignores_generated_directories(
     tmp_path: Path,
 ) -> None:

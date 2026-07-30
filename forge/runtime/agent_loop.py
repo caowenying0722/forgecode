@@ -135,6 +135,7 @@ from forge.runtime.tool_executor import (
     render_permission_notice,
 )
 from forge.runtime.workspace import WorkspaceTracker
+from forge.runtime.verification_ledger import VerificationLedger
 from forge.sessions.store import SessionStore
 from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolRegistry, ToolResult
@@ -337,6 +338,7 @@ class Conversation:
         self.working_state = WorkingState()
         self.run_state = AgentRunState()
         self.agent_controller = AgentController()
+        self.verification_ledger = VerificationLedger()
         if registry is not None:
             if 'task' in registry.names:
                 registry.replace(
@@ -352,6 +354,8 @@ class Conversation:
                     RunCommandTool(
                         resolved_context_root,
                         background_manager=self.background_manager,
+                        workspace_tracker=tracker,
+                        verification_ledger=self.verification_ledger,
                     )
                 )
             for task_tool in create_task_tools(
@@ -541,11 +545,13 @@ class Conversation:
             raise ValueError('prompt must not be empty')
 
         self.task_manager.begin_turn(prompt)
+        self.verification_ledger.clear_turn()
         self.working_state = WorkingState()
         self.run_state = AgentRunState()
         task_contract = await self._resolved_task_contract(prompt)
         self.agent_controller.begin_turn(task_contract)
         runtime = self.agent_controller.snapshot()
+        runtime.verification_ledger = self.verification_ledger
         runtime.budget.max_model_calls = self.max_iterations
         runtime.budget.max_tool_calls = self.max_turn_tool_calls
         verification_state = runtime.verification
@@ -1720,7 +1726,7 @@ class Conversation:
                             tool_changed_workspace,
                         )
                     )
-                if tool_call.name == 'verify':
+                if result.metadata.get('verification') is True:
                     if (
                         result.error is not None
                         and result.error.code == 'repeated_tool_call'
@@ -1751,7 +1757,31 @@ class Conversation:
                             )
                         )
                         return
-                    verification_evidence = verification_from_result(result)
+                    if not result.metadata.get('verification_ledger_recorded'):
+                        self.verification_ledger.record_from_metadata(
+                            result.metadata,
+                            content=result.content,
+                            evidence_source=(
+                                'run_command'
+                                if tool_call.name == 'run_command'
+                                else 'verify'
+                            ),
+                        )
+                    source_revision = (
+                        getattr(
+                            self.workspace_tracker,
+                            'source_revision',
+                            self.workspace_tracker.revision,
+                        )
+                        if self.workspace_tracker is not None
+                        else None
+                    )
+                    verification_evidence = (
+                        self.verification_ledger.latest_evidence(
+                            source_revision
+                        )
+                        or verification_from_result(result)
+                    )
                     if verification_evidence is None:
                         continue
                     verification_state.latest = verification_evidence
@@ -2564,7 +2594,6 @@ class Conversation:
             prompt,
             interaction_mode=self.interaction_mode,
             workspace_available=self.workspace_tracker is not None,
-            policy_requires_change=self.completion_checker.requires_changes,
         )
 
     async def _resolved_task_contract(self, prompt: str) -> TaskContract:
@@ -2573,7 +2602,25 @@ class Conversation:
             prompt,
             contract,
             self.intent_classifier,
+            semantic_context=self._semantic_task_context(),
         )
+
+    def _semantic_task_context(self) -> str:
+        pieces = []
+        if self._last_task_context:
+            pieces.append(self._last_task_context)
+        active = self.task_manager.active
+        if active is not None:
+            pieces.append(f'Active task: {active.goal}')
+            if active.steps:
+                pieces.append(
+                    'Plan steps:\n'
+                    + '\n'.join(
+                        f'- {step.status}: {step.title}'
+                        for step in active.steps
+                    )
+                )
+        return '\n\n'.join(pieces)
 
     def _plan_mode_tools(self) -> list[dict[str, Any]] | None:
         if self.tools is None:

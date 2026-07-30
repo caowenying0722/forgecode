@@ -476,6 +476,19 @@ class ReplaceTextTool(Tool[ReplaceTextInput]):
                     ),
                 },
             )
+        duplicate_symbols = duplicate_new_symbols(
+            content,
+            old_text,
+            new_text,
+        )
+        if duplicate_symbols:
+            raise ToolExecutionError(
+                'duplicate_symbol',
+                'Replacement would add symbol(s) that already exist in '
+                f'{arguments.path}: {", ".join(duplicate_symbols)}. Modify '
+                'the existing symbol instead of inserting another copy.',
+                details={'symbols': duplicate_symbols},
+            )
         updated = content.replace(
             old_text,
             new_text,
@@ -545,6 +558,42 @@ def closest_text_diagnostic(content: str, old_text: str) -> dict[str, object]:
         'similarity': round(best_ratio, 4),
         'closest_text': closest_text if len(closest_text) <= 2_000 else None,
     }
+
+
+def duplicate_new_symbols(
+    content: str,
+    old_text: str,
+    new_text: str,
+) -> list[str]:
+    '''Conservative duplicate definition guard for Python/TypeScript edits.'''
+    existing_region_removed = content.replace(old_text, '', 1)
+    old_symbols = set(_defined_symbols(old_text))
+    result: list[str] = []
+    for symbol in _defined_symbols(new_text):
+        if symbol in old_symbols:
+            continue
+        if re.search(
+            rf'(?m)^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s+{re.escape(symbol)}\b'
+            rf'|^\s*(?:def|class)\s+{re.escape(symbol)}\b'
+            rf'|^\s*(?:private|public|protected)?\s*{re.escape(symbol)}\s*(?::|=|\()',
+            existing_region_removed,
+        ):
+            result.append(symbol)
+    return sorted(set(result))
+
+
+def _defined_symbols(text: str) -> tuple[str, ...]:
+    patterns = (
+        r'(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\b',
+        r'(?m)^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b',
+        r'(?m)^\s*def\s+([A-Za-z_]\w*)\b',
+        r'(?m)^\s*class\s+([A-Za-z_]\w*)\b',
+        r'(?m)^\s*(?:private|public|protected)?\s*([A-Za-z_$][\w$]*)\s*(?::|=|\()',
+    )
+    symbols: list[str] = []
+    for pattern in patterns:
+        symbols.extend(match.group(1) for match in re.finditer(pattern, text))
+    return tuple(dict.fromkeys(symbols))
 
 
 def atomic_write_text(path: Path, content: str) -> None:

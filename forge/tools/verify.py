@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import time
+from typing import TYPE_CHECKING
 
 from pydantic import Field
 
@@ -30,6 +32,9 @@ from forge.runtime.process import (
     run_process,
 )
 
+if TYPE_CHECKING:
+    from forge.runtime.verification_ledger import VerificationLedger
+
 
 class VerifyInput(ToolInput):
     target: ValidationTarget = 'auto'
@@ -52,9 +57,15 @@ class VerifyTool(Tool[VerifyInput]):
     input_model = VerifyInput
     effect = 'process'
 
-    def __init__(self, root: Path, tracker: WorkspaceTracker) -> None:
+    def __init__(
+        self,
+        root: Path,
+        tracker: WorkspaceTracker,
+        ledger: 'VerificationLedger | None' = None,
+    ) -> None:
         super().__init__(root)
         self.tracker = tracker
+        self.ledger = ledger
 
     async def execute(self, arguments: VerifyInput) -> ToolResult:
         discovered = discover_validation_commands(self.root)
@@ -145,7 +156,7 @@ class VerifyTool(Tool[VerifyInput]):
         )
         cached = self.tracker.verification_cache.get(key)
         if isinstance(cached, ToolResult):
-            return ToolResult.ok(
+            reused = ToolResult.ok(
                 f'Reused verification evidence for source revision '
                 f'{source_revision}.',
                 content=cached.content,
@@ -158,6 +169,16 @@ class VerifyTool(Tool[VerifyInput]):
                     'filesystem_revision': self.tracker.filesystem_revision,
                 },
             )
+            if self.ledger is not None:
+                reused.metadata['verification_ledger_recorded'] = True
+                self.ledger.record_from_metadata(
+                    reused.metadata,
+                    content=reused.content,
+                    evidence_source='cache',
+                    reusable_key=key,
+                )
+            return reused
+        started_at = time()
         result = await run_process(
             command,
             cwd=cwd,
@@ -218,6 +239,17 @@ class VerifyTool(Tool[VerifyInput]):
             ],
         }
         content = render_process_output(result)
+        finished_at = time()
+        if self.ledger is not None:
+            metadata['verification_ledger_recorded'] = True
+            self.ledger.record_from_metadata(
+                metadata,
+                content=content,
+                evidence_source='verify',
+                reusable_key=key,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
         if result.timed_out:
             return ToolResult.fail(
                 'verification_timeout',

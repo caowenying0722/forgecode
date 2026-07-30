@@ -101,6 +101,27 @@ def run(coroutine: object) -> Any:
     return asyncio.run(coroutine)  # type: ignore[arg-type]
 
 
+def test_deprecated_require_changes_does_not_create_code_task(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+
+    decision = run(
+        CompletionGate(
+            tmp_path,
+            TaskPolicy(require_changes=True),
+        ).evaluate(
+            tracker,
+            None,
+            mutation_attempted=False,
+        )
+    )
+
+    assert decision.allowed is True
+
+
 def test_workspace_tracker_preserves_preexisting_user_changes(
     tmp_path: Path,
 ) -> None:
@@ -475,7 +496,7 @@ def test_completion_gate_rejects_failed_verification_and_empty_diff(
     )
 
     decision = run(
-        gate.evaluate(tracker, failed, mutation_attempted=False)
+        gate.evaluate(tracker, failed, mutation_attempted=True)
     )
 
     assert decision.allowed is False

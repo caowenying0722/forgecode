@@ -1,12 +1,42 @@
 '''Tests for project validation command discovery.'''
 
+import asyncio
 from pathlib import Path
+import subprocess
 
 from forge.runtime.verification import (
     choose_validation_command,
     classify_verification_command,
     discover_validation_commands,
 )
+from forge.runtime.verification_ledger import VerificationLedger
+from forge.runtime.workspace import WorkspaceTracker
+from forge.tools.shell import RunCommandTool
+
+
+def run(coroutine: object):
+    return asyncio.run(coroutine)  # type: ignore[arg-type]
+
+
+def initialize_git_repository(root: Path) -> None:
+    subprocess.run(['git', 'init', '--quiet'], cwd=root, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'forge@example.test'],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'ForgeCode Tests'],
+        cwd=root,
+        check=True,
+    )
+    (root / 'sample.txt').write_text('old\n', encoding='utf-8')
+    subprocess.run(['git', 'add', '.'], cwd=root, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'baseline'],
+        cwd=root,
+        check=True,
+    )
 
 
 def test_package_json_validation_discovery_prefers_project_scripts(
@@ -83,3 +113,29 @@ def test_empty_package_json_does_not_satisfy_build_discovery(
 
     assert auto is None
     assert build is None
+
+
+def test_run_command_validation_routes_to_verification_ledger(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    ledger = VerificationLedger()
+    tool = RunCommandTool(
+        tmp_path,
+        workspace_tracker=tracker,
+        verification_ledger=ledger,
+    )
+
+    first = run(tool.execute(tool.input_model(command='git diff --check')))
+    second = run(tool.execute(tool.input_model(command='git diff --check')))
+
+    assert first.success is True
+    assert first.metadata['verification'] is True
+    assert first.metadata['verification_status'] == 'passed'
+    assert ledger.latest_evidence(0) is not None
+    assert ledger.latest_evidence(0).success is True  # type: ignore[union-attr]
+    assert second.success is True
+    assert second.metadata['verification_reused'] is True
+    assert ledger.records[-1].evidence_source == 'cache'

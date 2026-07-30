@@ -52,6 +52,9 @@ class RepairTarget:
     direct_dependencies: tuple[str, ...] = ()
     failure_signature: str = ''
     diagnostic_excerpt: str = ''
+    baseline_source_revision: int | None = None
+    read_ranges: tuple[str, ...] = ()
+    attempted_edits: tuple[str, ...] = ()
 
     @property
     def has_specific_location(self) -> bool:
@@ -204,7 +207,6 @@ class RecoveryManager:
             allowed.add('verify')
             allowed.update({'git_status', 'git_diff'})
         if fix_available:
-            allowed.add('run_command')
             if read_available:
                 allowed.update({'find_files', 'grep', 'read_file'})
         return [
@@ -273,7 +275,7 @@ class RecoveryManager:
 
     def verification_read_budget(self, target: RepairTarget | None) -> int:
         if target is None:
-            return 1
+            return 2
         focus_count = len(
             set(
                 [
@@ -285,7 +287,8 @@ class RecoveryManager:
                 ]
             )
         )
-        return max(1, min(4, focus_count or 1))
+        range_count = len(target.line_numbers)
+        return max(2, min(8, focus_count + range_count or 2))
 
 
 def repair_target_from_tool_failure(
@@ -312,6 +315,7 @@ def repair_target_from_tool_failure(
         missing_exports=_extract_missing_exports(diagnostic),
         failure_signature=str(result.metadata.get('failure_signature', '')),
         diagnostic_excerpt=_excerpt(diagnostic),
+        baseline_source_revision=_metadata_source_revision(result),
     )
 
 
@@ -338,6 +342,7 @@ def repair_target_from_verification(
         direct_dependencies=_direct_dependencies(paths, modules),
         failure_signature=verification.failure_signature,
         diagnostic_excerpt=_excerpt(diagnostic),
+        baseline_source_revision=verification.bound_source_revision,
     )
 
 
@@ -368,6 +373,7 @@ def repair_target_from_verification_result(
         direct_dependencies=_direct_dependencies(paths, modules),
         failure_signature=_failure_signature_from_result(result),
         diagnostic_excerpt=_excerpt(diagnostic),
+        baseline_source_revision=_metadata_source_revision(result),
     )
 
 
@@ -403,10 +409,15 @@ def render_repair_target_context(target: RepairTarget | None) -> str:
         lines.append(f'- failure signature: {target.failure_signature}')
     if target.diagnostic_excerpt:
         lines.append(f'- diagnostic: {target.diagnostic_excerpt}')
+    if target.baseline_source_revision is not None:
+        lines.append(
+            f'- baseline source revision: {target.baseline_source_revision}'
+        )
     lines.append(
-        'Use this target before any broad discovery. If one exact location is '
-        'missing, perform one targeted read/search against these files or '
-        'symbols; otherwise repair the targeted code and verify again.'
+        'Use this target before any broad discovery. You may read multiple '
+        'small ranges inside these files and direct dependencies. Do not edit '
+        'until the latest target content for the current source revision has '
+        'been read; otherwise read the minimal current hunk first.'
     )
     return '\n'.join(lines)
 
@@ -420,6 +431,18 @@ def _diagnostic_text(result: ToolResult) -> str:
         parts.append(result.error.message)
         parts.extend(str(value) for value in result.error.details.values())
     return '\n'.join(part for part in parts if part)
+
+
+def _metadata_source_revision(result: ToolResult) -> int | None:
+    try:
+        return int(
+            result.metadata.get(
+                'source_revision',
+                result.metadata.get('workspace_revision'),
+            )
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _extract_paths(text: str) -> tuple[str, ...]:

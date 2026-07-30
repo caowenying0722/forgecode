@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol
 
 TurnKind = Literal[
     'answer',
+    'advisory',
     'inspect',
     'plan',
     'implement',
@@ -61,6 +62,7 @@ class SemanticTaskClassifier(Protocol):
         self,
         prompt: str,
         baseline: 'TaskContract',
+        semantic_context: str = '',
     ) -> 'TaskContract':
         ...
 
@@ -115,12 +117,12 @@ class TaskContract:
 
 
 _CHANGE_VERBS_ZH = (
-    '修复|修好|解决|修改|改|实现|实施|执行|落地|处理|新增|添加|'
+    '修复|修好|解决|修改|改|实现|实施|执行|落地|处理|新增|添加|加入|'
     '新建|删除|移除|创建|编写|写入|重写|重构|优化|更新|调整|调高|'
     '调低|改进|完成|替换|继续|开始|完善|开发'
 )
 _DIRECT_CHANGE_ZH = re.compile(
-    rf'^\s*(?:(?:请你?|帮我|麻烦你?|你直接|直接)\s*)?'
+    rf'^\s*(?:(?:请你?|帮我|麻烦你?|你直接|那就直接|直接)\s*)?'
     rf'(?:{_CHANGE_VERBS_ZH})'
 )
 _SCOPED_CHANGE_ZH = re.compile(
@@ -150,6 +152,16 @@ _START_TASK_WORK_ZH = re.compile(
     r'(?:阅读|读取|查看|明确|理解).{0,40}(?:任务|task\.md|需求)'
     r'.{0,30}(?:后|并|然后|开始).{0,20}'
     r'(?:开始工作|开始实现|执行|实施|实现|落地|完成)'
+)
+_AMBIGUOUS_FOLLOWUP_ZH = re.compile(
+    r'^\s*(?:可以|好|好的|行|那就)?[，,、\s]*'
+    r'(?:开始吧|开始|继续|继续吧|按刚才说的做|按刚才说的来)'
+    r'\s*[。.!！]*\s*$'
+)
+_AMBIGUOUS_FOLLOWUP_EN = re.compile(
+    r'^\s*(?:ok(?:ay)?|yes|sure|please)?[,\s]*'
+    r'(?:go ahead|start|continue|do it)\s*[.!]*\s*$',
+    re.IGNORECASE,
 )
 _NEGATED_CHANGE_ZH = re.compile(
     rf'(?:不要|别|无需|不用|暂时不|先不|禁止)'
@@ -224,6 +236,15 @@ _STATUS_ZH = re.compile(r'(?:进度|状态|情况|完成了吗|完成了?没有)
 _STATUS_EN = re.compile(r'\b(?:status|progress|update me|done yet)\b', re.IGNORECASE)
 _PLAN_ZH = re.compile(r'(?:方案|计划|建议|规划|清单|列表|checklist|roadmap)', re.IGNORECASE)
 _PLAN_EN = re.compile(r'\b(?:plan|proposal|suggestion|checklist|roadmap)\b', re.IGNORECASE)
+_ADVISORY_ZH = re.compile(
+    r'(?:还有.*(?:功能|完善)|还能.*(?:增加|加入|优化)|'
+    r'建议下一步|优化方向|几个优化|哪些功能|更完善)'
+)
+_ADVISORY_EN = re.compile(
+    r'\b(?:what next|next steps|suggest|recommend|improvement ideas|'
+    r'what features|could add|can add|optimi[sz]ation ideas)\b',
+    re.IGNORECASE,
+)
 _INSPECT_ZH = re.compile(
     r'^\s*(?:只\s*)?(?:查看|列出|分析|审计|检查|阅读|读取|总结|扫描)'
 )
@@ -270,6 +291,11 @@ def infer_change_required(prompt: str) -> bool:
     text = prompt.strip()
     if not text:
         return False
+    if (
+        _AMBIGUOUS_FOLLOWUP_ZH.search(text)
+        or _AMBIGUOUS_FOLLOWUP_EN.search(text)
+    ):
+        return False
     clauses = [
         clause.strip()
         for part in _CLAUSE_SPLIT_ZH.split(text)
@@ -313,7 +339,11 @@ def infer_task_contract(
     workspace_available: bool = True,
     policy_requires_change: bool = False,
 ) -> TaskContract:
-    '''Infer a conservative executable contract for one user turn.'''
+    '''Infer a conservative executable contract for one user turn.
+
+    ``policy_requires_change`` is deprecated compatibility input. It must not
+    turn answer/advisory/inspect/status/plan prompts into change turns.
+    '''
     if interaction_mode == 'plan':
         return _task_contract(
             prompt,
@@ -337,10 +367,9 @@ def infer_task_contract(
 
     text = prompt.strip()
     inferred_change = infer_change_required(text)
-    wants_change = bool(policy_requires_change or inferred_change)
-    requires_change = bool(policy_requires_change or (
-        workspace_available and inferred_change
-    ))
+    del policy_requires_change
+    wants_change = bool(inferred_change)
+    requires_change = bool(workspace_available and inferred_change)
     if wants_change:
         kind: TurnKind = 'implement'
         reason = 'explicit workspace-change request'
@@ -369,6 +398,13 @@ def infer_task_contract(
             'status',
             'high',
             'status request',
+            prompt=prompt,
+        )
+    if _ADVISORY_ZH.search(text) or _ADVISORY_EN.search(text):
+        return read_only_contract(
+            'advisory',
+            'high',
+            'advisory request',
             prompt=prompt,
         )
     if _PLAN_ZH.search(text) or _PLAN_EN.search(text):
@@ -431,6 +467,8 @@ async def refine_task_contract_async(
     prompt: str,
     contract: TaskContract,
     classifier: object | None = None,
+    *,
+    semantic_context: str = '',
 ) -> TaskContract:
     '''Async-aware variant used by the runtime production path.'''
     if (
@@ -443,7 +481,10 @@ async def refine_task_contract_async(
     if classify is None:
         return contract
     try:
-        result = classify(prompt, contract)
+        try:
+            result = classify(prompt, contract, semantic_context)
+        except TypeError:
+            result = classify(prompt, contract)
         if hasattr(result, '__await__'):
             result = await result
     except Exception:
@@ -461,6 +502,7 @@ class ModelSemanticTaskClassifier:
         self,
         prompt: str,
         baseline: TaskContract,
+        semantic_context: str = '',
     ) -> TaskContract:
         messages = [
             {
@@ -472,14 +514,17 @@ class ModelSemanticTaskClassifier:
                     'acceptance_criteria, context_hints, current_priority, '
                     'allowed_paths, forbidden_paths, verification_policy, '
                     'confidence. User request:\n'
-                    f'{prompt}'
+                    f'{prompt}\n\nContext:\n{semantic_context}'
                 ),
             }
         ]
         system = (
             'You are a conservative task router for a coding agent. '
             'Do not infer workspace modification when the user asks only for '
-            'analysis, explanation, status, or says not to modify files.'
+            'analysis, advice, explanation, status, planning, or says not to '
+            'modify files. Ambiguous follow-ups such as continue, start, or '
+            '可以开始 may be implement only when context clearly contains a '
+            'previous actionable implementation plan.'
         )
         text_parts: list[str] = []
         async for event in self.client.stream(messages, tools=None, system=system):
@@ -501,6 +546,7 @@ def read_only_contract(
     )
     phase: InitialPhase = 'exploring' if kind == 'inspect' else 'answering'
     surface: InitialToolSurface = 'read_only' if kind in {
+        'advisory',
         'inspect',
         'plan',
         'status',
@@ -612,6 +658,8 @@ def _deliverables(
         return ('workspace changes', 'concise change summary')
     if kind == 'inspect':
         return ('repository-grounded analysis',)
+    if kind == 'advisory':
+        return ('actionable recommendations',)
     if kind == 'plan':
         return ('plan or checklist',)
     return ('direct answer',)
@@ -660,7 +708,32 @@ def _parse_classifier_json(text: str) -> dict[str, Any]:
         payload = json.loads(stripped[start:end + 1])
     if not isinstance(payload, dict):
         raise ValueError('semantic classification must be a JSON object')
+    _validate_classifier_payload(payload)
     return payload
+
+
+def _validate_classifier_payload(payload: dict[str, Any]) -> None:
+    required = {
+        'kind',
+        'goal',
+        'requires_change',
+        'requires_plan',
+        'deliverables',
+        'acceptance_criteria',
+        'context_hints',
+        'allowed_paths',
+        'forbidden_paths',
+        'verification_policy',
+        'confidence',
+    }
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(
+            'semantic classification missing required keys: '
+            + ', '.join(sorted(missing))
+        )
+    if not isinstance(payload.get('verification_policy'), dict):
+        raise ValueError('verification_policy must be an object')
 
 
 def _contract_from_classifier_payload(
@@ -676,6 +749,7 @@ def _contract_from_classifier_payload(
         payload.get('kind'),
         {
             'answer',
+            'advisory',
             'inspect',
             'plan',
             'implement',
@@ -711,7 +785,7 @@ def _contract_from_classifier_payload(
         'all'
         if requires_change and not requires_plan
         else 'read_only'
-        if kind in {'inspect', 'plan', 'status'} or requires_plan
+        if kind in {'advisory', 'inspect', 'plan', 'status'} or requires_plan
         else 'none'
     )
     verification_payload = payload.get('verification_policy')

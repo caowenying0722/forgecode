@@ -56,7 +56,10 @@ class CompletionChecker:
 
     @property
     def requires_changes(self) -> bool:
-        return self.gate is not None and self.gate.policy.require_changes
+        # Deprecated compatibility surface. Global policy must not force the
+        # current prompt into a change contract; CompletionGate enforces policy
+        # after the current turn is independently classified.
+        return False
 
     async def evaluate(
         self,

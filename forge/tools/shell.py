@@ -5,10 +5,18 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+from time import time
 from typing import TYPE_CHECKING
 
 from pydantic import Field
 
+from forge.runtime.verification import (
+    NON_INTERACTIVE_ENV,
+    classify_verification_command,
+    discover_validation_commands,
+    verification_artifact_scope,
+    verification_cache_key,
+)
 from forge.runtime.process import (
     ProcessResult,
     process_metadata,
@@ -27,6 +35,8 @@ from forge.tools.base import (
 
 if TYPE_CHECKING:
     from forge.runtime.background import BackgroundTaskManager
+    from forge.runtime.verification_ledger import VerificationLedger
+    from forge.runtime.workspace import WorkspaceTracker
 
 
 class RunCommandInput(ToolInput):
@@ -65,9 +75,13 @@ class RunCommandTool(Tool[RunCommandInput]):
         self,
         root: Path,
         background_manager: 'BackgroundTaskManager | None' = None,
+        workspace_tracker: 'WorkspaceTracker | None' = None,
+        verification_ledger: 'VerificationLedger | None' = None,
     ) -> None:
         super().__init__(root)
         self.background_manager = background_manager
+        self.workspace_tracker = workspace_tracker
+        self.verification_ledger = verification_ledger
 
     async def execute(self, arguments: RunCommandInput) -> ToolResult:
         if os.name == 'nt' and has_unquoted_heredoc(arguments.command):
@@ -155,6 +169,9 @@ class RunCommandTool(Tool[RunCommandInput]):
                     'cwd': background.cwd,
                 },
             )
+        routed = await self._run_as_verification_if_applicable(arguments, cwd)
+        if routed is not None:
+            return routed
         result = await run_process(
             arguments.command,
             cwd=cwd,
@@ -186,6 +203,159 @@ class RunCommandTool(Tool[RunCommandInput]):
         return ToolResult.ok(
             f'Command completed with exit code 0 in '
             f'{result.duration_seconds:.3f}s.',
+            content=content,
+            metadata=metadata,
+        )
+
+    async def _run_as_verification_if_applicable(
+        self,
+        arguments: RunCommandInput,
+        cwd: Path,
+    ) -> ToolResult | None:
+        if (
+            self.workspace_tracker is None
+            or self.verification_ledger is None
+            or arguments.stdin is not None
+        ):
+            return None
+        discovered = discover_validation_commands(self.root)
+        status, _ = classify_verification_command(
+            arguments.command,
+            discovered_commands=discovered,
+        )
+        if status != 'passed':
+            return None
+        command = arguments.command.strip()
+        display_cwd = display_path(self.root, cwd)
+        source_revision = self.workspace_tracker.source_revision
+        filesystem_revision = self.workspace_tracker.filesystem_revision
+        scope = verification_artifact_scope(
+            command,
+            root=self.root,
+            target='auto',
+        )
+        key = verification_cache_key(
+            source_revision=source_revision,
+            command=command,
+            cwd=display_cwd,
+            scope=scope,
+        )
+        reusable = self.verification_ledger.reusable(key)
+        if reusable is not None:
+            result = ToolResult.ok(
+                f'Reused verification evidence for source revision '
+                f'{source_revision}.',
+                content=reusable.stdout_stderr_summary,
+                metadata={
+                    'verification': True,
+                    'verification_reused': True,
+                    'verification_status': reusable.status,
+                    'verification_type': reusable.kind,
+                    'command': reusable.command,
+                    'command_id': reusable.target,
+                    'cwd': reusable.cwd,
+                    'workspace_revision': source_revision,
+                    'source_revision': source_revision,
+                    'filesystem_revision': filesystem_revision,
+                    'exit_code': reusable.exit_code,
+                    'duration_seconds': reusable.duration_seconds,
+                    'timed_out': reusable.timed_out,
+                    'verification_side_effect_paths': list(
+                        reusable.side_effect_paths
+                    ),
+                    'verification_ledger_recorded': True,
+                },
+            )
+            self.verification_ledger.record_from_metadata(
+                result.metadata,
+                content=result.content,
+                evidence_source='cache',
+                reusable_key=key,
+            )
+            return result
+        started_at = time()
+        process = await run_process(
+            command,
+            cwd=cwd,
+            timeout_seconds=arguments.timeout_seconds,
+            shell=True,
+            env=NON_INTERACTIVE_ENV,
+        )
+        change = await self.workspace_tracker.refresh(
+            origin='verification',
+            artifact_scope=scope,
+        )
+        classification = (
+            change.classification
+            if change is not None
+            else self.workspace_tracker.last_classification
+        )
+        verification_status = (
+            'timed_out'
+            if process.timed_out
+            else ('passed' if process.exit_code == 0 else 'failed')
+        )
+        side_effect_paths = classification.verification_side_effect_paths
+        if side_effect_paths and verification_status == 'passed':
+            verification_status = 'failed'
+        metadata = {
+            **process_metadata(process),
+            'command': command,
+            'cwd': display_cwd,
+            'stdin_characters': 0,
+            'verification': True,
+            'verification_status': verification_status,
+            'verification_type': scope.verification_type,
+            'command_id': 'run_command',
+            'workspace_revision': source_revision,
+            'source_revision': source_revision,
+            'filesystem_revision': self.workspace_tracker.filesystem_revision,
+            'verification_artifact_scope': [
+                {
+                    'pattern': rule.pattern,
+                    'kind': rule.kind,
+                    'description': rule.description,
+                }
+                for rule in scope.allowed_writes
+            ],
+            'verification_side_effect_paths': list(side_effect_paths),
+            'generated_artifact_paths': list(classification.generated_paths),
+            'cache_paths': list(classification.cache_paths),
+            'verification_ledger_recorded': True,
+        }
+        content = render_process_output(process)
+        self.verification_ledger.record_from_metadata(
+            metadata,
+            content=content,
+            evidence_source='run_command',
+            reusable_key=key,
+            started_at=started_at,
+            finished_at=time(),
+        )
+        if process.timed_out:
+            return ToolResult.fail(
+                'verification_timeout',
+                f'Verification timed out after {arguments.timeout_seconds:g}s.',
+                content=content,
+                metadata=metadata,
+            )
+        if process.exit_code != 0:
+            return ToolResult.fail(
+                'verification_failed',
+                f'Verification exited with code {process.exit_code}.',
+                content=content,
+                metadata=metadata,
+            )
+        if side_effect_paths:
+            return ToolResult.fail(
+                'verification_side_effect',
+                'Verification modified undeclared source or workspace paths: '
+                + ', '.join(side_effect_paths),
+                content=content,
+                metadata=metadata,
+            )
+        return ToolResult.ok(
+            f'Verification passed in {process.duration_seconds:.3f}s.',
             content=content,
             metadata=metadata,
         )

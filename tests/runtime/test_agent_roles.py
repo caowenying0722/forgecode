@@ -27,7 +27,11 @@ from forge.runtime.model_client import (
     ModelProtocolError,
 )
 from forge.runtime.recovery_manager import RecoveryManager
-from forge.runtime.request_builder import RequestBuilder, RequestState
+from forge.runtime.request_builder import (
+    RequestBuilder,
+    RequestState,
+    _latest_verification,
+)
 from forge.runtime.progress import evaluate_progress
 from forge.runtime.state import (
     ModelStreamEvent,
@@ -519,6 +523,50 @@ def test_tool_run_policy_runtime_snapshot_overrides_legacy_booleans() -> None:
     assert transaction_phase(policy) == 'edit_recovery'
 
 
+def test_request_builder_reads_latest_verification_from_ledger() -> None:
+    contract = infer_task_contract('请修复 forge/runtime/intent.py')
+    runtime = TurnRuntimeState(
+        control_state=AgentControlState.FIX_REQUIRED,
+        contract=contract,
+    )
+    runtime.verification.latest = VerificationEvidence(
+        command='uv run pytest -q',
+        cwd='.',
+        exit_code=2,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=1,
+        source_revision=1,
+        filesystem_revision=1,
+        status='failed',
+        failure_signature='old-failure',
+        verification_type='test',
+    )
+    runtime.verification_ledger.record_from_metadata(
+        {
+            'verification': True,
+            'verification_status': 'passed',
+            'verification_type': 'test',
+            'command': 'uv run pytest -q',
+            'cwd': '.',
+            'workspace_revision': 1,
+            'source_revision': 1,
+            'filesystem_revision': 2,
+            'exit_code': 0,
+            'duration_seconds': 0.2,
+            'timed_out': False,
+        },
+        content='passed',
+        evidence_source='run_command',
+    )
+
+    latest = _latest_verification(RequestState(runtime=runtime))
+
+    assert latest is not None
+    assert latest.success is True
+    assert latest.filesystem_revision == 2
+
+
 def test_request_builder_injects_runtime_task_model_for_change() -> None:
     tools = [{'name': 'read_file'}, {'name': 'write_file'}]
     recovery = RecoveryManager(
@@ -593,6 +641,21 @@ def test_action_recovery_is_derived_from_control_state() -> None:
 
     assert controller.state is AgentControlState.TARGETED_ANALYSIS
     assert controller.action_recovery is True
+
+
+def test_controller_uses_turn_kind_for_read_only_initial_states() -> None:
+    answer = AgentController()
+    answer.begin_turn(infer_task_contract('解释一下 Python 里的生成器是什么'))
+    advisory = AgentController()
+    advisory.begin_turn(
+        infer_task_contract('还有加入其他功能让整个项目更完善吗？')
+    )
+    change = AgentController()
+    change.begin_turn(infer_task_contract('直接实现经验等级和三选一升级。'))
+
+    assert answer.state is AgentControlState.ANSWERING
+    assert advisory.state is AgentControlState.ADVISING
+    assert change.state is AgentControlState.IMPLEMENTING
 
 
 def test_progress_evaluator_counts_verification_as_progress() -> None:

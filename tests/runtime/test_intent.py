@@ -1,5 +1,6 @@
 '''Tests for conservative workspace-change intent inference.'''
 
+import asyncio
 from dataclasses import replace
 
 import pytest
@@ -10,6 +11,7 @@ from forge.runtime.intent import (
     infer_change_required,
     infer_task_contract,
     refine_task_contract,
+    refine_task_contract_async,
 )
 
 
@@ -26,7 +28,7 @@ from forge.runtime.intent import (
         '按刚才的方案执行',
         '按最高优先级 P0 进行修复',
         '把 world.js 改成六面渲染',
-        '可以，开始吧',
+        '那就直接加入暂停功能',
         '阅读当前目录下的任务文件task.md，明确任务后开始工作',
         '根据 task.md 继续完善项目功能',
         '根据task.md完善整个项目',
@@ -69,6 +71,7 @@ def test_explicit_change_requests_require_a_workspace_diff(
         'Write a plan for the refactor.',
         'Give me a P0/P1/P2 fix checklist.',
         'Plan a refactor, but do not change files.',
+        '可以，开始吧',
     ],
 )
 def test_questions_and_plans_do_not_require_a_workspace_diff(
@@ -118,6 +121,42 @@ def test_explicit_modes_override_prompt_intent() -> None:
     assert plan.initial_tool_surface == 'read_only'
     assert code.requires_change is True
     assert code.initial_tool_surface == 'all'
+
+
+@pytest.mark.parametrize(
+    'prompt',
+    [
+        '还有加入其他功能让整个项目更完善吗？',
+        '你建议下一步做什么？',
+        '这个项目还能增加哪些功能？',
+        '给我几个优化方向。',
+    ],
+)
+def test_global_policy_does_not_turn_advice_into_change(
+    prompt: str,
+) -> None:
+    contract = infer_task_contract(
+        prompt,
+        workspace_available=True,
+        policy_requires_change=True,
+    )
+
+    assert contract.kind == 'advisory'
+    assert contract.requires_change is False
+    assert contract.completion_contract == 'none'
+    assert contract.initial_tool_surface == 'read_only'
+
+
+def test_code_mode_can_force_implementation_contract() -> None:
+    contract = infer_task_contract(
+        '还有加入其他功能让整个项目更完善吗？',
+        interaction_mode='code',
+        workspace_available=True,
+        policy_requires_change=False,
+    )
+
+    assert contract.kind == 'implement'
+    assert contract.requires_change is True
 
 
 @pytest.mark.parametrize(
@@ -233,3 +272,42 @@ def test_semantic_classifier_is_used_only_for_low_confidence() -> None:
 
     assert classifier.calls == 1
     assert refined.kind == 'inspect'
+
+
+def test_semantic_classifier_receives_history_for_ambiguous_followup() -> None:
+    class ContextAwareClassifier:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def classify_task(
+            self,
+            prompt: str,
+            baseline: TaskContract,
+            semantic_context: str = '',
+        ) -> TaskContract:
+            self.calls.append((prompt, semantic_context))
+            return replace(
+                baseline,
+                intent=TurnIntent('implement', 'medium', 'classified follow-up'),
+                kind='implement',
+                requires_change=True,
+                completion_contract='change',
+                initial_tool_surface='all',
+                semantic_classification='recommended',
+            )
+
+    baseline = infer_task_contract('可以，开始吧')
+    classifier = ContextAwareClassifier()
+
+    refined = asyncio.run(
+        refine_task_contract_async(
+            '可以，开始吧',
+            baseline,
+            classifier,
+            semantic_context='Active task: add pause menu',
+        )
+    )
+
+    assert classifier.calls == [('可以，开始吧', 'Active task: add pause menu')]
+    assert refined.requires_change is True
+    assert refined.kind == 'implement'

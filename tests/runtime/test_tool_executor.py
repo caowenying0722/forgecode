@@ -338,6 +338,37 @@ def test_todo_planning_hook_blocks_complex_write_before_todo(
     assert not (tmp_path / 'sample.txt').exists()
 
 
+def test_todo_planning_hook_obeys_contract_metadata_not_prompt(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry([WriteTool(tmp_path)])
+    planning = TodoPlanningHook()
+    executor = ToolExecutor(
+        registry,
+        root=tmp_path,
+        permission=PermissionMiddleware('trusted'),
+        logger=ToolExecutionLogger(tmp_path),
+        hooks=HookRegistry([planning]),
+    )
+    run(
+        executor.hooks.run(
+            HookContext(
+                event='user_prompt_submit',
+                root=tmp_path,
+                prompt='请重构多个模块的架构并更新相关代码',
+                metadata={'todo_required': False},
+            )
+        )
+    )
+
+    record = run(
+        executor.execute(ToolCall(0, 'toolu_write', 'write_sample', {}))
+    )
+
+    assert record.result.success is True
+    assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'changed'
+
+
 def test_memory_write_goes_through_permission_and_logging(
     tmp_path: Path,
 ) -> None:
