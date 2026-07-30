@@ -16,6 +16,8 @@ class TaskStep:
     title: str
     status: StepStatus = 'pending'
     evidence: tuple[str, ...] = ()
+    deliverables: tuple[str, ...] = ()
+    criterion_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TaskStep:
@@ -24,6 +26,12 @@ class TaskStep:
             title=str(data['title']),
             status=str(data.get('status', 'pending')),  # type: ignore[arg-type]
             evidence=tuple(str(item) for item in data.get('evidence', [])),
+            deliverables=tuple(
+                str(item) for item in data.get('deliverables', [])
+            ),
+            criterion_ids=tuple(
+                str(item) for item in data.get('criterion_ids', [])
+            ),
         )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from forge.runtime.acceptance import AcceptanceLedger
 from forge.runtime.intent import InitialToolSurface, TaskContract
 from forge.runtime.recovery_manager import RepairTarget
 from forge.runtime.state import VerificationEvidence
@@ -324,6 +325,9 @@ class TurnRuntimeState:
     )
     verification_ledger: VerificationLedger = field(
         default_factory=VerificationLedger
+    )
+    acceptance_ledger: AcceptanceLedger = field(
+        default_factory=AcceptanceLedger
     )
     planning_recovery_calls: int = 0
     requires_planning: bool = False

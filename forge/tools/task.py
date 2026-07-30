@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from forge.runtime.acceptance import (
+    AcceptanceEvidence,
+    AcceptanceLedger,
+    evidence_from_payload,
+)
 from forge.tasks.manager import TaskManager
 from forge.tools.base import Tool, ToolExecutionError, ToolInput, ToolResult
 
@@ -37,8 +42,16 @@ class TaskGetTool(Tool[TaskGetInput]):
         )
 
 
+class TaskPlanStepInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    title: str = Field(min_length=1, max_length=1_000)
+    deliverables: list[str] = Field(default_factory=list, max_length=20)
+    criterion_ids: list[str] = Field(default_factory=list, max_length=20)
+
+
 class TaskPlanInput(ToolInput):
-    steps: list[str] = Field(min_length=2, max_length=20)
+    steps: list[str | TaskPlanStepInput] = Field(min_length=2, max_length=20)
     constraints: list[str] = Field(default_factory=list, max_length=20)
     scope_hints: list[str] = Field(default_factory=list, max_length=20)
     replace: bool = False
@@ -62,11 +75,16 @@ class TaskPlanTool(Tool[TaskPlanInput]):
         self.manager = manager
 
     async def execute(self, arguments: TaskPlanInput) -> ToolResult:
+        titles, step_deliverables, step_criterion_ids = _plan_step_links(
+            arguments.steps
+        )
         try:
             task = self.manager.plan(
-                arguments.steps,
+                titles,
                 constraints=arguments.constraints,
                 scope_hints=arguments.scope_hints,
+                step_deliverables=step_deliverables,
+                step_criterion_ids=step_criterion_ids,
                 replace_existing=arguments.replace,
             )
         except ValueError as error:
@@ -74,14 +92,69 @@ class TaskPlanTool(Tool[TaskPlanInput]):
         return ToolResult.ok(
             f'Created a {len(task.steps)}-step task plan.',
             content=self.manager.describe(),
-            metadata={'task_id': task.id, 'step_count': len(task.steps)},
+            metadata={
+                'task_id': task.id,
+                'step_count': len(task.steps),
+                'step_criterion_ids': {
+                    step.id: list(step.criterion_ids)
+                    for step in task.steps
+                    if step.criterion_ids
+                },
+            },
         )
+
+
+class TaskUpdateEvidenceInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    criterion_id: str = ''
+    evidence_type: Literal[
+        'source_change',
+        'test_result',
+        'typecheck',
+        'build',
+        'lint',
+        'smoke',
+        'symbol_evidence',
+        'runtime_integration',
+        'configuration',
+        'review',
+        'manual_limitation',
+    ] = 'review'
+    evidence_paths: list[str] = Field(default_factory=list, max_length=50)
+    symbols: list[str] = Field(default_factory=list, max_length=50)
+    verification_record_ids: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    source_revision: int = 0
+    producer: Literal['tool', 'model', 'runtime', 'test'] = 'model'
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    explanation: str = Field(default='', max_length=2_000)
+    status: Literal[
+        'pending',
+        'partially_satisfied',
+        'satisfied',
+        'blocked',
+    ] | None = None
 
 
 class TaskUpdateInput(ToolInput):
     step_id: str = Field(min_length=1)
     status: Literal['pending', 'in_progress', 'completed', 'blocked']
     evidence: list[str] = Field(default_factory=list, max_length=20)
+    deliverables: list[str] = Field(default_factory=list, max_length=20)
+    criterion_ids: list[str] = Field(default_factory=list, max_length=20)
+    evidence_paths: list[str] = Field(default_factory=list, max_length=50)
+    symbols: list[str] = Field(default_factory=list, max_length=50)
+    verification_record_ids: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    acceptance_evidence: list[TaskUpdateEvidenceInput] = Field(
+        default_factory=list,
+        max_length=50,
+    )
 
 
 class TaskUpdateTool(Tool[TaskUpdateInput]):
@@ -95,11 +168,33 @@ class TaskUpdateTool(Tool[TaskUpdateInput]):
     )
     input_model = TaskUpdateInput
 
-    def __init__(self, root: Path, manager: TaskManager) -> None:
+    def __init__(
+        self,
+        root: Path,
+        manager: TaskManager,
+        *,
+        acceptance_ledger: AcceptanceLedger | None = None,
+        workspace_tracker: Any | None = None,
+    ) -> None:
         super().__init__(root)
         self.manager = manager
+        self.acceptance_ledger = acceptance_ledger
+        self.workspace_tracker = workspace_tracker
 
     async def execute(self, arguments: TaskUpdateInput) -> ToolResult:
+        previous = self.manager.active
+        previous_step = (
+            next(
+                (
+                    step
+                    for step in previous.steps
+                    if step.id == arguments.step_id
+                ),
+                None,
+            )
+            if previous is not None
+            else None
+        )
         try:
             task = self.manager.update_step(
                 arguments.step_id,
@@ -109,6 +204,43 @@ class TaskUpdateTool(Tool[TaskUpdateInput]):
         except ValueError as error:
             raise ToolExecutionError('task_update_rejected', str(error)) from error
         current = task.current_step.title if task.current_step else 'none'
+        source_revision = _source_revision(self.workspace_tracker)
+        criterion_ids = tuple(
+            dict.fromkeys(
+                (
+                    *(
+                        previous_step.criterion_ids
+                        if previous_step is not None
+                        else ()
+                    ),
+                    *arguments.criterion_ids,
+                )
+            )
+        )
+        attached = _acceptance_evidence(
+            arguments,
+            criterion_ids=criterion_ids,
+            source_revision=source_revision,
+            ledger=self.acceptance_ledger,
+        )
+        completed_criteria = (
+            self.acceptance_ledger.record_many(attached)
+            if self.acceptance_ledger is not None
+            else ()
+        )
+        evidence_valid = bool(attached) and all(
+            item.criterion_id
+            and (
+                item.evidence_paths
+                or item.symbols
+                or item.verification_record_ids
+                or item.evidence_type in {'review', 'manual_limitation'}
+            )
+            for item in attached
+        )
+        completed_plan_step = (
+            arguments.status == 'completed' and evidence_valid
+        )
         return ToolResult.ok(
             f'Updated {arguments.step_id} to {arguments.status}.',
             content=f'Current step: {current}',
@@ -116,6 +248,12 @@ class TaskUpdateTool(Tool[TaskUpdateInput]):
                 'task_id': task.id,
                 'step_id': arguments.step_id,
                 'status': arguments.status,
+                'completed_plan_step': completed_plan_step,
+                'evidence_valid': evidence_valid,
+                'completed_criterion_ids': list(completed_criteria),
+                'acceptance_evidence': [
+                    item.as_dict() for item in attached
+                ],
             },
         )
 
@@ -123,9 +261,99 @@ class TaskUpdateTool(Tool[TaskUpdateInput]):
 def create_task_tools(
     root: Path,
     manager: TaskManager,
+    *,
+    acceptance_ledger: AcceptanceLedger | None = None,
+    workspace_tracker: Any | None = None,
 ) -> tuple[TaskGetTool, TaskPlanTool, TaskUpdateTool]:
     return (
         TaskGetTool(root, manager),
         TaskPlanTool(root, manager),
-        TaskUpdateTool(root, manager),
+        TaskUpdateTool(
+            root,
+            manager,
+            acceptance_ledger=acceptance_ledger,
+            workspace_tracker=workspace_tracker,
+        ),
+    )
+
+
+def _plan_step_links(
+    steps: list[str | TaskPlanStepInput],
+) -> tuple[list[str], dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+    titles: list[str] = []
+    deliverables: dict[str, tuple[str, ...]] = {}
+    criterion_ids: dict[str, tuple[str, ...]] = {}
+    for index, item in enumerate(steps, start=1):
+        step_id = f'step-{index}'
+        if isinstance(item, str):
+            titles.append(item)
+            continue
+        titles.append(item.title)
+        deliverables[step_id] = tuple(item.deliverables)
+        criterion_ids[step_id] = tuple(item.criterion_ids)
+    return titles, deliverables, criterion_ids
+
+
+def _acceptance_evidence(
+    arguments: TaskUpdateInput,
+    *,
+    criterion_ids: tuple[str, ...],
+    source_revision: int,
+    ledger: AcceptanceLedger | None,
+) -> tuple[AcceptanceEvidence, ...]:
+    payloads: list[dict[str, Any]] = [
+        item.model_dump(exclude_none=True)
+        for item in arguments.acceptance_evidence
+    ]
+    if not payloads and criterion_ids and (
+        arguments.evidence_paths
+        or arguments.symbols
+        or arguments.verification_record_ids
+    ):
+        payloads.extend(
+            {
+                'criterion_id': criterion_id,
+                'evidence_type': (
+                    'test_result'
+                    if arguments.verification_record_ids
+                    else 'source_change'
+                ),
+                'evidence_paths': arguments.evidence_paths,
+                'symbols': arguments.symbols,
+                'verification_record_ids': arguments.verification_record_ids,
+                'source_revision': source_revision,
+                'producer': 'model',
+                'confidence': 0.8,
+                'explanation': '; '.join(arguments.evidence),
+            }
+            for criterion_id in criterion_ids
+        )
+    evidence: list[AcceptanceEvidence] = []
+    for payload in payloads:
+        criterion = str(payload.get('criterion_id', ''))
+        criterion_text = (
+            ledger.criterion_text(criterion)
+            if ledger is not None
+            else ''
+        )
+        evidence.append(
+            evidence_from_payload(
+                payload,
+                criterion_text=criterion_text,
+                source_revision=source_revision,
+                plan_step_id=arguments.step_id,
+            )
+        )
+    return tuple(evidence)
+
+
+def _source_revision(workspace_tracker: Any | None) -> int:
+    if workspace_tracker is None:
+        return 0
+    return int(
+        getattr(
+            workspace_tracker,
+            'source_revision',
+            getattr(workspace_tracker, 'revision', 0),
+        )
     )

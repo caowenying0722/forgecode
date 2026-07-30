@@ -708,6 +708,8 @@ Working Layer
 
 ForgeCode 不再接受“模型说已经完成”作为修改任务的完成依据。只要当前轮次产生真实工作区 Diff，运行时就会强制检查：Diff 非空且属于本轮、修改路径没有越界、没有修改隐藏测试、自动 `git diff --check` 通过、`verify` 成功，并且验证对应最终工作区 revision。验证后再次编辑会立即使旧证据失效，必须重新验证；缺少证据时 `finish_task` 和普通最终回答都会被拒绝。只读回答不受测试门禁影响，检查型任务仍必须先取得仓库读取或搜索证据。
 
+完成判定还会维护通用 `AcceptanceLedger`。每条 `TaskContract.acceptance_criteria` 会得到稳定的 `criterion-N` ID，并只能由结构化 `AcceptanceEvidence` 推进，例如源码/配置变更、测试、typecheck、build、lint、smoke、review 或明确的 manual limitation。`task_update` 成功更新计划展示状态并不自动算有效进展；只有完成步骤时附带目标文件、符号、verification record 或 criterion evidence，才会重置停滞计数或增加完成度。`finish_task` 被拒绝时会返回具体缺口，包括 pending deliverables、missing/partial criteria、missing evidence、pending plan steps、missing verification、unrelated/forbidden changes 和推荐下一步。
+
 高保障场景还可以通过 `TaskPolicy(require_diff_review=True)` 要求 Agent 使用 `git_diff` 查看每个最终修改文件。该选项默认关闭，因为调用 `git_diff` 只能证明内容被取回，不能客观证明模型真正理解了变更。持久任务图中声明的每一条 `verification` 也必须在 `task_complete.evidence` 中逐项引用，不能用笼统的“测试已通过”代替计划中的验证要求。
 
 ### Slash Command
@@ -741,7 +743,7 @@ ForgeCode 在交互终端中提供 Slash Command，用于执行不需要交给�
 
 记忆保存在当前仓库的 `.forge/memory/` 下，可以直接通过 Markdown 文件检查和编辑。疑似包含 API Key、Token、密码或私钥的内容会被拒绝写入。
 
-会话恢复采用追加式 Rollout，而不是文件 Checkpoint。每条记录包含单调递增序号并在写入后刷新到磁盘；启动恢复时会忽略唯一一条被截断的末尾记录。若上一次进程停止在工具批次中间，已记录成功结果的工具会作为既有 `tool_result` 恢复，未完成工具会被标记为 `interrupted_tool_call`，由 Agent 先检查工作区再决定是否重试。`/resume` 选择器只展示最近 15 个保存会话，选中后完整恢复该会话的消息历史。`/resume` 不修改代码文件，只在 Git HEAD、分支或工作区摘要不一致时给出警告；`/fork` 复制对话状态并保留父 Session，代码隔离仍应使用 Git branch 或 worktree。
+会话恢复采用追加式 Rollout，而不是文件 Checkpoint。每条记录包含单调递增序号并在写入后刷新到磁盘；启动恢复时会忽略唯一一条被截断的末尾记录。若上一次进程停止在工具批次中间，已记录成功结果的工具会作为既有 `tool_result` 恢复，未完成工具会被标记为 `interrupted_tool_call`，由 Agent 先检查工作区再决定是否重试。Acceptance evidence 会以 `acceptance_ledger_updated` 事件追加写入，包含完整 ledger 快照，因此 resume/fork 后可以重建 satisfied、partial 和 pending criteria。`/resume` 选择器只展示最近 15 个保存会话，选中后完整恢复该会话的消息历史。`/resume` 不修改代码文件，只在 Git HEAD、分支或工作区摘要不一致时给出警告；`/fork` 复制对话状态并保留父 Session，代码隔离仍应使用 Git branch 或 worktree。
 
 `/context` 使用字符数近似估算 Token，同时展示本地保存的完整历史，以及经过大型工具结果落盘、旧工具结果缩短和中间消息裁剪后的实际请求历史。System Prompt、仓库规则/相关 Memory 和工具 Schema 会计入实际请求。预计剩余量按照下面的方式计算：
 

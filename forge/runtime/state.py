@@ -233,6 +233,16 @@ class VerificationCompleted:
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptanceLedgerUpdated:
+    '''Acceptance evidence changed for one or more task criteria.'''
+
+    evidence: tuple[dict[str, Any], ...]
+    completed_criterion_ids: tuple[str, ...] = ()
+    source_revision: int = 0
+    ledger: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class CompletionBlocked:
     '''The runtime rejected a premature model completion.'''
 
@@ -276,6 +286,7 @@ type ConversationEvent = (
     | ToolExecutionCompleted
     | WorkspaceChanged
     | VerificationCompleted
+    | AcceptanceLedgerUpdated
     | CompletionBlocked
     | ContextCompacted
     | TurnCompleted

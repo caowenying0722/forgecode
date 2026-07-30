@@ -46,6 +46,7 @@ from forge.runtime.agent_messages import (
     build_assistant_message,
     build_tool_result_message,
 )
+from forge.runtime.acceptance import AcceptanceLedger
 from forge.runtime.agent_controller import (
     AgentControlState,
     AgentController,
@@ -102,6 +103,7 @@ from forge.runtime.completion import CompletionGate, TaskPolicy
 from forge.runtime.background import BackgroundTaskManager
 from forge.runtime.team import MessageBus, render_team_notification
 from forge.runtime.state import (
+    AcceptanceLedgerUpdated,
     AgentPhaseChanged,
     CompletionBlocked,
     ConversationEvent,
@@ -339,6 +341,7 @@ class Conversation:
         self.run_state = AgentRunState()
         self.agent_controller = AgentController()
         self.verification_ledger = VerificationLedger()
+        self.acceptance_ledger = AcceptanceLedger()
         if registry is not None:
             if 'task' in registry.names:
                 registry.replace(
@@ -361,6 +364,8 @@ class Conversation:
             for task_tool in create_task_tools(
                 resolved_context_root,
                 self.task_manager,
+                acceptance_ledger=self.acceptance_ledger,
+                workspace_tracker=tracker,
             ):
                 registry.register(task_tool)
             for team_tool in create_team_tools(
@@ -413,6 +418,7 @@ class Conversation:
             tracker,
             completion_gate,
             self.task_manager,
+            acceptance_ledger=self.acceptance_ledger,
         )
         self.recovery_manager = RecoveryManager(
             self.tools,
@@ -549,9 +555,12 @@ class Conversation:
         self.working_state = WorkingState()
         self.run_state = AgentRunState()
         task_contract = await self._resolved_task_contract(prompt)
+        self.acceptance_ledger.configure(task_contract)
+        self.completion_checker.task_contract = task_contract
         self.agent_controller.begin_turn(task_contract)
         runtime = self.agent_controller.snapshot()
         runtime.verification_ledger = self.verification_ledger
+        runtime.acceptance_ledger = self.acceptance_ledger
         runtime.budget.max_model_calls = self.max_iterations
         runtime.budget.max_tool_calls = self.max_turn_tool_calls
         verification_state = runtime.verification
@@ -1243,6 +1252,40 @@ class Conversation:
                             source_revision=change.source_revision,
                             source_paths=change.source_paths,
                         )
+                        acceptance_paths = (
+                            change.source_paths
+                            or (
+                                self.workspace_tracker.changed_paths
+                                if self.workspace_tracker is not None
+                                else ()
+                            )
+                            or (
+                                change.paths
+                                if self.workspace_tracker is None
+                                else ()
+                            )
+                        )
+                        if acceptance_paths:
+                            completed = self.acceptance_ledger.observe_source_change(
+                                acceptance_paths,
+                                source_revision=change.source_revision,
+                            )
+                            batch.completed_criterion_ids.extend(completed)
+                            evidence = self.acceptance_ledger.evidence_snapshot(
+                                source_revision=change.source_revision,
+                            )
+                            if evidence:
+                                batch.attached_acceptance_evidence.extend(
+                                    item.as_dict() for item in evidence
+                                )
+                                yield AcceptanceLedgerUpdated(
+                                    evidence=tuple(
+                                        item.as_dict() for item in evidence
+                                    ),
+                                    completed_criterion_ids=completed,
+                                    source_revision=change.source_revision,
+                                    ledger=self.acceptance_ledger.as_dict(),
+                                )
                     decision = await self.completion_checker.evaluate(
                         verification_state.latest,
                         mutation_attempted=(
@@ -1693,14 +1736,22 @@ class Conversation:
                 if self.workspace_tracker is not None:
                     change = await self.workspace_tracker.refresh()
                     if change is not None:
-                        tool_changed_workspace = bool(change.source_paths)
-                        if change.source_paths:
+                        task_changed_paths = (
+                            self.workspace_tracker.changed_paths
+                        )
+                        tool_changed_workspace = bool(
+                            change.source_paths or task_changed_paths
+                        )
+                        if change.source_paths or task_changed_paths:
                             batch.last_workspace_change_position = tool_position
+                        if change.source_paths:
                             self.working_state.advance_revision(
                                 change.source_revision,
                                 change.source_paths,
                             )
-                        if tool_effect == 'process' and change.source_paths:
+                        if tool_effect == 'process' and (
+                            change.source_paths or task_changed_paths
+                        ):
                             mutation_attempted = True
                         yield WorkspaceChanged(
                             revision=change.revision,
@@ -1709,6 +1760,31 @@ class Conversation:
                             source_revision=change.source_revision,
                             source_paths=change.source_paths,
                         )
+                        acceptance_paths = (
+                            change.source_paths
+                            or task_changed_paths
+                        )
+                        if acceptance_paths:
+                            completed = self.acceptance_ledger.observe_source_change(
+                                acceptance_paths,
+                                source_revision=change.source_revision,
+                            )
+                            batch.completed_criterion_ids.extend(completed)
+                            evidence = self.acceptance_ledger.evidence_snapshot(
+                                source_revision=change.source_revision,
+                            )
+                            if evidence:
+                                batch.attached_acceptance_evidence.extend(
+                                    item.as_dict() for item in evidence
+                                )
+                                yield AcceptanceLedgerUpdated(
+                                    evidence=tuple(
+                                        item.as_dict() for item in evidence
+                                    ),
+                                    completed_criterion_ids=completed,
+                                    source_revision=change.source_revision,
+                                    ledger=self.acceptance_ledger.as_dict(),
+                                )
                     elif is_satisfied_non_diff_workspace_write(
                         tool_call,
                         result,
@@ -1727,6 +1803,8 @@ class Conversation:
                         )
                     )
                 if result.metadata.get('verification') is True:
+                    previous_verification = verification_state.latest
+                    previous_repair_target = verification_state.repair_target
                     if (
                         result.error is not None
                         and result.error.code == 'repeated_tool_call'
@@ -1784,8 +1862,45 @@ class Conversation:
                     )
                     if verification_evidence is None:
                         continue
+                    batch.previous_verification_error_count = (
+                        _verification_error_count(
+                            previous_verification,
+                            None,
+                        )
+                    )
+                    batch.current_verification_error_count = (
+                        _verification_error_count(
+                            verification_evidence,
+                            result,
+                        )
+                    )
+                    previous_signature = (
+                        previous_verification.failure_signature
+                        if previous_verification is not None
+                        else ''
+                    )
+                    batch.failure_signature_changed = bool(
+                        previous_signature
+                        and verification_evidence.failure_signature
+                        and previous_signature
+                        != verification_evidence.failure_signature
+                    )
+                    batch.verification_reused = (
+                        verification_evidence.verification_reused
+                    )
                     verification_state.latest = verification_evidence
                     if verification_state.latest.success:
+                        batch.repair_target_resolved = bool(
+                            previous_repair_target is not None
+                            and _paths_overlap(
+                                previous_repair_target.paths,
+                                (
+                                    self.workspace_tracker.changed_paths
+                                    if self.workspace_tracker is not None
+                                    else ()
+                                ),
+                            )
+                        )
                         verification_state.clear_failure()
                     else:
                         verification_state.repair_target = (
@@ -1842,11 +1957,102 @@ class Conversation:
                         verification_state.read_count = 0
                     if verification_state.latest is not None:
                         batch.verification_progressed = True
+                        completed = self.acceptance_ledger.observe_verification(
+                            verification_state.latest
+                        )
+                        batch.completed_criterion_ids.extend(completed)
+                        evidence = self.acceptance_ledger.evidence_snapshot(
+                            criterion_ids=completed,
+                            source_revision=verification_state.latest.bound_source_revision,
+                        )
+                        if evidence:
+                            batch.attached_acceptance_evidence.extend(
+                                item.as_dict() for item in evidence
+                            )
+                            yield AcceptanceLedgerUpdated(
+                                evidence=tuple(
+                                    item.as_dict() for item in evidence
+                                ),
+                                completed_criterion_ids=completed,
+                                source_revision=(
+                                    verification_state.latest.bound_source_revision
+                                ),
+                                ledger=self.acceptance_ledger.as_dict(),
+                            )
                         yield VerificationCompleted(
                             evidence=verification_state.latest
                         )
+                if (
+                    tool_call.name in {'task_plan', 'todo_write'}
+                    and result.success
+                ):
+                    task = self.task_manager.active
+                    step_ids = tuple(
+                        step.id for step in task.steps
+                    ) if task is not None and task.steps else tuple(
+                        str(item.get('id', ''))
+                        for item in tool_call.arguments.get('todos', [])
+                        if isinstance(item, dict) and item.get('id')
+                    )
+                    completed = self.acceptance_ledger.observe_plan(
+                        step_ids=step_ids
+                    )
+                    batch.completed_criterion_ids.extend(completed)
+                    evidence = self.acceptance_ledger.evidence_snapshot(
+                        criterion_ids=completed,
+                    )
+                    if evidence:
+                        batch.attached_acceptance_evidence.extend(
+                            item.as_dict() for item in evidence
+                        )
+                        yield AcceptanceLedgerUpdated(
+                            evidence=tuple(
+                                item.as_dict() for item in evidence
+                            ),
+                            completed_criterion_ids=completed,
+                            source_revision=_source_revision(
+                                self.workspace_tracker
+                            ),
+                            ledger=self.acceptance_ledger.as_dict(),
+                        )
                 if tool_call.name == 'task_update' and result.success:
-                    batch.task_progressed = True
+                    completed = tuple(
+                        str(item)
+                        for item in result.metadata.get(
+                            'completed_criterion_ids',
+                            [],
+                        )
+                    )
+                    batch.completed_criterion_ids.extend(completed)
+                    if bool(result.metadata.get('completed_plan_step')):
+                        batch.completed_step_ids.append(
+                            str(result.metadata.get('step_id', ''))
+                        )
+                    if bool(result.metadata.get('evidence_valid')):
+                        batch.evidence_valid = True
+                    evidence_payload = result.metadata.get(
+                        'acceptance_evidence',
+                        [],
+                    )
+                    if isinstance(evidence_payload, list):
+                        batch.attached_acceptance_evidence.extend(
+                            item
+                            for item in evidence_payload
+                            if isinstance(item, dict)
+                        )
+                        if evidence_payload:
+                            yield AcceptanceLedgerUpdated(
+                                evidence=tuple(
+                                    item
+                                    for item in evidence_payload
+                                    if isinstance(item, dict)
+                                ),
+                                completed_criterion_ids=completed,
+                                source_revision=_source_revision(
+                                    self.workspace_tracker
+                                ),
+                                ledger=self.acceptance_ledger.as_dict(),
+                            )
             request_messages.append(build_tool_result_message(batch.results))
 
             if batch.terminal_finish_reasons:
@@ -2267,11 +2473,19 @@ class Conversation:
                     if verification_state.repair_target is not None
                     else ()
                 ),
-                verification_reused=(
-                    verification_state.latest.verification_reused
-                    if verification_state.latest is not None
-                    else False
+                completed_acceptance_criteria=tuple(
+                    dict.fromkeys(batch.completed_criterion_ids)
                 ),
+                completed_plan_step=bool(batch.completed_step_ids),
+                previous_verification_error_count=(
+                    batch.previous_verification_error_count
+                ),
+                current_verification_error_count=(
+                    batch.current_verification_error_count
+                ),
+                failure_signature_changed=batch.failure_signature_changed,
+                verification_reused=batch.verification_reused,
+                repair_target_resolved=batch.repair_target_resolved,
             )
             if progress.progressed:
                 calls_without_progress = 0
@@ -2856,6 +3070,14 @@ class Conversation:
         self.messages[:] = snapshot.messages
         self.session_id = snapshot.id
         self.task_manager.active = snapshot.active_task
+        if isinstance(getattr(snapshot, 'acceptance_ledger', None), dict):
+            restored = AcceptanceLedger.from_dict(
+                snapshot.acceptance_ledger
+            )
+            self.acceptance_ledger.criteria = restored.criteria
+            self.acceptance_ledger.current_source_revision = (
+                restored.current_source_revision
+            )
         self.interaction_mode = normalize_interaction_mode(
             snapshot.interaction_mode
         )
@@ -3115,6 +3337,42 @@ def render_mcp_status(root: Path, tool_names: tuple[str, ...]) -> str:
     lines.append(f'Tools: {len(tool_names)}')
     lines.extend(f'- {name}' for name in tool_names)
     return '\n'.join(lines)
+
+
+def _source_revision(tracker: WorkspaceTracker | None) -> int:
+    if tracker is None:
+        return 0
+    return int(getattr(tracker, 'source_revision', tracker.revision))
+
+
+def _verification_error_count(
+    verification: VerificationEvidence | None,
+    result: ToolResult | None,
+) -> int | None:
+    if verification is None:
+        return None
+    if verification.success:
+        return 0
+    if result is not None:
+        explicit = result.metadata.get('verification_error_count')
+        if explicit is None:
+            explicit = result.metadata.get('error_count')
+        try:
+            return int(explicit)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            pass
+        text = '\n'.join((result.summary, result.content))
+        counted = text.casefold().count('error')
+        return counted if counted > 0 else 1
+    return 1
+
+
+def _paths_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    normalized_left = {path.replace('\\', '/') for path in left if path}
+    normalized_right = {path.replace('\\', '/') for path in right if path}
+    if not normalized_left or not normalized_right:
+        return False
+    return bool(normalized_left & normalized_right)
 
 
 def normalize_interaction_mode(mode: str) -> InteractionMode:

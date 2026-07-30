@@ -299,13 +299,25 @@ def render_task_contract_context(contract: TaskContract) -> str:
 
 
 def render_contract_summary(contract: TaskContract) -> str:
-    return (
+    summary = (
         f'- intent: {contract.intent.kind} '
         f'({contract.intent.confidence}, {contract.intent.reason})\n'
         f'- completion contract: {contract.completion_contract}\n'
         f'- initial phase: {contract.initial_phase}\n'
         f'- initial tool surface: {contract.initial_tool_surface}\n'
     )
+    if contract.deliverables:
+        summary += '- deliverables:\n'
+        summary += ''.join(
+            f'  - {item}\n' for item in contract.deliverables
+        )
+    if contract.acceptance_criteria:
+        summary += '- acceptance criteria:\n'
+        summary += ''.join(
+            f'  - criterion-{index}: {item}\n'
+            for index, item in enumerate(contract.acceptance_criteria, start=1)
+        )
+    return summary
 
 
 def recovery_system_suffix(

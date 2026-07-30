@@ -37,12 +37,15 @@ def evaluate_progress(
     current_verification_error_count: int | None = None,
     failure_signature_changed: bool = False,
     verification_reused: bool = False,
+    repair_target_resolved: bool = False,
 ) -> ProgressEvaluation:
     '''Classify whether the last batch materially advanced the task.'''
     if completed_acceptance_criteria:
         return ProgressEvaluation(True, 'acceptance_criterion')
     if completed_plan_step:
         return ProgressEvaluation(True, 'plan_step')
+    if repair_target_resolved:
+        return ProgressEvaluation(True, 'repair_target_resolved')
     if workspace_progressed:
         effective_source_paths = source_changed_paths or changed_paths
         if not effective_source_paths:

@@ -124,6 +124,10 @@ class SessionRollout:
                 tool_id = str(payload.get('tool_call_id', ''))
                 if tool_id:
                     completed_tools[tool_id] = payload
+            elif event_type == 'acceptance_ledger_updated':
+                ledger = payload.get('ledger')
+                if isinstance(ledger, dict):
+                    state['acceptance_ledger'] = ledger
         state['messages'] = repair_dangling_tool_batch(
             messages,
             started_tools,

@@ -74,6 +74,17 @@ class ToolBatchState:
     task_progressed: bool = False
     evidence_progressed: bool = False
     verification_progressed: bool = False
+    completed_step_ids: list[str] = field(default_factory=list)
+    completed_criterion_ids: list[str] = field(default_factory=list)
+    attached_acceptance_evidence: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    evidence_valid: bool = False
+    previous_verification_error_count: int | None = None
+    current_verification_error_count: int | None = None
+    failure_signature_changed: bool = False
+    verification_reused: bool = False
+    repair_target_resolved: bool = False
     required_change_rejected: bool = False
     accepted_finish: ToolResult | None = None
     terminal_finish_reasons: tuple[str, ...] = ()

@@ -35,6 +35,7 @@ class SessionSnapshot:
     cwd: str
     messages: list[dict[str, Any]]
     active_task: ActiveTask | None = None
+    acceptance_ledger: dict[str, Any] | None = None
     interaction_mode: str = 'auto'
     permission_mode: str = 'trusted'
     git_head: str | None = None
@@ -55,6 +56,7 @@ class SessionSnapshot:
                 if self.active_task is not None
                 else None
             ),
+            'acceptance_ledger': self.acceptance_ledger,
             'interaction_mode': self.interaction_mode,
             'permission_mode': self.permission_mode,
             'git_head': self.git_head,
@@ -85,6 +87,11 @@ class SessionSnapshot:
             active_task=(
                 ActiveTask.from_dict(active_task_data)
                 if isinstance(active_task_data, dict)
+                else None
+            ),
+            acceptance_ledger=(
+                dict(data['acceptance_ledger'])
+                if isinstance(data.get('acceptance_ledger'), dict)
                 else None
             ),
             interaction_mode=str(data.get('interaction_mode', 'auto')),
@@ -254,6 +261,9 @@ class SessionStore:
             cwd=str(self.root),
             messages=json_round_trip(messages),
             active_task=active_task,
+            acceptance_ledger=(
+                existing.acceptance_ledger if existing is not None else None
+            ),
             interaction_mode=interaction_mode,
             permission_mode=permission_mode,
             git_head=identity['git_head'],

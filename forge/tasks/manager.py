@@ -58,6 +58,8 @@ class TaskManager:
         *,
         constraints: list[str] | None = None,
         scope_hints: list[str] | None = None,
+        step_deliverables: dict[str, tuple[str, ...]] | None = None,
+        step_criterion_ids: dict[str, tuple[str, ...]] | None = None,
         replace_existing: bool = False,
     ) -> ActiveTask:
         task = self._require_active()
@@ -73,6 +75,14 @@ class TaskManager:
                 id=f'step-{index}',
                 title=title,
                 status='in_progress' if index == 1 else 'pending',
+                deliverables=(step_deliverables or {}).get(
+                    f'step-{index}',
+                    (),
+                ),
+                criterion_ids=(step_criterion_ids or {}).get(
+                    f'step-{index}',
+                    (),
+                ),
             )
             for index, title in enumerate(clean_steps, start=1)
         )

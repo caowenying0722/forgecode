@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 import hashlib
-import re
 
 from forge.context.working import WorkingState
+from forge.runtime.acceptance import AcceptanceLedger
 from forge.runtime.completion import CompletionDecision, CompletionGate
+from forge.runtime.intent import TaskContract
 from forge.runtime.state import ToolCall, VerificationEvidence
 from forge.runtime.task_scope import (
     evaluate_change_relevance,
@@ -44,10 +45,14 @@ class CompletionChecker:
         tracker: WorkspaceTracker | None,
         gate: CompletionGate | None,
         task_manager: TaskManager,
+        *,
+        acceptance_ledger: AcceptanceLedger | None = None,
     ) -> None:
         self.tracker = tracker
         self.gate = gate
         self.task_manager = task_manager
+        self.acceptance_ledger = acceptance_ledger or AcceptanceLedger()
+        self.task_contract: TaskContract | None = None
         self.last_finish_gap_report: dict[str, object] = {}
 
     @property
@@ -147,11 +152,11 @@ class CompletionChecker:
             )
             self.last_finish_gap_report = gap_report
             missing = (
-                tuple(gap_report.get('missing_deliverables', ()))
-                + tuple(gap_report.get('missing_acceptance_criteria', ()))
-                + tuple(gap_report.get('unfinished_plan_steps', ()))
-                + tuple(gap_report.get('missing_runtime_integration', ()))
-                + tuple(gap_report.get('missing_verification_types', ()))
+                tuple(gap_report.get('pending_deliverables', ()))
+                + tuple(gap_report.get('missing_criteria', ()))
+                + tuple(gap_report.get('pending_plan_steps', ()))
+                + tuple(gap_report.get('missing_verification', ()))
+                + tuple(gap_report.get('unresolved_repair_target', ()))
             )
             if missing:
                 reasons.append(
@@ -177,37 +182,9 @@ class CompletionChecker:
         changed_paths = (
             self.tracker.changed_paths if self.tracker is not None else ()
         )
-        all_paths = tuple(
-            dict.fromkeys((*changed_paths, *evidence_paths))
-        )
-        goal = task.goal
-        feature_criteria = _feature_acceptance_criteria(goal)
-        text = self._changed_and_evidence_text(all_paths)
-        completed_criteria = tuple(
-            criterion
-            for criterion, pattern in feature_criteria
-            if pattern.search(text)
-        )
-        missing_criteria = tuple(
-            criterion
-            for criterion, pattern in feature_criteria
-            if not pattern.search(text)
-        )
-        runtime_missing: list[str] = []
-        if feature_criteria and not re.search(
-            r'(?i)(PlayScene|Scene|create\(|update\(|spawn|runtime|运行时|场景)',
-            text,
-        ):
-            runtime_missing.append('runtime scene/system integration evidence')
-        verification_types = _verification_type_evidence(verification)
-        missing_verification = []
-        if feature_criteria and 'typecheck' not in verification_types:
-            missing_verification.append('typecheck')
-        if feature_criteria and not (
-            {'build', 'test', 'smoke'} & verification_types
-        ):
-            missing_verification.append('build/test/smoke')
-        unfinished_steps = tuple(
+        contract = self.task_contract
+        ledger_report = self.acceptance_ledger.gap_report()
+        pending_steps = tuple(
             step.title for step in task.steps if step.status != 'completed'
         )
         unrelated = (
@@ -220,20 +197,54 @@ class CompletionChecker:
             if self.tracker is not None
             else ()
         )
+        deliverables = (
+            contract.deliverables
+            if contract is not None
+            else ('workspace changes',)
+        )
+        satisfied_criteria = tuple(ledger_report['satisfied_criteria'])
+        partial_criteria = tuple(
+            ledger_report['partially_satisfied_criteria']
+        )
+        missing_criteria = tuple(ledger_report['missing_criteria'])
+        completed_deliverables, pending_deliverables = _deliverable_status(
+            deliverables,
+            changed_paths=changed_paths,
+            evidence_paths=evidence_paths,
+            missing_criteria=missing_criteria,
+            pending_steps=pending_steps,
+        )
+        missing_verification = _missing_verification(
+            contract,
+            verification,
+        )
+        unresolved_repair_target: tuple[str, ...] = ()
+        recommended = _recommended_next_action(
+            pending_deliverables=pending_deliverables,
+            missing_criteria=missing_criteria,
+            missing_verification=missing_verification,
+            pending_steps=pending_steps,
+            unrelated=unrelated,
+            forbidden=forbidden,
+        )
         return {
-            'completed_deliverables': (
-                ('task-relevant source/config changes',)
-                if changed_paths
-                else ()
-            ),
-            'missing_deliverables': (
-                () if changed_paths else ('task-relevant source/config changes',)
-            ),
-            'satisfied_acceptance_criteria': completed_criteria,
+            'completed_deliverables': completed_deliverables,
+            'pending_deliverables': pending_deliverables,
+            'satisfied_criteria': satisfied_criteria,
+            'partially_satisfied_criteria': partial_criteria,
+            'missing_criteria': missing_criteria,
+            'missing_evidence': tuple(ledger_report['missing_evidence']),
+            'pending_plan_steps': pending_steps,
+            'missing_verification': missing_verification,
+            'unresolved_repair_target': unresolved_repair_target,
+            'unrelated_changes': unrelated,
+            'forbidden_changes': forbidden,
+            'recommended_next_action': recommended,
+            # Compatibility aliases for older callers/tests.
+            'missing_deliverables': pending_deliverables,
+            'satisfied_acceptance_criteria': satisfied_criteria,
             'missing_acceptance_criteria': missing_criteria,
-            'unfinished_plan_steps': unfinished_steps,
-            'missing_runtime_integration': tuple(runtime_missing),
-            'missing_verification_types': tuple(missing_verification),
+            'unfinished_plan_steps': pending_steps,
             'has_unrelated_or_forbidden_changes': bool(unrelated or forbidden),
             'unrelated_paths': unrelated,
             'forbidden_paths': forbidden,
@@ -271,6 +282,11 @@ class CompletionChecker:
         task = self.task_manager.active
         if task is not None and task.planned and any(
             step.status != 'completed' for step in task.steps
+        ):
+            return False
+        if (
+            self.acceptance_ledger.partial_ids()
+            or self.acceptance_ledger.pending_ids()
         ):
             return False
         decision = await self.gate.evaluate(
@@ -409,69 +425,69 @@ def build_completion_feedback(
     }
 
 
-def _feature_acceptance_criteria(
-    goal: str,
-) -> tuple[tuple[str, re.Pattern[str]], ...]:
-    text = goal.casefold()
-    wants_upgrade = bool(re.search(r'三选一|3\s*选\s*1|upgrade|升级', text))
-    wants_weapon = bool(re.search(r'武器组合|weapon.*combo|combo|组合', text))
-    wants_boss = bool(re.search(r'\bboss\b|Boss|首领|boss', goal))
-    criteria: list[tuple[str, re.Pattern[str]]] = []
-    if wants_upgrade:
-        criteria.extend(
-            [
-                (
-                    'upgrade candidate generation logic exists',
-                    re.compile(r'(?i)(upgrade|升级).{0,80}(candidate|option|choice|候选|选项)'),
-                ),
-                (
-                    'runtime presents three upgrade choices',
-                    re.compile(r'(?i)(three|3|三).{0,40}(upgrade|choice|option|升级|选项)'),
-                ),
-                (
-                    'player can choose one upgrade',
-                    re.compile(r'(?i)(select|choose|pick|选择).{0,80}(upgrade|升级|option|选项)'),
-                ),
-                (
-                    'chosen upgrade mutates player, weapon, or run state',
-                    re.compile(r'(?i)(apply|mutate|update|add|修改|应用).{0,100}(player|weapon|state|玩家|武器|状态)'),
-                ),
-            ]
-        )
-    if wants_weapon:
-        criteria.extend(
-            [
-                (
-                    'weapon combination can be configured and triggered',
-                    re.compile(r'(?i)(weapon|武器).{0,80}(combo|combine|synergy|组合|合成|联动)'),
-                ),
-                (
-                    'runtime state can activate at least one weapon combination',
-                    re.compile(r'(?i)(trigger|activate|unlock|触发|激活|解锁).{0,100}(combo|combination|组合)'),
-                ),
-            ]
-        )
-    if wants_boss:
-        criteria.extend(
-            [
-                (
-                    'boss spawn condition exists',
-                    re.compile(r'(?i)(boss|首领).{0,100}(spawn|wave|time|score|生成|波次|时间|分数|条件)'),
-                ),
-                (
-                    'boss has independent health, behavior, or phase logic',
-                    re.compile(r'(?i)(boss|首领).{0,120}(health|hp|phase|behavior|生命|血量|阶段|行为)'),
-                ),
-            ]
-        )
-    if criteria:
-        criteria.append(
-            (
-                'scene or runtime entry point wires these systems together',
-                re.compile(r'(?i)(PlayScene|Scene|create\(|update\(|运行时|场景).{0,160}(upgrade|weapon|boss|升级|武器|首领)'),
+def _deliverable_status(
+    deliverables: tuple[str, ...],
+    *,
+    changed_paths: tuple[str, ...],
+    evidence_paths: tuple[str, ...],
+    missing_criteria: tuple[str, ...],
+    pending_steps: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    completed: list[str] = []
+    pending: list[str] = []
+    for deliverable in deliverables:
+        normalized = deliverable.casefold()
+        if any(
+            token in normalized
+            for token in ('workspace', 'change', 'diff', 'code', 'source')
+        ):
+            (completed if changed_paths else pending).append(deliverable)
+        elif 'analysis' in normalized or 'answer' in normalized:
+            (completed if evidence_paths or not missing_criteria else pending).append(
+                deliverable
             )
-        )
-    return tuple(criteria)
+        elif not missing_criteria and not pending_steps:
+            completed.append(deliverable)
+        else:
+            pending.append(deliverable)
+    return tuple(completed), tuple(pending)
+
+
+def _missing_verification(
+    contract: TaskContract | None,
+    verification: VerificationEvidence | None,
+) -> tuple[str, ...]:
+    if contract is None or not contract.verification_policy.required:
+        return ()
+    if verification is None:
+        return ('current verification evidence',)
+    if not verification.success:
+        return ('passing verification evidence',)
+    return ()
+
+
+def _recommended_next_action(
+    *,
+    pending_deliverables: tuple[str, ...],
+    missing_criteria: tuple[str, ...],
+    missing_verification: tuple[str, ...],
+    pending_steps: tuple[str, ...],
+    unrelated: tuple[str, ...],
+    forbidden: tuple[str, ...],
+) -> str:
+    if forbidden:
+        return 'Revert or isolate forbidden changes before finishing.'
+    if unrelated:
+        return 'Remove unrelated changes or connect them to the active task scope.'
+    if pending_steps:
+        return 'Complete the next pending plan step with structured evidence.'
+    if missing_criteria:
+        return 'Produce evidence for the next missing acceptance criterion.'
+    if missing_verification:
+        return 'Run current verification for the final source revision.'
+    if pending_deliverables:
+        return 'Complete the pending deliverable with task-local evidence.'
+    return 'Declare completion with a concise summary.'
 
 
 def _verification_type_evidence(

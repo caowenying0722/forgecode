@@ -9,6 +9,8 @@ from pathlib import Path
 from forge.context.working import WorkingState
 from forge.runtime.completion import CompletionGate, TaskPolicy
 from forge.runtime.completion_checker import CompletionChecker
+from forge.runtime.acceptance import AcceptanceLedger
+from forge.runtime.intent import TaskContract, TurnIntent, VerificationPolicy
 from forge.runtime.state import VerificationEvidence
 from forge.runtime.verification import verification_artifact_scope
 from forge.runtime.workspace import WorkspaceTracker
@@ -61,6 +63,20 @@ def evidence(
         workspace_revision=source_revision,
         source_revision=source_revision,
         verification_type=verification_type,
+    )
+
+
+def contract_with_criteria(criteria: tuple[str, ...]) -> TaskContract:
+    return TaskContract(
+        intent=TurnIntent('implement', 'high', 'test contract'),
+        requires_change=True,
+        requires_plan=False,
+        completion_contract='change',
+        initial_phase='implementing',
+        initial_tool_surface='all',
+        deliverables=('workspace changes',),
+        acceptance_criteria=criteria,
+        verification_policy=VerificationPolicy(kind='required', required=True),
     )
 
 
@@ -380,7 +396,7 @@ def test_forbidden_file_is_not_hidden_by_related_change(tmp_path: Path) -> None:
     assert any('Forbidden paths' in reason for reason in decision.reasons)
 
 
-def test_finish_rejects_config_only_build_without_runtime_feature_evidence(
+def test_finish_rejects_config_only_build_without_smoke_evidence(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -390,7 +406,24 @@ def test_finish_rejects_config_only_build_without_runtime_feature_evidence(
     run(tracker.refresh())
     task_manager = TaskManager(tmp_path)
     task_manager.begin_turn('帮我优先实现“三选一升级 + 武器组合 + Boss”')
-    checker = CompletionChecker(tracker, CompletionGate(tmp_path), task_manager)
+    contract = contract_with_criteria(
+        ('Runtime behavior has smoke evidence.',)
+    )
+    ledger = AcceptanceLedger.from_contract(contract)
+    ledger.observe_verification(
+        evidence(
+            tracker.source_revision,
+            command='npx vite build',
+            verification_type='build',
+        )
+    )
+    checker = CompletionChecker(
+        tracker,
+        CompletionGate(tmp_path),
+        task_manager,
+        acceptance_ledger=ledger,
+    )
+    checker.task_contract = contract
     finish = ToolResult.ok(
         'Declared change task completed.',
         metadata={
@@ -412,11 +445,13 @@ def test_finish_rejects_config_only_build_without_runtime_feature_evidence(
     )
 
     assert reasons
-    assert checker.last_finish_gap_report['missing_acceptance_criteria']
-    assert checker.last_finish_gap_report['missing_runtime_integration']
+    assert checker.last_finish_gap_report['missing_criteria'] == (
+        'Runtime behavior has smoke evidence.',
+    )
+    assert checker.last_finish_gap_report['missing_verification'] == ()
 
 
-def test_finish_accepts_when_feature_criteria_and_verification_have_evidence(
+def test_finish_accepts_when_acceptance_ledger_has_evidence(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -439,7 +474,28 @@ def test_finish_accepts_when_feature_criteria_and_verification_have_evidence(
     run(tracker.refresh())
     task_manager = TaskManager(tmp_path)
     task_manager.begin_turn('帮我优先实现“三选一升级 + 武器组合 + Boss”')
-    checker = CompletionChecker(tracker, CompletionGate(tmp_path), task_manager)
+    contract = contract_with_criteria(
+        (
+            'A source diff exists.',
+            'Runtime behavior has smoke evidence.',
+        )
+    )
+    ledger = AcceptanceLedger.from_contract(contract)
+    ledger.observe_source_change(('src/game/PlayScene.ts',), source_revision=1)
+    ledger.observe_verification(
+        evidence(
+            tracker.source_revision,
+            command='npm run smoke',
+            verification_type='smoke',
+        )
+    )
+    checker = CompletionChecker(
+        tracker,
+        CompletionGate(tmp_path),
+        task_manager,
+        acceptance_ledger=ledger,
+    )
+    checker.task_contract = contract
     finish = ToolResult.ok(
         'Declared change task completed.',
         metadata={
