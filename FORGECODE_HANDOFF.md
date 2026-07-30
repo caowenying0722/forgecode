@@ -10,6 +10,12 @@
 - `finish_task` gap reports are generated from the task contract, plan state, acceptance ledger, verification state, and workspace change classification.
 - Acceptance ledger updates are persisted as `acceptance_ledger_updated` rollout events with full ledger snapshots so sessions can replay satisfied, partial, and pending criteria.
 
-## Remaining Migration Work
+## Runtime State And Recovery Cleanup
 
-See `PLANS.md` for the next milestone covering `RequestState` compatibility fields, `TurnRuntimeState` counter migration, unified recovery scopes, edit revision checks, and further `agent_loop.py` decomposition.
+The current `PLANS.md` milestone is complete:
+
+- `RequestState` recovery/synthesis compatibility scalars were removed; recovery request construction now reads those fields from `TurnRuntimeState`.
+- Action, mutation, and verification recovery tool selection use `RecoveryScope` instead of bare `read_available` booleans.
+- Remaining Agent Loop counters moved into `TurnRuntimeState` sub-states for loop progress, completion gate state, synthesis retries, token-limit recovery, and model-failure recovery.
+- Edit tools now support stale-write guards: `write_file` and `replace_text` accept `expected_sha256`, `write_file_chunk` accepts `expected_current_sha256`, and `apply_patch` accepts `expected_sha256_by_path`. `read_file` returns whole-file `sha256` metadata for this flow.
+- Tool-call signature normalization and early mutation relevance checks moved from `agent_loop.py` to `agent_tool_calls.py`.

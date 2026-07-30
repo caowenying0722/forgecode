@@ -1,6 +1,7 @@
 '''Tests for shell, Git, and patch tools against temporary repositories.'''
 
 import asyncio
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +18,10 @@ from forge.runtime.workspace import WorkspaceTracker
 
 def run(coroutine: object) -> ToolResult:
     return asyncio.run(coroutine)  # type: ignore[arg-type]
+
+
+def hashlib_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def initialize_git_repository(root: Path) -> None:
@@ -358,6 +363,36 @@ def test_apply_patch_changes_the_file_and_reports_status(
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
     assert result.metadata['changed_files'] == ['sample.txt']
     assert 'M sample.txt' in result.content
+
+
+def test_apply_patch_rejects_stale_expected_hash_without_writing(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    path = tmp_path / 'sample.txt'
+    digest = hashlib_sha256(path)
+    path.write_text('user edit\n', encoding='utf-8')
+    patch = (
+        '--- a/sample.txt\n'
+        '+++ b/sample.txt\n'
+        '@@ -1 +1 @@\n'
+        '-user edit\n'
+        '+new\n'
+    )
+
+    result = run(
+        ApplyPatchTool(tmp_path).run(
+            {
+                'patch': patch,
+                'expected_sha256_by_path': {'sample.txt': digest},
+            }
+        )
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'file_hash_mismatch'
+    assert path.read_text(encoding='utf-8') == 'user edit\n'
 
 
 def test_apply_patch_reports_only_its_targets_in_dirty_repository(

@@ -39,6 +39,48 @@ MODULE_PATTERNS = (
 
 
 @dataclass(frozen=True, slots=True)
+class RecoveryScope:
+    '''Bounded recovery read scope derived from runtime state.'''
+
+    phase: str
+    read_count: int = 0
+    read_budget: int = 0
+
+    @property
+    def read_available(self) -> bool:
+        return self.read_count < self.read_budget
+
+    @classmethod
+    def action(cls, *, read_used: bool) -> 'RecoveryScope':
+        return cls(
+            phase='action',
+            read_count=1 if read_used else 0,
+            read_budget=1,
+        )
+
+    @classmethod
+    def mutation(cls, *, read_used: bool) -> 'RecoveryScope':
+        return cls(
+            phase='mutation',
+            read_count=1 if read_used else 0,
+            read_budget=1,
+        )
+
+    @classmethod
+    def verification(
+        cls,
+        *,
+        read_count: int,
+        read_budget: int,
+    ) -> 'RecoveryScope':
+        return cls(
+            phase='verification',
+            read_count=max(0, read_count),
+            read_budget=max(0, read_budget),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RepairTarget:
     '''Specific repair focus derived from the latest structured failure.'''
 
@@ -80,7 +122,7 @@ class RecoveryManager:
     def action_tools(
         self,
         *,
-        read_available: bool,
+        scope: RecoveryScope,
         include_finish: bool = True,
     ) -> list[dict[str, Any]] | None:
         if self.tools is None:
@@ -89,7 +131,7 @@ class RecoveryManager:
         for definition in self.tools:
             name = str(definition.get('name', ''))
             if (
-                (read_available and name in self.read_tools)
+                (scope.read_available and name in self.read_tools)
                 or (include_finish and name == 'finish_task')
                 or (
                     self.tool_runner is not None
@@ -104,7 +146,7 @@ class RecoveryManager:
         self,
         failures: list[dict[str, Any]],
         *,
-        read_available: bool,
+        scope: RecoveryScope,
         include_finish: bool = False,
     ) -> list[dict[str, Any]] | None:
         latest = failures[-1] if failures else {}
@@ -118,12 +160,12 @@ class RecoveryManager:
         }:
             return self.scoped_mutation_tools(
                 failures,
-                read_available=read_available,
+                scope=scope,
                 include_finish=include_finish,
             )
         if latest.get('code') != 'parent_not_found':
             return self.action_tools(
-                read_available=read_available,
+                scope=scope,
                 include_finish=include_finish,
             )
         if self.tools is None:
@@ -141,7 +183,7 @@ class RecoveryManager:
         }
         if not allowed & {'apply_patch', 'write_file', 'write_file_chunk'}:
             allowed.update({'write_file', 'write_file_chunk', 'apply_patch'})
-        if read_available:
+        if scope.read_available:
             allowed.add('list_directory')
         return [
             definition
@@ -153,7 +195,7 @@ class RecoveryManager:
         self,
         failures: list[dict[str, Any]],
         *,
-        read_available: bool,
+        scope: RecoveryScope,
         include_finish: bool,
     ) -> list[dict[str, Any]] | None:
         if self.tools is None:
@@ -182,7 +224,7 @@ class RecoveryManager:
         }
         if not allowed:
             allowed.add('apply_patch')
-        if read_available:
+        if scope.read_available:
             allowed.update({'read_file', 'grep'})
         if include_finish:
             allowed.add('finish_task')
@@ -196,7 +238,7 @@ class RecoveryManager:
         self,
         *,
         fix_available: bool,
-        read_available: bool,
+        scope: RecoveryScope,
         verify_available: bool = True,
     ) -> list[dict[str, Any]] | None:
         if self.tools is None:
@@ -207,7 +249,7 @@ class RecoveryManager:
             allowed.add('verify')
             allowed.update({'git_status', 'git_diff'})
         if fix_available:
-            if read_available:
+            if scope.read_available:
                 allowed.update({'find_files', 'grep', 'read_file'})
         return [
             definition

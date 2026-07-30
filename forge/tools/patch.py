@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import shlex
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from forge.tools.base import (
     Tool,
@@ -21,7 +21,9 @@ from forge.tools.base import (
 from forge.tools.filesystem import (
     MAX_EDIT_CHARACTERS,
     dominant_newline,
+    file_sha256,
     read_text_preserving_newlines,
+    validate_expected_sha256,
 )
 from forge.runtime.process import (
     process_metadata,
@@ -32,6 +34,28 @@ from forge.runtime.process import (
 
 class ApplyPatchInput(ToolInput):
     patch: str = Field(min_length=1, max_length=MAX_EDIT_CHARACTERS)
+    expected_sha256_by_path: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            'Optional map of repository-relative patch target paths to the '
+            'SHA-256 each file must have before the patch is applied. Use '
+            'the sha256 metadata from read_file to reject stale patches.'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def validate_expected_hashes(self) -> ApplyPatchInput:
+        if self.expected_sha256_by_path is None:
+            return self
+        for path, digest in self.expected_sha256_by_path.items():
+            if not path.strip():
+                raise ValueError('expected_sha256_by_path paths must not be empty')
+            if re.fullmatch(r'[0-9a-fA-F]{64}', digest) is None:
+                raise ValueError(
+                    'expected_sha256_by_path values must be 64-character '
+                    'hex SHA-256 digests'
+                )
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +124,11 @@ class ApplyPatchTool(Tool[ApplyPatchInput]):
                     metadata={'format': patch_format},
                 )
             target_paths = tuple(change[0] for change in changes)
+            validate_expected_patch_hashes(
+                self.root,
+                target_paths,
+                arguments.expected_sha256_by_path,
+            )
             for path, _, after in changes:
                 target = resolve_repository_path(
                     self.root,
@@ -152,6 +181,12 @@ class ApplyPatchTool(Tool[ApplyPatchInput]):
                 details=details,
                 metadata={'format': patch_format},
             )
+
+        validate_expected_patch_hashes(
+            self.root,
+            target_paths,
+            arguments.expected_sha256_by_path,
+        )
 
         check = await run_process(
             ['git', 'apply', '--check', '--whitespace=nowarn', '-'],
@@ -212,6 +247,45 @@ class ApplyPatchTool(Tool[ApplyPatchInput]):
                 'apply': process_metadata(applied),
                 'status': process_metadata(status),
             },
+        )
+
+
+def validate_expected_patch_hashes(
+    root: Path,
+    target_paths: tuple[str, ...],
+    expected_sha256_by_path: dict[str, str] | None,
+) -> None:
+    if not expected_sha256_by_path:
+        return
+    targets = set(target_paths)
+    normalized: dict[str, str] = {}
+    for raw_path, digest in expected_sha256_by_path.items():
+        path = resolve_repository_path(
+            root,
+            raw_path,
+            must_exist=False,
+        )
+        shown = display_path(root, path)
+        normalized[shown] = digest.casefold()
+    unknown = sorted(set(normalized) - targets)
+    if unknown:
+        raise ToolExecutionError(
+            'expected_hash_target_mismatch',
+            'expected_sha256_by_path includes path(s) that are not patch '
+            f'targets: {", ".join(unknown)}.',
+            details={
+                'expected_paths': sorted(normalized),
+                'target_paths': sorted(targets),
+            },
+        )
+    for shown, expected in normalized.items():
+        path = resolve_repository_path(root, shown, must_exist=False)
+        actual = file_sha256(path) if path.exists() and path.is_file() else None
+        validate_expected_sha256(
+            path,
+            expected_sha256=expected,
+            actual_sha256=actual,
+            root=root,
         )
 
 

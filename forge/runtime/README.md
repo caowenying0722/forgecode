@@ -8,6 +8,8 @@ branch directly to `agent_loop.py`.
 | --- | --- | --- |
 | `agent_loop` | phase transitions and orchestration order | provider parsing, tool serialization, recovery text |
 | `agent_state` / `state` | turn phases, value objects, emitted events | execution policy or side effects |
+| `agent_controller` | turn-scoped runtime state, control state, bounded counters | prompt rendering or tool execution |
+| `agent_tool_calls` | tool-call signatures, argument normalization, static mutation preflight | tool execution or workspace mutation |
 | `model_client` | Anthropic provider transport and stream parsing | turn-level usage or completion policy |
 | `model_runner` | one model run and cumulative usage | retries requiring workspace/context decisions |
 | `model_failure` | classify model exceptions into recovery actions | conversation or context mutation |

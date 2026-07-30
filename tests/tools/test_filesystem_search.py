@@ -171,12 +171,13 @@ def test_read_file_supports_inclusive_line_ranges(tmp_path: Path) -> None:
         '     2 | TODO: repair parser\n'
         '     3 | third'
     )
-    assert result.metadata == {
-        'path': 'src/app.py',
-        'start_line': 2,
-        'end_line': 3,
-        'total_lines': 3,
-    }
+    assert result.metadata['path'] == 'src/app.py'
+    assert result.metadata['start_line'] == 2
+    assert result.metadata['end_line'] == 3
+    assert result.metadata['total_lines'] == 3
+    assert result.metadata['sha256'] == hashlib.sha256(
+        (tmp_path / 'src' / 'app.py').read_bytes()
+    ).hexdigest()
 
 
 def test_read_file_rejects_an_inverted_range(tmp_path: Path) -> None:
@@ -242,6 +243,29 @@ def test_write_file_creates_and_atomically_replaces_small_text(
     assert replaced.metadata['created'] is False
     assert (tmp_path / 'game.html').read_text(encoding='utf-8') == 'second'
     assert not list(tmp_path.glob('*.forge-tmp'))
+
+
+def test_write_file_rejects_stale_expected_hash(tmp_path: Path) -> None:
+    path = tmp_path / 'game.html'
+    path.write_text('first', encoding='utf-8')
+    tool = WriteFileTool(tmp_path)
+    read = run(ReadFileTool(tmp_path).run({'path': 'game.html'}))
+    path.write_text('changed elsewhere', encoding='utf-8')
+
+    stale = run(
+        tool.run(
+            {
+                'path': 'game.html',
+                'content': 'second',
+                'expected_sha256': read.metadata['sha256'],
+            }
+        )
+    )
+
+    assert stale.success is False
+    assert stale.error is not None
+    assert stale.error.code == 'file_hash_mismatch'
+    assert path.read_text(encoding='utf-8') == 'changed elsewhere'
 
 
 def test_write_file_rejects_content_over_30000_characters(
@@ -332,6 +356,30 @@ def test_write_file_chunk_rejects_offset_and_hash_without_writing(
     assert not (tmp_path / 'new.js').exists()
 
 
+def test_write_file_chunk_rejects_stale_current_hash(tmp_path: Path) -> None:
+    path = tmp_path / 'large.js'
+    path.write_text('original', encoding='utf-8')
+    old_digest = hashlib.sha256(b'original').hexdigest()
+    path.write_text('changed', encoding='utf-8')
+
+    result = run(
+        WriteFileChunkTool(tmp_path).run(
+            {
+                'path': 'large.js',
+                'content': 'replacement',
+                'offset': 0,
+                'truncate': True,
+                'expected_current_sha256': old_digest,
+            }
+        )
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'file_hash_mismatch'
+    assert path.read_text(encoding='utf-8') == 'changed'
+
+
 def test_replace_text_requires_one_exact_occurrence(tmp_path: Path) -> None:
     path = tmp_path / 'game.js'
     path.write_text('const gravity = 1;\n', encoding='utf-8')
@@ -362,6 +410,29 @@ def test_replace_text_requires_one_exact_occurrence(tmp_path: Path) -> None:
     assert missing.error is not None
     assert missing.error.code == 'text_not_found'
     assert missing.error.details['occurrences'] == 0
+
+
+def test_replace_text_rejects_stale_expected_hash(tmp_path: Path) -> None:
+    path = tmp_path / 'game.js'
+    path.write_text('const gravity = 1;\n', encoding='utf-8')
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    path.write_text('const gravity = 2;\n', encoding='utf-8')
+
+    result = run(
+        ReplaceTextTool(tmp_path).run(
+            {
+                'path': 'game.js',
+                'old_text': 'gravity = 2',
+                'new_text': 'gravity = 3',
+                'expected_sha256': digest,
+            }
+        )
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'file_hash_mismatch'
+    assert path.read_text(encoding='utf-8') == 'const gravity = 2;\n'
 
 
 def test_replace_text_reports_whitespace_only_near_miss(

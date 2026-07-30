@@ -149,6 +149,7 @@ class ReadFileTool(Tool[ReadFileInput]):
                 'start_line': arguments.start_line,
                 'end_line': end_line,
                 'total_lines': total_lines,
+                'sha256': file_sha256(path),
             },
         )
 
@@ -156,6 +157,14 @@ class ReadFileTool(Tool[ReadFileInput]):
 class WriteFileInput(ToolInput):
     path: str = Field(min_length=1)
     content: str = Field(min_length=1, max_length=MAX_EDIT_CHARACTERS)
+    expected_sha256: str | None = Field(
+        default=None,
+        pattern=r'^[0-9a-fA-F]{64}$',
+        description=(
+            'Optional SHA-256 of the current file content before this write. '
+            'Use the sha256 metadata from read_file to reject stale edits.'
+        ),
+    )
 
 
 class WriteFileTool(Tool[WriteFileInput]):
@@ -194,15 +203,25 @@ class WriteFileTool(Tool[WriteFileInput]):
             )
 
         existed = path.exists()
+        previous_sha256 = file_sha256(path) if existed else None
+        validate_expected_sha256(
+            path,
+            expected_sha256=arguments.expected_sha256,
+            actual_sha256=previous_sha256,
+            root=self.root,
+        )
         atomic_write_text(path, arguments.content)
         shown_path = display_path(self.root, path)
         action = 'Replaced' if existed else 'Created'
+        digest = file_sha256(path)
         return ToolResult.ok(
             f'{action} {shown_path} with {len(arguments.content)} characters.',
             metadata={
                 'path': shown_path,
                 'characters': len(arguments.content),
                 'created': not existed,
+                'previous_sha256': previous_sha256,
+                'sha256': digest,
             },
         )
 
@@ -216,6 +235,14 @@ class WriteFileChunkInput(ToolInput):
     expected_sha256: str | None = Field(
         default=None,
         pattern=r'^[0-9a-fA-F]{64}$',
+    )
+    expected_current_sha256: str | None = Field(
+        default=None,
+        pattern=r'^[0-9a-fA-F]{64}$',
+        description=(
+            'Optional SHA-256 of the current file content before this chunk. '
+            'Use the sha256 metadata from read_file to reject stale writes.'
+        ),
     )
 
     @model_validator(mode='after')
@@ -281,6 +308,13 @@ class WriteFileChunkTool(Tool[WriteFileChunkInput]):
         else:
             existing = ''
 
+        previous_sha256 = file_sha256(path) if existed else None
+        validate_expected_sha256(
+            path,
+            expected_sha256=arguments.expected_current_sha256,
+            actual_sha256=previous_sha256,
+            root=self.root,
+        )
         actual_offset = len(existing)
         if actual_offset != arguments.offset:
             raise ToolExecutionError(
@@ -327,6 +361,7 @@ class WriteFileChunkTool(Tool[WriteFileChunkInput]):
                 'created': not existed,
                 'truncated': arguments.truncate,
                 'final': arguments.final,
+                'previous_sha256': previous_sha256,
                 'sha256': digest,
             },
         )
@@ -396,6 +431,14 @@ class ReplaceTextInput(ToolInput):
     path: str = Field(min_length=1)
     old_text: str = Field(min_length=1, max_length=MAX_EDIT_CHARACTERS)
     new_text: str = Field(max_length=MAX_EDIT_CHARACTERS)
+    expected_sha256: str | None = Field(
+        default=None,
+        pattern=r'^[0-9a-fA-F]{64}$',
+        description=(
+            'Optional SHA-256 of the current file content before this edit. '
+            'Use the sha256 metadata from read_file to reject stale edits.'
+        ),
+    )
 
 
 class ReplaceTextTool(Tool[ReplaceTextInput]):
@@ -429,6 +472,13 @@ class ReplaceTextTool(Tool[ReplaceTextInput]):
                 'not_utf8_text',
                 f'File is not valid UTF-8 text: {arguments.path}',
             ) from error
+        previous_sha256 = file_sha256(path)
+        validate_expected_sha256(
+            path,
+            expected_sha256=arguments.expected_sha256,
+            actual_sha256=previous_sha256,
+            root=self.root,
+        )
         newline = dominant_newline(content)
         old_text = convert_newlines(arguments.old_text, newline)
         new_text = convert_newlines(arguments.new_text, newline)
@@ -496,12 +546,15 @@ class ReplaceTextTool(Tool[ReplaceTextInput]):
         )
         atomic_write_text(path, updated)
         shown_path = display_path(self.root, path)
+        digest = file_sha256(path)
         return ToolResult.ok(
             f'Replaced one text fragment in {shown_path}.',
             metadata={
                 'path': shown_path,
                 'old_characters': len(arguments.old_text),
                 'new_characters': len(arguments.new_text),
+                'previous_sha256': previous_sha256,
+                'sha256': digest,
             },
         )
 
@@ -623,6 +676,36 @@ def read_text_preserving_newlines(path: Path) -> str:
     '''Read UTF-8 text without universal-newline conversion.'''
     with path.open('r', encoding='utf-8', newline='') as source:
         return source.read()
+
+
+def file_sha256(path: Path) -> str:
+    '''Return the SHA-256 digest of the current file bytes.'''
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def validate_expected_sha256(
+    path: Path,
+    *,
+    expected_sha256: str | None,
+    actual_sha256: str | None,
+    root: Path,
+) -> None:
+    '''Reject stale edits before mutating the filesystem.'''
+    if expected_sha256 is None:
+        return
+    expected = expected_sha256.casefold()
+    if actual_sha256 != expected:
+        raise ToolExecutionError(
+            'file_hash_mismatch',
+            'Current file SHA-256 does not match expected_sha256 for '
+            f'{display_path(root, path)}. Re-read the file before editing.',
+            details={
+                'path': display_path(root, path),
+                'expected_sha256': expected,
+                'actual_sha256': actual_sha256,
+                'exists': path.exists(),
+            },
+        )
 
 
 def dominant_newline(content: str) -> str:

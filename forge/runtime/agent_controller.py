@@ -260,8 +260,60 @@ class ActionRecoveryRuntimeState:
 
 
 @dataclass(slots=True)
+class LoopRuntimeState:
+    '''Counters that describe progress through one model-tool turn.'''
+
+    calls_without_progress: int = 0
+    pre_mutation_calls: int = 0
+    tool_protocol_failures: int = 0
+
+    def reset_progress(self) -> None:
+        self.calls_without_progress = 0
+
+    def reset_pre_mutation(self) -> None:
+        self.pre_mutation_calls = 0
+
+    def reset_protocol_failures(self) -> None:
+        self.tool_protocol_failures = 0
+
+
+@dataclass(slots=True)
+class CompletionRuntimeState:
+    '''Completion-gate counters and review coverage for one turn.'''
+
+    blocks: int = 0
+    last_reasons: tuple[str, ...] = ()
+    ready_revision: int | None = None
+    decision_calls: int = 0
+    ready_context: str = ''
+    reviewed_paths: set[str] = field(default_factory=set)
+
+    def clear_ready(self) -> None:
+        self.ready_revision = None
+        self.decision_calls = 0
+        self.ready_context = ''
+        self.reviewed_paths.clear()
+
+
+@dataclass(slots=True)
+class ModelFailureRuntimeState:
+    '''Model transport/protocol recovery counters for one turn.'''
+
+    reactive_compaction_attempted: bool = False
+    protocol_recoveries: int = 0
+    output_continuations: int = 0
+
+    def clear(self) -> None:
+        self.reactive_compaction_attempted = False
+        self.protocol_recoveries = 0
+        self.output_continuations = 0
+
+
+@dataclass(slots=True)
 class SynthesisRuntimeState:
     mode: SynthesisMode = SynthesisMode.NORMAL
+    retries: int = 0
+    token_limit_reason: str = ''
 
     @property
     def force(self) -> bool:
@@ -276,6 +328,7 @@ class SynthesisRuntimeState:
 
     def clear(self) -> None:
         self.mode = SynthesisMode.NORMAL
+        self.retries = 0
 
     @property
     def finalization_recovery(self) -> bool:
@@ -332,9 +385,15 @@ class TurnRuntimeState:
     planning_recovery_calls: int = 0
     requires_planning: bool = False
     edit_recovery: EditRecoveryState = field(default_factory=EditRecoveryState)
-    completion_ready_context: str = ''
+    loop: LoopRuntimeState = field(default_factory=LoopRuntimeState)
+    completion: CompletionRuntimeState = field(
+        default_factory=CompletionRuntimeState
+    )
     action_recovery_state: ActionRecoveryRuntimeState = field(
         default_factory=ActionRecoveryRuntimeState
+    )
+    model_failure: ModelFailureRuntimeState = field(
+        default_factory=ModelFailureRuntimeState
     )
     synthesis: SynthesisRuntimeState = field(
         default_factory=SynthesisRuntimeState
@@ -427,6 +486,14 @@ class TurnRuntimeState:
     @action_read_used.setter
     def action_read_used(self, value: bool) -> None:
         self.action_recovery_state.read_used = value
+
+    @property
+    def completion_ready_context(self) -> str:
+        return self.completion.ready_context
+
+    @completion_ready_context.setter
+    def completion_ready_context(self, value: str) -> None:
+        self.completion.ready_context = value
 
     @property
     def synthesis_mode(self) -> str:

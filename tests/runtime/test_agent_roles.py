@@ -13,6 +13,7 @@ from forge.runtime.intent import infer_task_contract
 from forge.runtime.agent_controller import (
     AgentControlState,
     AgentController,
+    SynthesisMode,
     TurnRuntimeState,
 )
 from forge.runtime.agent_state import AgentPhase, AgentRunState
@@ -27,6 +28,7 @@ from forge.runtime.model_client import (
     ModelProtocolError,
 )
 from forge.runtime.recovery_manager import RecoveryManager
+from forge.runtime.recovery_manager import RecoveryScope
 from forge.runtime.request_builder import (
     RequestBuilder,
     RequestState,
@@ -302,9 +304,15 @@ def test_request_builder_only_allows_finish_during_final_recovery() -> None:
         excluded_write_tools=frozenset(),
     )
     builder = RequestBuilder(recovery, action_recovery_limit=3)
+    contract = infer_task_contract('请修复 sample.txt')
+    runtime = TurnRuntimeState(
+        control_state=AgentControlState.IMPLEMENTING,
+        contract=contract,
+    )
+    runtime.synthesis.mode = SynthesisMode.FINALIZATION
 
     spec = builder.build(
-        state=RequestState(finalization_recovery=True),
+        state=RequestState(runtime=runtime),
         interaction_mode='code',
         all_tools=tools,
         plan_tools=[tools[0]],
@@ -379,7 +387,6 @@ def test_request_builder_uses_no_tool_surface_for_knowledge_answer() -> None:
 
     spec = RequestBuilder(recovery, action_recovery_limit=3).build(
         state=RequestState(
-            control_state=AgentControlState.EXPLORING,
             task_contract=contract,
         ),
         interaction_mode='auto',
@@ -407,7 +414,6 @@ def test_request_builder_allows_only_read_tools_for_file_analysis() -> None:
 
     spec = RequestBuilder(recovery, action_recovery_limit=3).build(
         state=RequestState(
-            control_state=AgentControlState.EXPLORING,
             task_contract=contract,
             change_required=contract.requires_change,
         ),
@@ -424,7 +430,7 @@ def test_request_builder_allows_only_read_tools_for_file_analysis() -> None:
     assert '[ForgeCode Turn Change Contract]' not in spec.system_prompt
 
 
-def test_request_builder_control_state_overrides_conflicting_booleans() -> None:
+def test_request_builder_uses_runtime_action_recovery_scope() -> None:
     tools = [
         {'name': 'read_file'},
         {'name': 'write_file'},
@@ -437,14 +443,15 @@ def test_request_builder_control_state_overrides_conflicting_booleans() -> None:
         excluded_write_tools=frozenset(),
     )
     contract = infer_task_contract('分析 forge/runtime/intent.py')
+    runtime = TurnRuntimeState(
+        control_state=AgentControlState.TARGETED_ANALYSIS,
+        contract=contract,
+    )
+    runtime.action_recovery_state.read_used = True
 
     spec = RequestBuilder(recovery, action_recovery_limit=3).build(
         state=RequestState(
-            control_state=AgentControlState.TARGETED_ANALYSIS,
-            task_contract=contract,
-            planning_recovery=True,
-            action_recovery=False,
-            action_read_used=True,
+            runtime=runtime,
         ),
         interaction_mode='auto',
         all_tools=tools,
@@ -481,12 +488,6 @@ def test_request_builder_runtime_snapshot_overrides_legacy_booleans() -> None:
     spec = RequestBuilder(recovery, action_recovery_limit=3).build(
         state=RequestState(
             runtime=runtime,
-            control_state=AgentControlState.FIX_REQUIRED,
-            finalization_recovery=True,
-            verification_recovery=True,
-            planning_recovery=True,
-            action_recovery=True,
-            task_contract=contract,
         ),
         interaction_mode='auto',
         all_tools=tools,
@@ -749,9 +750,115 @@ def test_action_recovery_excludes_directory_only_writes() -> None:
         excluded_write_tools=frozenset({'create_directory'}),
     )
 
-    selected = recovery.action_tools(read_available=False)
+    selected = recovery.action_tools(
+        scope=RecoveryScope.action(read_used=True)
+    )
 
     assert selected == [{'name': 'write_file'}]
+
+
+def test_recovery_scope_controls_action_reads() -> None:
+    tools = [
+        {'name': 'read_file'},
+        {'name': 'grep'},
+        {'name': 'write_file'},
+        {'name': 'finish_task'},
+    ]
+    recovery = RecoveryManager(
+        tools,
+        EffectByName({'write_file'}),
+        read_tools=frozenset({'read_file', 'grep'}),
+        excluded_write_tools=frozenset(),
+    )
+
+    first = recovery.action_tools(
+        scope=RecoveryScope.action(read_used=False)
+    )
+    exhausted = recovery.action_tools(
+        scope=RecoveryScope.action(read_used=True)
+    )
+
+    assert {tool['name'] for tool in first or ()} == {
+        'read_file',
+        'grep',
+        'write_file',
+        'finish_task',
+    }
+    assert {tool['name'] for tool in exhausted or ()} == {
+        'write_file',
+        'finish_task',
+    }
+
+
+def test_recovery_scope_controls_mutation_reads() -> None:
+    tools = [
+        {'name': 'read_file'},
+        {'name': 'grep'},
+        {'name': 'replace_text'},
+    ]
+    recovery = RecoveryManager(
+        tools,
+        EffectByName({'replace_text'}),
+        read_tools=frozenset({'read_file', 'grep'}),
+        excluded_write_tools=frozenset(),
+    )
+    failures = [{'tool': 'replace_text', 'code': 'patch_context_not_found'}]
+
+    first = recovery.mutation_tools(
+        failures,
+        scope=RecoveryScope.mutation(read_used=False),
+    )
+    exhausted = recovery.mutation_tools(
+        failures,
+        scope=RecoveryScope.mutation(read_used=True),
+    )
+
+    assert {tool['name'] for tool in first or ()} == {
+        'read_file',
+        'grep',
+        'replace_text',
+    }
+    assert {tool['name'] for tool in exhausted or ()} == {'replace_text'}
+
+
+def test_recovery_scope_controls_verification_reads() -> None:
+    tools = [
+        {'name': 'find_files'},
+        {'name': 'read_file'},
+        {'name': 'grep'},
+        {'name': 'write_file'},
+        {'name': 'verify'},
+        {'name': 'finish_task'},
+    ]
+    recovery = RecoveryManager(
+        tools,
+        EffectByName({'write_file'}),
+        read_tools=frozenset({'read_file', 'grep'}),
+        excluded_write_tools=frozenset(),
+    )
+
+    first = recovery.verification_tools(
+        fix_available=True,
+        scope=RecoveryScope.verification(read_count=1, read_budget=2),
+        verify_available=False,
+    )
+    exhausted = recovery.verification_tools(
+        fix_available=True,
+        scope=RecoveryScope.verification(read_count=2, read_budget=2),
+        verify_available=False,
+    )
+
+    assert {tool['name'] for tool in first or ()} == {
+        'find_files',
+        'read_file',
+        'grep',
+        'write_file',
+        'finish_task',
+    }
+    assert {tool['name'] for tool in exhausted or ()} == {
+        'write_file',
+        'finish_task',
+    }
 
 
 def test_recovery_manager_extracts_verification_repair_target() -> None:
@@ -880,15 +987,17 @@ def test_request_builder_injects_verification_repair_target() -> None:
         status='failed',
         failure_signature='abc123',
     )
+    contract = infer_task_contract('请修复 src/app.py')
+    runtime = TurnRuntimeState(
+        control_state=AgentControlState.FIX_REQUIRED,
+        contract=contract,
+    )
+    runtime.verification.latest = evidence
+    runtime.verification.repair_target = target
 
     spec = RequestBuilder(recovery, action_recovery_limit=3).build(
         state=RequestState(
-            control_state=AgentControlState.FIX_REQUIRED,
-            verification_recovery=True,
-            verification_fix_recovery=True,
-            verification_fix_required=True,
-            latest_verification=evidence,
-            verification_repair_target=target,
+            runtime=runtime,
         ),
         interaction_mode='auto',
         all_tools=tools,

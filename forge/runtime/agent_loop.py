@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import cache
-import hashlib
 from itertools import count
 import json
 from pathlib import Path
@@ -41,6 +40,10 @@ from forge.runtime.intent import (
     refine_task_contract_async,
 )
 from forge.runtime.agent_state import AgentPhase, AgentRunState
+from forge.runtime.agent_tool_calls import (
+    early_mutation_relevance_failure,
+    tool_call_signature,
+)
 from forge.runtime.agent_messages import (
     append_notification_message,
     build_assistant_message,
@@ -128,7 +131,6 @@ from forge.runtime.task_scope import (
     evaluate_change_relevance,
     infer_task_scope,
 )
-from forge.runtime.tool_targets import mutation_target_paths
 from forge.runtime.tool_executor import (
     PermissionMiddleware,
     ToolExecutionLogger,
@@ -567,6 +569,9 @@ class Conversation:
         edit_recovery = runtime.edit_recovery
         action_recovery_state = runtime.action_recovery_state
         synthesis_state = runtime.synthesis
+        loop_state = runtime.loop
+        completion_state = runtime.completion
+        model_failure_state = runtime.model_failure
         self.todo_planning.configure(required=task_contract.requires_plan)
         await self.hook_registry.run(
             HookContext(
@@ -591,8 +596,6 @@ class Conversation:
         mutation_attempted = False
         change_required = task_contract.requires_change
         tool_attempts: dict[str, tuple[int, bool]] = {}
-        calls_without_progress = 0
-        pre_mutation_calls = 0
         action_recovery_state.calls = 0
         action_recovery_state.read_used = False
         action_recovery_state.block_events = 0
@@ -601,28 +604,24 @@ class Conversation:
         edit_recovery.read_used = False
         edit_recovery.context = ''
         synthesis_state.clear()
-        tool_protocol_failures = 0
-        synthesis_retries = 0
-        completion_blocks = 0
-        last_completion_reasons: tuple[str, ...] = ()
+        model_failure_state.clear()
+        loop_state.calls_without_progress = 0
+        loop_state.pre_mutation_calls = 0
+        loop_state.tool_protocol_failures = 0
+        completion_state.blocks = 0
+        completion_state.last_reasons = ()
         verification_state.failed_revision = None
         verification_state.read_count = 0
         verification_state.recovery_calls = 0
         verification_state.last_failure_signature = ''
-        token_limit_reason = ''
-        completion_ready_revision: int | None = None
-        completion_decision_calls = 0
-        completion_ready_context = ''
-        completion_reviewed_paths: set[str] = set()
+        synthesis_state.token_limit_reason = ''
+        completion_state.clear_ready()
         if self.workspace_tracker is not None:
             await self.workspace_tracker.begin_turn()
 
         self._last_repository_context = (
             self.context.repository.system_suffix(prompt)
         )
-        reactive_compaction_attempted = False
-        protocol_recoveries = 0
-        output_continuations = 0
         continued_text_parts: list[str] = []
 
         iterations = (
@@ -692,7 +691,7 @@ class Conversation:
                 and completed_usage.total_input_tokens
                 >= self.max_turn_input_tokens
             ):
-                token_limit_reason = (
+                synthesis_state.token_limit_reason = (
                     'Stopped after the turn consumed '
                     f'{completed_usage.total_input_tokens} input tokens, '
                     'reaching the configured cumulative input-token limit '
@@ -701,17 +700,15 @@ class Conversation:
                 synthesis_state.mode = SynthesisMode.TOKEN_LIMIT
                 request_messages.append(
                     build_token_limit_recovery_feedback(
-                        token_limit_reason,
+                        synthesis_state.token_limit_reason,
                         self.task_manager.system_suffix(),
                         self.working_state.system_suffix(),
                     )
                 )
 
             runtime = self.agent_controller.snapshot()
-            runtime.completion_ready_context = completion_ready_context
             request_state = RequestState(
                 runtime=runtime,
-                control_state=self.agent_controller.state,
                 task_contract=task_contract,
                 change_required=change_required,
                 mutation_attempted=mutation_attempted,
@@ -819,19 +816,23 @@ class Conversation:
                     partial_text=partial_text,
                     has_tool_calls=bool(tool_calls),
                     request_usage=model_run.request_usage,
-                    output_continuations=output_continuations,
+                    output_continuations=(
+                        model_failure_state.output_continuations
+                    ),
                     max_output_continuations=(
                         self.max_output_continuations
                     ),
                     reactive_compaction_attempted=(
-                        reactive_compaction_attempted
+                        model_failure_state.reactive_compaction_attempted
                     ),
-                    protocol_recoveries=protocol_recoveries,
+                    protocol_recoveries=(
+                        model_failure_state.protocol_recoveries
+                    ),
                     max_protocol_recoveries=self.max_protocol_recoveries,
                     available_tools=tuple(sorted(request_tool_names)),
                 )
                 if failure.action is ModelFailureAction.COMPACT_CONTEXT:
-                    reactive_compaction_attempted = True
+                    model_failure_state.reactive_compaction_attempted = True
                     report = await self.context.compact_history(
                         request_messages,
                         self.client,
@@ -842,7 +843,7 @@ class Conversation:
                     yield failure.event
                     raise
                 if failure.action is ModelFailureAction.CONTINUE_OUTPUT:
-                    output_continuations += 1
+                    model_failure_state.output_continuations += 1
                     if (
                         failure.consume_usage
                         and model_run.request_usage is None
@@ -869,7 +870,7 @@ class Conversation:
                     yield failure.event
                     continue
                 if failure.action is ModelFailureAction.RECOVER_PROTOCOL:
-                    protocol_recoveries += 1
+                    model_failure_state.protocol_recoveries += 1
                     if (
                         failure.consume_usage
                         and model_run.request_usage is not None
@@ -952,7 +953,7 @@ class Conversation:
                 if (
                     (
                         synthesis_state.mode is not SynthesisMode.NORMAL
-                        or completion_blocks > 0
+                        or completion_state.blocks > 0
                     )
                     and request_usage is not None
                 ):
@@ -964,7 +965,7 @@ class Conversation:
                         'The model returned no usable answer after ForgeCode '
                         'requested a final synthesis or completion recovery.'
                     )
-                    reasons = (reason, *last_completion_reasons)
+                    reasons = (reason, *completion_state.last_reasons)
                     self.task_manager.stuck(reasons)
                     self.messages[:] = request_messages
                     yield TurnCompleted(
@@ -1092,7 +1093,7 @@ class Conversation:
                     yield phase_event
                 if synthesis_state.mode is SynthesisMode.TOKEN_LIMIT:
                     reason = (
-                        token_limit_reason
+                        synthesis_state.token_limit_reason
                         or 'The turn reached the cumulative input-token limit.'
                     )
                     self.task_manager.stuck((reason,))
@@ -1201,12 +1202,12 @@ class Conversation:
                         complete_text
                     )
                 ):
-                    synthesis_retries += 1
+                    synthesis_state.retries += 1
                     reason = (
                         'The synthesis did not reference any collected '
                         'repository evidence.'
                     )
-                    if synthesis_retries <= 1:
+                    if synthesis_state.retries <= 1:
                         request_messages.append(
                             build_synthesis_retry_feedback(
                                 self.task_manager.system_suffix(),
@@ -1291,14 +1292,14 @@ class Conversation:
                         mutation_attempted=(
                             mutation_attempted or change_required
                         ),
-                        reviewed_paths=completion_reviewed_paths,
+                        reviewed_paths=completion_state.reviewed_paths,
                         evidence_paths=self.working_state.evidence_paths,
                     )
                     if not decision.allowed:
-                        last_completion_reasons = decision.reasons
-                        completion_blocks += 1
+                        completion_state.last_reasons = decision.reasons
+                        completion_state.blocks += 1
                         yield CompletionBlocked(
-                            attempt=completion_blocks,
+                            attempt=completion_state.blocks,
                             reasons=decision.reasons,
                         )
                         if request_state.tool_free_recovery:
@@ -1380,7 +1381,7 @@ class Conversation:
                                 is SynthesisMode.CHECKPOINT
                             ):
                                 synthesis_state.clear()
-                            synthesis_retries = 0
+                            synthesis_state.retries = 0
                             if (
                                 synthesis_state.mode
                                 is SynthesisMode.STAGNATION_FINAL
@@ -1395,7 +1396,10 @@ class Conversation:
                                 )
                             )
                             continue
-                        if completion_blocks < self.max_completion_blocks:
+                        if (
+                            completion_state.blocks
+                            < self.max_completion_blocks
+                        ):
                             request_messages.append(
                                 build_completion_feedback(
                                     decision.reasons,
@@ -1625,7 +1629,7 @@ class Conversation:
                         mutation_attempted=mutation_attempted,
                         change_required=change_required,
                         verification=verification_state.latest,
-                        reviewed_paths=completion_reviewed_paths,
+                        reviewed_paths=completion_state.reviewed_paths,
                         evidence_paths=self.working_state.evidence_paths,
                     )
                     if (
@@ -1643,7 +1647,7 @@ class Conversation:
                         )
                     if finish_reasons:
                         finish_rejection = finish_reasons
-                        last_completion_reasons = finish_reasons
+                        completion_state.last_reasons = finish_reasons
                         pending_required_change = (
                             self._pending_required_change(
                                 change_required,
@@ -1654,10 +1658,10 @@ class Conversation:
                             batch.required_change_rejected = True
                             action_recovery_state.block_events += 1
                         else:
-                            completion_blocks += 1
+                            completion_state.blocks += 1
                         if synthesis_state.mode is SynthesisMode.CHECKPOINT:
                             synthesis_state.clear()
-                        calls_without_progress = 0
+                        loop_state.calls_without_progress = 0
                         result = ToolResult.fail(
                             'finish_rejected',
                             'The finish_task declaration did not match the '
@@ -1671,7 +1675,7 @@ class Conversation:
                         )
                         if (
                             not pending_required_change
-                            and completion_blocks
+                            and completion_state.blocks
                             >= self.max_completion_blocks
                         ):
                             batch.terminal_finish_reasons = finish_reasons
@@ -1721,7 +1725,7 @@ class Conversation:
                         attempt=(
                             action_recovery_state.block_events
                             if batch.required_change_rejected
-                            else completion_blocks
+                            else completion_state.blocks
                         ),
                         reasons=finish_rejection,
                     )
@@ -2170,12 +2174,12 @@ class Conversation:
                 edit_recovery.failures.clear()
                 edit_recovery.read_used = False
                 edit_recovery.context = ''
-                pre_mutation_calls = 0
+                loop_state.pre_mutation_calls = 0
                 action_recovery_state.calls = 0
                 action_recovery_state.read_used = False
                 if synthesis_state.mode is SynthesisMode.CHECKPOINT:
                     synthesis_state.clear()
-                synthesis_retries = 0
+                synthesis_state.retries = 0
                 if synthesis_state.mode is SynthesisMode.STAGNATION_FINAL:
                     synthesis_state.clear()
                 if (
@@ -2196,10 +2200,7 @@ class Conversation:
                     runtime.control_state
                 ):
                     verification_state.recovery_calls = 0
-                completion_ready_revision = None
-                completion_decision_calls = 0
-                completion_ready_context = ''
-                completion_reviewed_paths.clear()
+                completion_state.clear_ready()
             reviewed_now = completion_review_paths(
                 batch.results,
                 (
@@ -2208,8 +2209,8 @@ class Conversation:
                     else ()
                 ),
             )
-            new_reviews = reviewed_now - completion_reviewed_paths
-            completion_reviewed_paths.update(reviewed_now)
+            new_reviews = reviewed_now - completion_state.reviewed_paths
+            completion_state.reviewed_paths.update(reviewed_now)
             pending_write_results = batch.pending_write_results(
                 reverted_to_baseline=batch_reverted_to_baseline,
             )
@@ -2275,15 +2276,15 @@ class Conversation:
                 for _, result in batch.results
             )
             if protocol_failure:
-                tool_protocol_failures += 1
+                loop_state.tool_protocol_failures += 1
             elif any(result.success for _, result in batch.results):
-                tool_protocol_failures = 0
+                loop_state.tool_protocol_failures = 0
             if batch_requires_todo(batch.results):
                 self.agent_controller.enter_planning_recovery()
                 if synthesis_state.mode is SynthesisMode.CHECKPOINT:
                     synthesis_state.clear()
-                synthesis_retries = 0
-                calls_without_progress = 0
+                synthesis_state.retries = 0
+                loop_state.calls_without_progress = 0
                 action_recovery_state.calls = 0
                 action_recovery_state.read_used = False
                 request_messages.append(
@@ -2313,11 +2314,12 @@ class Conversation:
                     action_recovery_state.read_used = False
                     entered_action_recovery = True
                 elif batch.task_progressed:
-                    pre_mutation_calls = 0
+                    loop_state.pre_mutation_calls = 0
                 else:
-                    pre_mutation_calls += 1
+                    loop_state.pre_mutation_calls += 1
                     if (
-                        pre_mutation_calls > self.pre_mutation_limit
+                        loop_state.pre_mutation_calls
+                        > self.pre_mutation_limit
                         and _can_enter_pre_mutation_action_recovery(
                             task_contract
                         )
@@ -2329,13 +2331,13 @@ class Conversation:
                 if self.agent_controller.action_recovery:
                     if synthesis_state.mode is SynthesisMode.CHECKPOINT:
                         synthesis_state.clear()
-                    synthesis_retries = 0
+                    synthesis_state.retries = 0
                     if (
                         synthesis_state.mode
                         is SynthesisMode.STAGNATION_FINAL
                     ):
                         synthesis_state.clear()
-                    calls_without_progress = 0
+                    loop_state.calls_without_progress = 0
                     if entered_action_recovery:
                         action_recovery_state.block_events += 1
                         yield CompletionBlocked(
@@ -2384,7 +2386,7 @@ class Conversation:
                     mutation_attempted=mutation_attempted,
                     verification=verification_state.latest,
                     mutation_failures=edit_recovery.failures,
-                    reviewed_paths=completion_reviewed_paths,
+                    reviewed_paths=completion_state.reviewed_paths,
                     evidence_paths=self.working_state.evidence_paths,
                 )
             )
@@ -2398,29 +2400,29 @@ class Conversation:
                     'source_revision',
                     self.workspace_tracker.revision,
                 )
-                new_ready_revision = completion_ready_revision != revision
+                new_ready_revision = completion_state.ready_revision != revision
                 if new_ready_revision:
-                    completion_ready_revision = revision
-                    completion_decision_calls = 0
-                    completion_reviewed_paths.clear()
+                    completion_state.ready_revision = revision
+                    completion_state.decision_calls = 0
+                    completion_state.reviewed_paths.clear()
                     if synthesis_state.mode is SynthesisMode.CHECKPOINT:
                         synthesis_state.clear()
-                    synthesis_retries = 0
+                    synthesis_state.retries = 0
                     if (
                         synthesis_state.mode
                         is SynthesisMode.STAGNATION_FINAL
                     ):
                         synthesis_state.clear()
                 if not new_ready_revision and not new_reviews:
-                    completion_decision_calls += 1
-                completion_ready_context = render_completion_ready_context(
+                    completion_state.decision_calls += 1
+                completion_state.ready_context = render_completion_ready_context(
                     self.workspace_tracker.changed_paths,
                     verification_state.latest,
-                    completion_decision_calls,
+                    completion_state.decision_calls,
                     self.completion_decision_limit,
-                    completion_reviewed_paths,
+                    completion_state.reviewed_paths,
                 )
-                calls_without_progress = 0
+                loop_state.calls_without_progress = 0
                 synthesis_state.mode = SynthesisMode.FINALIZATION
                 request_messages.append(
                     build_finalization_recovery_feedback(
@@ -2431,10 +2433,7 @@ class Conversation:
                     )
                 )
                 continue
-            completion_ready_revision = None
-            completion_decision_calls = 0
-            completion_ready_context = ''
-            completion_reviewed_paths.clear()
+            completion_state.clear_ready()
             progress = evaluate_progress(
                 workspace_progressed=workspace_progressed,
                 task_progressed=batch.task_progressed,
@@ -2488,22 +2487,22 @@ class Conversation:
                 repair_target_resolved=batch.repair_target_resolved,
             )
             if progress.progressed:
-                calls_without_progress = 0
+                loop_state.calls_without_progress = 0
                 if synthesis_state.mode is SynthesisMode.CHECKPOINT:
                     synthesis_state.clear()
-                synthesis_retries = 0
+                synthesis_state.retries = 0
             elif protocol_failure:
                 # Malformed tool arguments are a protocol-recovery problem,
                 # not evidence that the task itself is stuck.
                 request_messages.append(
                     build_tool_protocol_feedback(
-                        tool_protocol_failures,
+                        loop_state.tool_protocol_failures,
                         self.task_manager.system_suffix(),
                         batch.results,
                     )
                 )
                 if (
-                    tool_protocol_failures
+                    loop_state.tool_protocol_failures
                     >= self.max_tool_protocol_recoveries
                 ):
                     reason = (
@@ -2536,20 +2535,20 @@ class Conversation:
                 # workspace-write failure remains unresolved. Reads and
                 # searches may guide the corrected edit without also
                 # consuming the global Stagnation budget.
-                calls_without_progress = 0
+                loop_state.calls_without_progress = 0
             else:
-                calls_without_progress += 1
-            if calls_without_progress == self.stagnation_warning:
+                loop_state.calls_without_progress += 1
+            if loop_state.calls_without_progress == self.stagnation_warning:
                 if synthesis_state.mode is SynthesisMode.NORMAL:
                     synthesis_state.mode = SynthesisMode.CHECKPOINT
                 request_messages.append(
                     build_stagnation_feedback(
-                        calls_without_progress,
+                        loop_state.calls_without_progress,
                         self.task_manager.system_suffix(),
                         self.working_state.system_suffix(),
                     )
                 )
-            elif calls_without_progress >= self.stagnation_limit:
+            elif loop_state.calls_without_progress >= self.stagnation_limit:
                 if (
                     not edit_recovery.failures
                     and self._pending_required_change(
@@ -2565,8 +2564,8 @@ class Conversation:
                     action_recovery_state.read_used = False
                     if synthesis_state.mode is SynthesisMode.CHECKPOINT:
                         synthesis_state.clear()
-                    synthesis_retries = 0
-                    calls_without_progress = 0
+                    synthesis_state.retries = 0
+                    loop_state.calls_without_progress = 0
                     action_recovery_state.block_events += 1
                     yield CompletionBlocked(
                         attempt=action_recovery_state.block_events,
@@ -2604,17 +2603,20 @@ class Conversation:
                     decision = await self.completion_checker.evaluate(
                         verification_state.latest,
                         mutation_attempted=mutation_attempted,
-                        reviewed_paths=completion_reviewed_paths,
+                        reviewed_paths=completion_state.reviewed_paths,
                         evidence_paths=self.working_state.evidence_paths,
                     )
                     if not decision.allowed:
-                        last_completion_reasons = decision.reasons
-                        completion_blocks += 1
+                        completion_state.last_reasons = decision.reasons
+                        completion_state.blocks += 1
                         yield CompletionBlocked(
-                            attempt=completion_blocks,
+                            attempt=completion_state.blocks,
                             reasons=decision.reasons,
                         )
-                        if completion_blocks >= self.max_completion_blocks:
+                        if (
+                            completion_state.blocks
+                            >= self.max_completion_blocks
+                        ):
                             if only_verification_blocked(decision.reasons):
                                 verification_state.recovery_calls += 1
                                 if (
@@ -2669,13 +2671,13 @@ class Conversation:
                                     self.agent_controller.enter_fix_required()
                                 else:
                                     self.agent_controller.enter_ready_to_verify()
-                                calls_without_progress = 0
+                                loop_state.calls_without_progress = 0
                                 if (
                                     synthesis_state.mode
                                     is SynthesisMode.CHECKPOINT
                                 ):
                                     synthesis_state.clear()
-                                synthesis_retries = 0
+                                synthesis_state.retries = 0
                                 if (
                                     synthesis_state.mode
                                     is SynthesisMode.STAGNATION_FINAL
@@ -2714,10 +2716,10 @@ class Conversation:
                                 )
                             )
                             return
-                        calls_without_progress = 0
+                        loop_state.calls_without_progress = 0
                         if synthesis_state.mode is SynthesisMode.CHECKPOINT:
                             synthesis_state.clear()
-                        synthesis_retries = 0
+                        synthesis_state.retries = 0
                         if (
                             synthesis_state.mode
                             is SynthesisMode.STAGNATION_FINAL
@@ -2738,13 +2740,13 @@ class Conversation:
                         build_stagnation_final_recovery_feedback(
                             self.task_manager.system_suffix(),
                             self.working_state.system_suffix(),
-                            calls_without_progress,
+                            loop_state.calls_without_progress,
                         )
                     )
                     continue
                 reason = (
                     'Stopped after '
-                    f'{calls_without_progress} model calls without new '
+                    f'{loop_state.calls_without_progress} model calls without new '
                     'workspace, plan, or repository evidence.'
                 )
                 self.task_manager.stuck((reason,))
@@ -3142,59 +3144,6 @@ class Conversation:
         return SubagentWorktreeManager(self.task_manager.root).describe()
 
 
-def tool_call_signature(tool_call: ToolCall, revision: int) -> str:
-    '''Identify an exact tool request within one workspace revision.'''
-    arguments = json.dumps(
-        normalize_tool_arguments(tool_call.name, tool_call.arguments),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(',', ':'),
-        default=str,
-    )
-    digest = hashlib.sha256(arguments.encode('utf-8')).hexdigest()[:24]
-    return f'{revision}:{tool_call.name}:{digest}'
-
-
-def early_mutation_relevance_failure(
-    tool_call: ToolCall,
-    *,
-    tool_effect: str | None,
-    change_required: bool,
-    task_scope_patterns: tuple[str, ...],
-) -> ToolResult | None:
-    '''Block statically obvious off-goal workspace edits before execution.'''
-    if (
-        not change_required
-        or tool_effect != 'workspace_write'
-        or not task_scope_patterns
-    ):
-        return None
-    targets = mutation_target_paths(tool_call)
-    if not targets:
-        return None
-    relevance_targets = _scope_probe_paths(targets)
-    relevance = evaluate_change_relevance(
-        relevance_targets,
-        TaskScope(patterns=task_scope_patterns),
-    )
-    if relevance.relevant:
-        return None
-    return ToolResult.fail(
-        'irrelevant_mutation_target',
-        (
-            f'{tool_call.name} targets paths outside the current task scope: '
-            + ', '.join(targets)
-            + '. Choose a task-relevant edit target instead.'
-        ),
-        details={
-            'targets': list(targets),
-            'task_scope_patterns': list(task_scope_patterns[:16]),
-            'reasons': list(relevance.reasons),
-        },
-        metadata={'irrelevant_mutation_target': True},
-    )
-
-
 def _can_enter_pre_mutation_action_recovery(
     contract: TaskContract,
 ) -> bool:
@@ -3205,76 +3154,6 @@ def _can_enter_pre_mutation_action_recovery(
         or contract.context_hints
         or '.' in contract.goal
     )
-
-
-def _scope_probe_paths(paths: tuple[str, ...]) -> tuple[str, ...]:
-    expanded: list[str] = []
-    for path in paths:
-        normalized = path.replace('\\', '/').rstrip('/')
-        expanded.append(normalized)
-        name = normalized.rsplit('/', 1)[-1]
-        if '.' not in name:
-            expanded.append(f'{normalized}/__forge_scope_probe__')
-    return tuple(dict.fromkeys(expanded))
-
-
-def normalize_tool_arguments(
-    tool_name: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    normalized = dict(arguments)
-    defaults: dict[str, Any] = {}
-    if tool_name == 'read_file':
-        defaults = {'start_line': 1, 'end_line': None}
-    elif tool_name == 'list_directory':
-        defaults = {'path': '.', 'max_results': 1000}
-    elif tool_name == 'find_files':
-        defaults = {'path': '.', 'max_results': 200}
-    elif tool_name == 'grep':
-        defaults = {
-            'path': '.',
-            'file_types': [],
-            'case_sensitive': True,
-            'regex': True,
-            'max_results': 200,
-        }
-    elif tool_name == 'verify':
-        defaults = {
-            'target': 'auto',
-            'command_id': '',
-            'command': '',
-            'cwd': '.',
-            'timeout_seconds': 120.0,
-        }
-    elif tool_name == 'git_diff':
-        defaults = {'path': None, 'cached': False}
-
-    for key, value in defaults.items():
-        normalized.setdefault(key, value)
-    for key in ('path', 'cwd'):
-        if key in normalized and normalized[key] is not None:
-            normalized[key] = normalize_signature_path(str(normalized[key]))
-    if tool_name == 'grep' and isinstance(normalized.get('file_types'), list):
-        normalized['file_types'] = sorted(
-            normalize_file_type(str(item))
-            for item in normalized['file_types']
-        )
-    return normalized
-
-
-def normalize_signature_path(path: str) -> str:
-    rendered = path.strip().replace('\\', '/')
-    while rendered.startswith('./'):
-        rendered = rendered[2:]
-    rendered = rendered.rstrip('/')
-    return rendered or '.'
-
-
-def normalize_file_type(value: str) -> str:
-    lowered = value.strip().casefold()
-    if not lowered:
-        return lowered
-    return lowered if lowered.startswith('.') else f'.{lowered}'
 
 
 def required_change_block_reason() -> str:
