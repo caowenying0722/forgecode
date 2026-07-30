@@ -502,7 +502,7 @@ def test_request_builder_runtime_snapshot_overrides_legacy_booleans() -> None:
     assert '[ForgeCode Verification Recovery]' not in spec.system_prompt
 
 
-def test_tool_run_policy_runtime_snapshot_overrides_legacy_booleans() -> None:
+def test_tool_run_policy_uses_runtime_snapshot_for_transaction_phase() -> None:
     contract = infer_task_contract('请修复 forge/runtime/intent.py')
     runtime = TurnRuntimeState(
         control_state=AgentControlState.IMPLEMENTING,
@@ -515,10 +515,6 @@ def test_tool_run_policy_runtime_snapshot_overrides_legacy_booleans() -> None:
         available_tools=frozenset({'read_file'}),
         runtime=runtime,
         control_state=AgentControlState.TASK_PLANNING,
-        planning_recovery=True,
-        action_recovery=True,
-        mutation_recovery=False,
-        verification_recovery=True,
     )
 
     assert transaction_phase(policy) == 'edit_recovery'

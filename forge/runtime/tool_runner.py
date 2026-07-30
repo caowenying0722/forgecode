@@ -19,11 +19,6 @@ class ToolRunPolicy:
     available_tools: frozenset[str]
     runtime: 'TurnRuntimeState | None' = None
     control_state: Any = None
-    # Legacy compatibility fields. Runtime/controller state wins when present.
-    action_recovery: bool = False
-    mutation_recovery: bool = False
-    planning_recovery: bool = False
-    verification_recovery: bool = False
     action_read_exhausted: bool = False
     verification_read_exhausted: bool = False
     semantic_repeat: ToolResult | None = None
@@ -290,14 +285,6 @@ def transaction_phase(policy: ToolRunPolicy) -> str:
     if policy_runtime_verification_recovery(policy):
         return 'verification_recovery'
     if state_value(control_state) == 'targeted_analysis':
-        return 'action_recovery'
-    if policy.planning_recovery:
-        return 'planning_recovery'
-    if policy.mutation_recovery:
-        return 'edit_recovery'
-    if policy.verification_recovery:
-        return 'verification_recovery'
-    if policy.action_recovery:
         return 'action_recovery'
     return 'normal'
 
