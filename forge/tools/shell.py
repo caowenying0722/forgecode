@@ -263,6 +263,17 @@ class RunCommandTool(Tool[RunCommandInput]):
                     'verification_side_effect_paths': list(
                         reusable.side_effect_paths
                     ),
+                    'generated_artifact_paths': list(
+                        reusable.generated_artifact_paths
+                    ),
+                    'cache_paths': list(reusable.cache_paths),
+                    'generated_artifact_fingerprints': [
+                        list(item)
+                        for item in reusable.generated_artifact_fingerprints
+                    ],
+                    'cache_fingerprints': [
+                        list(item) for item in reusable.cache_fingerprints
+                    ],
                     'verification_ledger_recorded': True,
                 },
             )
@@ -298,6 +309,14 @@ class RunCommandTool(Tool[RunCommandInput]):
         side_effect_paths = classification.verification_side_effect_paths
         if side_effect_paths and verification_status == 'passed':
             verification_status = 'failed'
+        generated_artifact_fingerprints = _current_fingerprints(
+            self.workspace_tracker,
+            classification.generated_paths,
+        )
+        cache_fingerprints = _current_fingerprints(
+            self.workspace_tracker,
+            classification.cache_paths,
+        )
         metadata = {
             **process_metadata(process),
             'command': command,
@@ -321,6 +340,10 @@ class RunCommandTool(Tool[RunCommandInput]):
             'verification_side_effect_paths': list(side_effect_paths),
             'generated_artifact_paths': list(classification.generated_paths),
             'cache_paths': list(classification.cache_paths),
+            'generated_artifact_fingerprints': [
+                list(item) for item in generated_artifact_fingerprints
+            ],
+            'cache_fingerprints': [list(item) for item in cache_fingerprints],
             'verification_ledger_recorded': True,
         }
         content = render_process_output(process)
@@ -359,6 +382,17 @@ class RunCommandTool(Tool[RunCommandInput]):
             content=content,
             metadata=metadata,
         )
+
+
+def _current_fingerprints(
+    tracker: 'WorkspaceTracker',
+    paths: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (path, tracker.current.files[path])
+        for path in paths
+        if path in tracker.current.files
+    )
 
 
 SCRIPT_WRITE_PATTERNS = (

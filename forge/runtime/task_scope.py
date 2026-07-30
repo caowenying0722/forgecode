@@ -51,6 +51,9 @@ PROJECT_SUPPORT_PATTERNS = (
     'test/**',
     '__tests__/**',
 )
+PACKAGE_LOCKFILE_PATHS = frozenset(
+    {'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'}
+)
 GAME_SCOPE_PATTERNS = (
     'game/**',
     'play/**',
@@ -277,12 +280,18 @@ def classify_changed_paths(
     normalized = tuple(
         path.replace('\\', '/') for path in changed_paths if path
     )
+    normalized_set = set(normalized)
     result: list[ClassifiedPath] = []
     workspace_classifier = WorkspaceChangeClassifier()
     for path in normalized:
         base = workspace_classifier.classify_path(path)
         if base.kind in {'generated_artifact', 'cache', 'unrelated'}:
             result.append(ClassifiedPath(path, 'unrelated'))
+        elif (
+            path in PACKAGE_LOCKFILE_PATHS
+            and 'package.json' in normalized_set
+        ):
+            result.append(ClassifiedPath(path, 'supporting'))
         elif scope.constrained and _matches_scope(path, scope.patterns):
             role: ChangePathRole = (
                 'supporting'

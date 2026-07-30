@@ -266,6 +266,7 @@ class WorkspaceTracker:
                 )
             )
             if path not in non_source_side_effects
+            and not (path in self._artifact_paths and path not in self._watched_paths)
         )
 
     @property
@@ -301,7 +302,9 @@ class WorkspaceTracker:
         for path in self._watched_paths:
             files[path] = fingerprint_path(self.root, path)
         for path in self._artifact_paths:
-            files[path] = fingerprint_path(self.root, path)
+            fingerprint = fingerprint_path(self.root, path)
+            if fingerprint != 'missing' or path in self.baseline.files:
+                files[path] = fingerprint
         if artifact_scope is not None:
             for path in scan_artifact_scope_paths(self.root, artifact_scope):
                 files[path] = fingerprint_path(self.root, path)

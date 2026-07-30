@@ -1721,6 +1721,85 @@ def test_identical_batch_scope_failures_consume_one_recovery_attempt(
     }
 
 
+def test_successful_build_with_declared_outputs_finishes_without_cleanup_loop(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / 'package.json').write_text(
+        '{"scripts":{"build":"tsc -p tsconfig.json && vite build"}}\n',
+        encoding='utf-8',
+    )
+    (tmp_path / 'tsconfig.json').write_text('{}\n', encoding='utf-8')
+    source = tmp_path / 'src' / 'main.ts'
+    source.parent.mkdir()
+    source.write_text('export const value = 1;\n', encoding='utf-8')
+    (tmp_path / 'npx.cmd').write_text(
+        '\n'.join(
+            (
+                '@echo off',
+                'if "%1"=="tsc" exit /b 0',
+                'if "%1"=="vite" goto vite_build',
+                'exit /b 1',
+                ':vite_build',
+                'mkdir dist 2>nul',
+                'mkdir dist\\assets 2>nul',
+                'echo ^<div id="app"^>^</div^> > dist\\index.html',
+                'echo console.log(1); > dist\\assets\\app.js',
+                'exit /b 0',
+            )
+        )
+        + '\n',
+        encoding='utf-8',
+    )
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'vite-loop-edit',
+        'replace_text',
+        {
+            'path': 'src/main.ts',
+            'old_text': 'export const value = 1;\n',
+            'new_text': 'export const value = 2;\n',
+        },
+    )
+    verify = ToolCall(
+        0,
+        'vite-loop-verify',
+        'verify',
+        {'target': 'build'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(verify),
+        finish_response(
+            'vite-loop-finish',
+            task_kind='change',
+            summary='Updated src/main.ts and verified the build.',
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        task_policy=TaskPolicy(require_verification=True),
+    )
+
+    events = collect_turn(conversation, '修改 Vite Phaser 项目的 src/main.ts')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.completion_reasons == ()
+    assert completed.result.changed_paths == ('src/main.ts',)
+    assert completed.result.verification is not None
+    assert completed.result.verification.generated_artifact_paths == (
+        'dist/assets/app.js',
+        'dist/index.html',
+    )
+    assert (tmp_path / 'dist' / 'index.html').is_file()
+    assert (tmp_path / 'dist' / 'assets' / 'app.js').is_file()
+    assert not any(isinstance(event, CompletionBlocked) for event in events)
+    assert completed.result.status != 'stuck'
+
+
 def test_distinct_workspace_write_failures_still_accumulate(
     tmp_path: Path,
 ) -> None:

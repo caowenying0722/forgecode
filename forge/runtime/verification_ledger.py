@@ -26,6 +26,10 @@ class VerificationRecord:
     failure_signature: str
     artifact_scope: tuple[dict[str, object], ...] = ()
     side_effect_paths: tuple[str, ...] = ()
+    generated_artifact_paths: tuple[str, ...] = ()
+    cache_paths: tuple[str, ...] = ()
+    generated_artifact_fingerprints: tuple[tuple[str, str], ...] = ()
+    cache_fingerprints: tuple[tuple[str, str], ...] = ()
     stdout_stderr_summary: str = ''
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -56,6 +60,10 @@ class VerificationRecord:
             verification_type=self.kind,
             verification_reused=self.reused,
             verification_side_effect_paths=self.side_effect_paths,
+            generated_artifact_paths=self.generated_artifact_paths,
+            cache_paths=self.cache_paths,
+            generated_artifact_fingerprints=self.generated_artifact_fingerprints,
+            cache_fingerprints=self.cache_fingerprints,
         )
 
 
@@ -124,6 +132,19 @@ class VerificationLedger:
                 str(path)
                 for path in metadata.get('verification_side_effect_paths', [])
             ),
+            generated_artifact_paths=tuple(
+                str(path)
+                for path in metadata.get('generated_artifact_paths', [])
+            ),
+            cache_paths=tuple(
+                str(path) for path in metadata.get('cache_paths', [])
+            ),
+            generated_artifact_fingerprints=_fingerprints_from_metadata(
+                metadata.get('generated_artifact_fingerprints', [])
+            ),
+            cache_fingerprints=_fingerprints_from_metadata(
+                metadata.get('cache_fingerprints', [])
+            ),
             stdout_stderr_summary=content[:4_000],
             started_at=float(started_at if started_at is not None else now),
             finished_at=float(finished_at if finished_at is not None else now),
@@ -171,3 +192,21 @@ def _failure_signature(metadata: dict[str, object], content: str) -> str:
     if not signature_text.strip():
         signature_text = content[:4_000]
     return hashlib.sha256(signature_text.encode('utf-8')).hexdigest()
+
+
+def _fingerprints_from_metadata(value: object) -> tuple[tuple[str, str], ...]:
+    pairs: list[tuple[str, str]] = []
+    if not isinstance(value, (list, tuple)):
+        return ()
+    for item in value:
+        if isinstance(item, dict):
+            path = item.get('path')
+            fingerprint = item.get('fingerprint')
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            path, fingerprint = item
+        else:
+            continue
+        if path is None or fingerprint is None:
+            continue
+        pairs.append((str(path), str(fingerprint)))
+    return tuple(pairs)

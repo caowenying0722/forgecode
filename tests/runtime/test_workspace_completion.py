@@ -18,6 +18,7 @@ from forge.runtime.agent_tool_calls import early_mutation_relevance_failure
 from forge.runtime.state import VerificationEvidence
 from forge.runtime.state import ToolCall
 from forge.runtime.task_scope import evaluate_change_relevance, infer_task_scope
+from forge.runtime.verification import verification_artifact_scope
 from forge.runtime.workspace import WorkspaceTracker, should_skip_workspace_path
 from forge.tasks.manager import TaskManager
 from forge.tools.filesystem import CreateDirectoryTool
@@ -777,3 +778,510 @@ def test_completion_checker_accepts_evidence_related_change(
     )
 
     assert decision.allowed is True
+
+
+def _verified_build_evidence(
+    tracker: WorkspaceTracker,
+    *,
+    command: str = 'npx vite build',
+    status: str = 'passed',
+    exit_code: int = 0,
+    timed_out: bool = False,
+    generated_paths: tuple[str, ...] = (),
+    cache_paths: tuple[str, ...] = (),
+    side_effect_paths: tuple[str, ...] = (),
+) -> VerificationEvidence:
+    generated = generated_paths or tuple(
+        path
+        for path in tracker.filesystem_changed_paths
+        if path.startswith(('dist/', 'release/'))
+    )
+    return VerificationEvidence(
+        command=command,
+        cwd='.',
+        exit_code=exit_code,
+        duration_seconds=0.1,
+        timed_out=timed_out,
+        workspace_revision=tracker.source_revision,
+        source_revision=tracker.source_revision,
+        filesystem_revision=tracker.filesystem_revision,
+        status=status,
+        verification_type='build',
+        generated_artifact_paths=generated,
+        cache_paths=cache_paths,
+        verification_side_effect_paths=side_effect_paths,
+        generated_artifact_fingerprints=tuple(
+            (path, tracker.current.files[path])
+            for path in generated
+            if path in tracker.current.files
+        ),
+        cache_fingerprints=tuple(
+            (path, tracker.current.files[path])
+            for path in cache_paths
+            if path in tracker.current.files
+        ),
+    )
+
+
+def _checker_for_game_task(
+    root: Path,
+    tracker: WorkspaceTracker,
+) -> CompletionChecker:
+    task_manager = TaskManager(root)
+    task_manager.begin_turn('实现 Phaser 游戏主入口 src/main.ts')
+    return CompletionChecker(tracker, CompletionGate(root), task_manager)
+
+
+def _prepare_vite_change(tmp_path: Path) -> tuple[WorkspaceTracker, Path]:
+    initialize_git_repository(tmp_path)
+    (tmp_path / 'package.json').write_text(
+        '{"scripts":{"build":"vite build"}}\n',
+        encoding='utf-8',
+    )
+    source = tmp_path / 'src' / 'main.ts'
+    source.parent.mkdir()
+    source.write_text('export const value = 1;\n', encoding='utf-8')
+    subprocess.run(['git', 'add', '.'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'vite baseline'],
+        cwd=tmp_path,
+        check=True,
+    )
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    source.write_text('export const value = 2;\n', encoding='utf-8')
+    run(tracker.refresh())
+    return tracker, source
+
+
+def _write_build_outputs(root: Path, directory: str = 'dist') -> tuple[str, ...]:
+    html = root / directory / 'index.html'
+    bundle = root / directory / 'assets' / 'app.js'
+    bundle.parent.mkdir(parents=True)
+    html.write_text('<div id="app"></div>\n', encoding='utf-8')
+    bundle.write_text('console.log("bundle");\n', encoding='utf-8')
+    return (
+        f'{directory}/assets/app.js',
+        f'{directory}/index.html',
+    )
+
+
+def test_current_successful_vite_build_artifacts_do_not_block_completion(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    outputs = _write_build_outputs(tmp_path)
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(tracker, generated_paths=outputs)
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert tracker.changed_paths == ('src/main.ts',)
+    assert decision.allowed is True
+
+
+def test_generated_artifacts_alone_do_not_satisfy_change_task(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    outputs = _write_build_outputs(tmp_path)
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(tracker, generated_paths=outputs)
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+        )
+    )
+
+    assert tracker.changed_paths == ()
+    assert decision.allowed is False
+    assert any('final Diff is empty' in reason for reason in decision.reasons)
+
+
+def test_failed_build_artifacts_still_block_completion(tmp_path: Path) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    outputs = _write_build_outputs(tmp_path)
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(
+        tracker,
+        status='failed',
+        exit_code=1,
+        generated_paths=outputs,
+    )
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert decision.allowed is False
+    assert any('latest verification failed' in item for item in decision.reasons)
+    assert any('outside the task deliverables' in item for item in decision.reasons)
+
+
+def test_timed_out_build_artifacts_still_block_completion(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    outputs = _write_build_outputs(tmp_path)
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(
+        tracker,
+        status='timed_out',
+        exit_code=-1,
+        timed_out=True,
+        generated_paths=outputs,
+    )
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert decision.allowed is False
+    assert any('timed out' in item for item in decision.reasons)
+    assert any('outside the task deliverables' in item for item in decision.reasons)
+
+
+def test_stale_build_artifacts_are_not_trusted(tmp_path: Path) -> None:
+    tracker, source = _prepare_vite_change(tmp_path)
+    outputs = _write_build_outputs(tmp_path)
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(tracker, generated_paths=outputs)
+    source.write_text('export const value = 3;\n', encoding='utf-8')
+    run(tracker.refresh())
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert decision.allowed is False
+    assert any('changed after verification' in item for item in decision.reasons)
+    assert any('outside the task deliverables' in item for item in decision.reasons)
+
+
+def test_undeclared_generated_output_still_blocks_completion(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    declared = _write_build_outputs(tmp_path)
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(tracker, generated_paths=declared)
+    (tmp_path / 'dist' / 'manual.js').write_text('manual\n', encoding='utf-8')
+    run(tracker.refresh())
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert decision.allowed is False
+    assert any('dist/manual.js' in item for item in decision.reasons)
+
+
+def test_verification_source_side_effect_still_blocks_completion(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    outputs = _write_build_outputs(tmp_path)
+    side_effect = tmp_path / 'tmp' / 'debug.log'
+    side_effect.parent.mkdir()
+    side_effect.write_text('debug\n', encoding='utf-8')
+    change = run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    assert change is not None
+    evidence = _verified_build_evidence(
+        tracker,
+        status='failed',
+        exit_code=1,
+        generated_paths=outputs,
+        side_effect_paths=change.classification.verification_side_effect_paths,
+    )
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert decision.allowed is False
+    assert any('Verification modified undeclared' in item for item in decision.reasons)
+
+
+def test_forbidden_path_is_never_trusted_as_verification_output(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    hidden = tmp_path / 'tests' / 'hidden' / 'bundle.js'
+    hidden.parent.mkdir(parents=True)
+    hidden.write_text('forbidden\n', encoding='utf-8')
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(
+        tracker,
+        generated_paths=('tests/hidden/bundle.js',),
+    )
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert decision.allowed is False
+    assert any('Forbidden paths' in item for item in decision.reasons)
+
+
+def test_verified_artifact_modified_after_build_is_not_trusted(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    outputs = _write_build_outputs(tmp_path)
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(tracker, generated_paths=outputs)
+    (tmp_path / 'dist' / 'index.html').write_text('tampered\n', encoding='utf-8')
+    run(tracker.refresh())
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert decision.allowed is False
+    assert any('dist/index.html' in item for item in decision.reasons)
+
+
+def test_verified_artifact_unchanged_after_build_is_trusted(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    outputs = _write_build_outputs(tmp_path)
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(tracker, generated_paths=outputs)
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert decision.allowed is True
+
+
+def test_deleted_verified_artifact_does_not_block_completion(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    outputs = _write_build_outputs(tmp_path)
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(tracker, generated_paths=outputs)
+    (tmp_path / 'dist' / 'index.html').unlink()
+    (tmp_path / 'dist' / 'assets' / 'app.js').unlink()
+    run(tracker.refresh())
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert tracker.filesystem_changed_paths == ('src/main.ts',)
+    assert decision.allowed is True
+
+
+def test_custom_vite_out_dir_is_allowed_as_verified_output(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = _prepare_vite_change(tmp_path)
+    (tmp_path / 'vite.config.ts').write_text(
+        "export default { build: { outDir: 'release' } };\n",
+        encoding='utf-8',
+    )
+    run(tracker.refresh())
+    outputs = _write_build_outputs(tmp_path, 'release')
+    run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    evidence = _verified_build_evidence(
+        tracker,
+        generated_paths=outputs,
+    )
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts', 'vite.config.ts'),
+        )
+    )
+
+    assert decision.allowed is True
+
+
+def test_new_npm_project_accepts_package_lock_as_supporting_config() -> None:
+    scope = infer_task_scope(
+        '创建 npm 项目',
+        scope_hints=('package.json',),
+        scope_hint_source='allowed_path',
+    )
+
+    relevance = evaluate_change_relevance(
+        ('package.json', 'package-lock.json'),
+        scope,
+    )
+
+    assert relevance.relevant is True
+
+
+def test_lockfile_does_not_expand_scope_to_unrelated_paths() -> None:
+    scope = infer_task_scope(
+        '创建 npm 项目',
+        scope_hints=('package.json',),
+        scope_hint_source='allowed_path',
+    )
+
+    relevance = evaluate_change_relevance(
+        ('package.json', 'package-lock.json', 'notes/debug.txt'),
+        scope,
+    )
+
+    assert relevance.relevant is False
+    assert 'notes/debug.txt' in relevance.reasons[0]

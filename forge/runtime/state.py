@@ -63,6 +63,8 @@ class VerificationEvidence:
     generated_artifact_paths: tuple[str, ...] = ()
     cache_paths: tuple[str, ...] = ()
     verification_side_effect_paths: tuple[str, ...] = ()
+    generated_artifact_fingerprints: tuple[tuple[str, str], ...] = ()
+    cache_fingerprints: tuple[tuple[str, str], ...] = ()
 
     @property
     def success(self) -> bool:

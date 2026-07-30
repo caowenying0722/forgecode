@@ -139,3 +139,126 @@ def test_run_command_validation_routes_to_verification_ledger(
     assert second.success is True
     assert second.metadata['verification_reused'] is True
     assert ledger.records[-1].evidence_source == 'cache'
+
+
+def test_verification_ledger_preserves_generated_artifact_paths() -> None:
+    ledger = VerificationLedger()
+
+    record = ledger.record_from_metadata(
+        {
+            'verification': True,
+            'verification_status': 'passed',
+            'command': 'npx vite build',
+            'cwd': '.',
+            'workspace_revision': 1,
+            'source_revision': 1,
+            'filesystem_revision': 2,
+            'exit_code': 0,
+            'duration_seconds': 0.1,
+            'timed_out': False,
+            'generated_artifact_paths': [
+                'dist/index.html',
+                'dist/assets/app.js',
+            ],
+        }
+    )
+
+    assert record is not None
+    evidence = record.to_evidence()
+    assert evidence.generated_artifact_paths == (
+        'dist/index.html',
+        'dist/assets/app.js',
+    )
+
+
+def test_verification_ledger_preserves_cache_paths() -> None:
+    ledger = VerificationLedger()
+
+    record = ledger.record_from_metadata(
+        {
+            'verification': True,
+            'verification_status': 'passed',
+            'command': 'python -m pytest -q',
+            'cwd': '.',
+            'workspace_revision': 0,
+            'source_revision': 0,
+            'filesystem_revision': 1,
+            'exit_code': 0,
+            'duration_seconds': 0.1,
+            'timed_out': False,
+            'cache_paths': ['.pytest_cache/v/cache/nodeids'],
+        }
+    )
+
+    assert record is not None
+    assert record.to_evidence().cache_paths == (
+        '.pytest_cache/v/cache/nodeids',
+    )
+
+
+def test_verification_ledger_preserves_artifact_fingerprints() -> None:
+    ledger = VerificationLedger()
+
+    record = ledger.record_from_metadata(
+        {
+            'verification': True,
+            'verification_status': 'passed',
+            'command': 'npx vite build',
+            'cwd': '.',
+            'workspace_revision': 1,
+            'source_revision': 1,
+            'filesystem_revision': 2,
+            'exit_code': 0,
+            'duration_seconds': 0.1,
+            'timed_out': False,
+            'generated_artifact_paths': ['dist/index.html'],
+            'cache_paths': ['.vite/cache.json'],
+            'generated_artifact_fingerprints': [
+                ['dist/index.html', 'file:abc']
+            ],
+            'cache_fingerprints': [['.vite/cache.json', 'file:def']],
+        }
+    )
+
+    assert record is not None
+    evidence = record.to_evidence()
+    assert evidence.generated_artifact_fingerprints == (
+        ('dist/index.html', 'file:abc'),
+    )
+    assert evidence.cache_fingerprints == (
+        ('.vite/cache.json', 'file:def'),
+    )
+
+
+def test_cached_verification_preserves_artifact_evidence() -> None:
+    ledger = VerificationLedger()
+    key = ('source', 1, 'npx vite build')
+    original = ledger.record_from_metadata(
+        {
+            'verification': True,
+            'verification_status': 'passed',
+            'command': 'npx vite build',
+            'command_id': 'npm:build',
+            'cwd': '.',
+            'workspace_revision': 1,
+            'source_revision': 1,
+            'filesystem_revision': 2,
+            'exit_code': 0,
+            'duration_seconds': 0.1,
+            'timed_out': False,
+            'generated_artifact_paths': ['dist/index.html'],
+            'generated_artifact_fingerprints': [
+                ['dist/index.html', 'file:abc']
+            ],
+        },
+        reusable_key=key,
+    )
+
+    assert original is not None
+    reusable = ledger.reusable(key)
+    assert reusable is not None
+    cached = reusable.to_evidence()
+    assert cached.generated_artifact_paths == ('dist/index.html',)
+    assert cached.generated_artifact_fingerprints == (
+        ('dist/index.html', 'file:abc'),
+    )

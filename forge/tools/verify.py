@@ -203,6 +203,14 @@ class VerifyTool(Tool[VerifyInput]):
         side_effect_paths = classification.verification_side_effect_paths
         if side_effect_paths and verification_status == 'passed':
             verification_status = 'failed'
+        generated_artifact_fingerprints = _current_fingerprints(
+            self.tracker,
+            classification.generated_paths,
+        )
+        cache_fingerprints = _current_fingerprints(
+            self.tracker,
+            classification.cache_paths,
+        )
         metadata = {
             **process_metadata(result),
             'command': command,
@@ -225,6 +233,10 @@ class VerifyTool(Tool[VerifyInput]):
             'verification_side_effect_paths': list(side_effect_paths),
             'generated_artifact_paths': list(classification.generated_paths),
             'cache_paths': list(classification.cache_paths),
+            'generated_artifact_fingerprints': [
+                list(item) for item in generated_artifact_fingerprints
+            ],
+            'cache_fingerprints': [list(item) for item in cache_fingerprints],
             'source_revision_changed': (
                 self.tracker.source_revision != source_revision
             ),
@@ -281,3 +293,14 @@ class VerifyTool(Tool[VerifyInput]):
         if scope.reusable:
             self.tracker.verification_cache[key] = passed
         return passed
+
+
+def _current_fingerprints(
+    tracker: WorkspaceTracker,
+    paths: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (path, tracker.current.files[path])
+        for path in paths
+        if path in tracker.current.files
+    )

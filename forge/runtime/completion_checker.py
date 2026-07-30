@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 import hashlib
+from pathlib import PurePosixPath
 
 from forge.context.working import WorkingState
 from forge.runtime.acceptance import AcceptanceLedger
-from forge.runtime.completion import CompletionDecision, CompletionGate
+from forge.runtime.completion import (
+    CompletionDecision,
+    CompletionGate,
+    matches_any,
+)
 from forge.runtime.intent import TaskContract
 from forge.runtime.state import ToolCall, VerificationEvidence
 from forge.runtime.task_scope import (
@@ -85,6 +90,7 @@ class CompletionChecker:
         )
         return self._with_relevance_reasons(
             decision,
+            verification=verification,
             evidence_paths=evidence_paths,
         )
 
@@ -156,6 +162,7 @@ class CompletionChecker:
                 )
                 decision = self._with_relevance_reasons(
                     decision,
+                    verification=verification,
                     evidence_paths=evidence_paths,
                 )
                 reasons.extend(decision.reasons)
@@ -312,6 +319,7 @@ class CompletionChecker:
             return False
         return self._with_relevance_reasons(
             decision,
+            verification=verification,
             evidence_paths=evidence_paths,
         ).allowed
 
@@ -340,6 +348,7 @@ class CompletionChecker:
         self,
         decision: CompletionDecision,
         *,
+        verification: VerificationEvidence | None = None,
         evidence_paths: tuple[str, ...] = (),
     ) -> CompletionDecision:
         if self.tracker is None:
@@ -347,12 +356,20 @@ class CompletionChecker:
         task = self.task_manager.active
         if task is None:
             return decision
-        if (
-            _tracker_filesystem_changed_paths(self.tracker)
-            and not self.tracker.changed_paths
-        ):
+        filesystem_paths = _tracker_filesystem_changed_paths(self.tracker)
+        trusted_outputs = trusted_verification_output_paths(
+            self.tracker,
+            verification,
+            forbidden_patterns=(
+                self.gate.policy.forbidden_paths if self.gate is not None else ()
+            ),
+        )
+        untrusted_filesystem_paths = tuple(
+            path for path in filesystem_paths if path not in trusted_outputs
+        )
+        if filesystem_paths and not self.tracker.changed_paths:
             classification = self.tracker.classifier.classify(
-                _tracker_filesystem_changed_paths(self.tracker)
+                untrusted_filesystem_paths
             )
             paths = (
                 classification.generated_paths
@@ -374,12 +391,12 @@ class CompletionChecker:
                         )
                     ),
                 )
-        elif _tracker_filesystem_changed_paths(self.tracker):
+        elif filesystem_paths:
             source_paths = set(self.tracker.changed_paths)
             classification = self.tracker.classifier.classify(
                 tuple(
                     path
-                    for path in _tracker_filesystem_changed_paths(self.tracker)
+                    for path in untrusted_filesystem_paths
                     if path not in source_paths
                 )
             )
@@ -576,6 +593,12 @@ def verification_from_result(
             cache_paths=tuple(
                 str(path) for path in metadata.get('cache_paths', [])
             ),
+            generated_artifact_fingerprints=_fingerprints_from_metadata(
+                metadata.get('generated_artifact_fingerprints', [])
+            ),
+            cache_fingerprints=_fingerprints_from_metadata(
+                metadata.get('cache_fingerprints', [])
+            ),
             verification_side_effect_paths=tuple(
                 str(path)
                 for path in metadata.get('verification_side_effect_paths', [])
@@ -583,6 +606,72 @@ def verification_from_result(
         )
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def trusted_verification_output_paths(
+    tracker: WorkspaceTracker,
+    verification: VerificationEvidence | None,
+    *,
+    forbidden_patterns: tuple[str, ...] = (),
+) -> frozenset[str]:
+    if verification is None or not verification.success:
+        return frozenset()
+    if verification.bound_source_revision != tracker.source_revision:
+        return frozenset()
+    if verification.verification_side_effect_paths:
+        return frozenset()
+    filesystem_paths = set(_tracker_filesystem_changed_paths(tracker))
+    fingerprint_by_path = {
+        path: fingerprint
+        for path, fingerprint in (
+            *verification.generated_artifact_fingerprints,
+            *verification.cache_fingerprints,
+        )
+    }
+    declared = set(verification.generated_artifact_paths) | set(
+        verification.cache_paths
+    )
+    trusted: set[str] = set()
+    for raw_path in declared:
+        path = str(raw_path).replace('\\', '/')
+        if path not in filesystem_paths:
+            continue
+        if not _is_workspace_relative_path(path):
+            continue
+        if forbidden_patterns and matches_any(path, forbidden_patterns):
+            continue
+        fingerprint = fingerprint_by_path.get(path)
+        if not fingerprint:
+            continue
+        if tracker.current.files.get(path) != fingerprint:
+            continue
+        trusted.add(path)
+    return frozenset(trusted)
+
+
+def _is_workspace_relative_path(path: str) -> bool:
+    if not path or path.startswith('/') or '\\' in path:
+        return False
+    parts = PurePosixPath(path).parts
+    return '..' not in parts and not any(':' in part for part in parts)
+
+
+def _fingerprints_from_metadata(value: object) -> tuple[tuple[str, str], ...]:
+    pairs: list[tuple[str, str]] = []
+    if not isinstance(value, (list, tuple)):
+        return ()
+    for item in value:
+        if isinstance(item, dict):
+            path = item.get('path')
+            fingerprint = item.get('fingerprint')
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            path, fingerprint = item
+        else:
+            continue
+        if path is None or fingerprint is None:
+            continue
+        pairs.append((str(path), str(fingerprint)))
+    return tuple(pairs)
 
 
 def completion_review_paths(
