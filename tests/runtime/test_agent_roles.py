@@ -629,6 +629,38 @@ def test_failed_verification_stays_out_of_exploring() -> None:
     assert controller.state is not AgentControlState.EXPLORING
 
 
+def test_invalid_verify_does_not_enter_fix_required() -> None:
+    controller = AgentController()
+    controller.begin_turn(infer_task_contract('请修复 forge/runtime/intent.py'))
+
+    controller.observe_tool_result(
+        'verify',
+        ToolResult.fail(
+            'verification_command_invalid',
+            'Verification command is invalid.',
+            metadata={
+                'verification': True,
+                'verification_status': 'invalid',
+                'exit_code': -1,
+                'timed_out': False,
+            },
+        ),
+    )
+
+    assert controller.state is AgentControlState.READY_TO_VERIFY
+    runtime = controller.snapshot()
+    runtime.verification.latest = VerificationEvidence(
+        command='npm install',
+        cwd='.',
+        exit_code=-1,
+        duration_seconds=0,
+        timed_out=False,
+        workspace_revision=1,
+        status='invalid',
+    )
+    assert runtime.verification_fix_required is False
+
+
 def test_action_recovery_is_derived_from_control_state() -> None:
     controller = AgentController()
     controller.begin_turn(infer_task_contract('请修复 src/app.py'))
@@ -823,6 +855,8 @@ def test_recovery_scope_controls_verification_reads() -> None:
         {'name': 'read_file'},
         {'name': 'grep'},
         {'name': 'write_file'},
+        {'name': 'run_command'},
+        {'name': 'task'},
         {'name': 'verify'},
         {'name': 'finish_task'},
     ]
@@ -849,12 +883,15 @@ def test_recovery_scope_controls_verification_reads() -> None:
         'read_file',
         'grep',
         'write_file',
+        'run_command',
         'finish_task',
     }
     assert {tool['name'] for tool in exhausted or ()} == {
         'write_file',
+        'run_command',
         'finish_task',
     }
+    assert 'task' not in {tool['name'] for tool in first or ()}
 
 
 def test_recovery_manager_extracts_verification_repair_target() -> None:
@@ -886,6 +923,35 @@ def test_recovery_manager_extracts_verification_repair_target() -> None:
     assert target.failure_signature == 'abc123'
     assert target.expected_action == (
         'repair the failing changed code or project configuration'
+    )
+
+
+def test_invalid_verify_does_not_create_source_repair_target() -> None:
+    recovery = RecoveryManager(
+        [{'name': 'read_file'}],
+        None,
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    result = ToolResult.fail(
+        'verification_command_invalid',
+        'Verification command is invalid.',
+        metadata={
+            'verification_status': 'invalid',
+            'failure_signature': 'invalid-command',
+        },
+    )
+
+    target = recovery.verification_repair_target_from_result(
+        result,
+        changed_paths=('src/app.py',),
+    )
+
+    assert target.source == 'verify:invalid'
+    assert target.paths == ()
+    assert target.direct_dependencies == ()
+    assert target.expected_action == (
+        'choose a valid non-interactive validation command'
     )
 
 
@@ -1008,6 +1074,53 @@ def test_request_builder_injects_verification_repair_target() -> None:
     assert 'src/app.py' in spec.system_prompt
     assert 'missing_value' in spec.system_prompt
     assert 'verify' not in spec.tool_names
+
+
+def test_invalid_verify_keeps_verify_available_without_repair_target() -> None:
+    tools = [
+        {'name': 'read_file'},
+        {'name': 'write_file'},
+        {'name': 'verify'},
+        {'name': 'finish_task'},
+        {'name': 'git_status'},
+        {'name': 'git_diff'},
+    ]
+    recovery = RecoveryManager(
+        tools,
+        EffectByName({'write_file'}),
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    contract = infer_task_contract('请修复 src/app.py')
+    runtime = TurnRuntimeState(
+        control_state=AgentControlState.READY_TO_VERIFY,
+        contract=contract,
+    )
+    runtime.verification.latest = VerificationEvidence(
+        command='npm install',
+        cwd='.',
+        exit_code=-1,
+        duration_seconds=0.0,
+        timed_out=False,
+        workspace_revision=3,
+        status='invalid',
+    )
+
+    spec = RequestBuilder(recovery, action_recovery_limit=3).build(
+        state=RequestState(runtime=runtime),
+        interaction_mode='auto',
+        all_tools=tools,
+        plan_tools=[tools[0]],
+        base_system_prompt='base',
+        repository_context='',
+        changed_paths=('src/app.py',),
+    )
+
+    assert {'verify', 'finish_task', 'git_status', 'git_diff'} <= spec.tool_names
+    assert 'write_file' not in spec.tool_names
+    assert '[ForgeCode Repair Target]' not in spec.system_prompt
+    assert 'previous verify command was invalid' in spec.system_prompt
+    assert 'Do not edit files' in spec.system_prompt
 
 
 def test_model_failure_handler_preserves_partial_output() -> None:

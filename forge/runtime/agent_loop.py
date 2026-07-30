@@ -140,6 +140,7 @@ from forge.runtime.tool_executor import (
 )
 from forge.runtime.workspace import WorkspaceTracker
 from forge.runtime.verification_ledger import VerificationLedger
+from forge.runtime.verification import verification_status_requires_repair
 from forge.sessions.store import SessionStore
 from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolRegistry, ToolResult
@@ -1357,14 +1358,15 @@ class Conversation:
                                 for marker in (
                                     'latest verification failed',
                                     'latest verification timed out',
-                                    'latest verification command was invalid',
                                 )
                                 for reason in decision.reasons
                             )
                             verification_needs_repair = (
                                 verification_failure_blocked
                                 and verification_state.latest is not None
-                                and not verification_state.latest.success
+                                and verification_status_requires_repair(
+                                    verification_state.latest.status
+                                )
                             )
                             verification_state.failed_revision = (
                                 verification_state.latest.workspace_revision
@@ -1906,7 +1908,9 @@ class Conversation:
                             )
                         )
                         verification_state.clear_failure()
-                    else:
+                    elif verification_status_requires_repair(
+                        verification_state.latest.status
+                    ):
                         verification_state.repair_target = (
                             self.recovery_manager
                             .verification_repair_target_from_result(
@@ -1959,6 +1963,8 @@ class Conversation:
                             else None
                         )
                         verification_state.read_count = 0
+                    else:
+                        verification_state.clear_failure()
                     if verification_state.latest is not None:
                         batch.verification_progressed = True
                         completed = self.acceptance_ledger.observe_verification(
@@ -2652,14 +2658,15 @@ class Conversation:
                                     for marker in (
                                         'latest verification failed',
                                         'latest verification timed out',
-                                        'latest verification command was invalid',
                                     )
                                     for reason in decision.reasons
                                 )
                                 verification_needs_repair = (
                                     verification_failure_blocked
                                     and verification_state.latest is not None
-                                    and not verification_state.latest.success
+                                    and verification_status_requires_repair(
+                                        verification_state.latest.status
+                                    )
                                 )
                                 verification_state.failed_revision = (
                                     verification_state.latest.workspace_revision

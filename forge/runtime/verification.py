@@ -21,6 +21,10 @@ VerificationStatus = Literal[
     'invalid',
     'unavailable',
 ]
+KNOWN_VERIFICATION_STATUSES = frozenset(
+    {'passed', 'failed', 'timed_out', 'invalid', 'unavailable'}
+)
+REPAIR_REQUIRED_VERIFICATION_STATUSES = frozenset({'failed', 'timed_out'})
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +35,48 @@ class ValidationCommand:
     target: ValidationTarget = 'auto'
     source: str = 'discovered'
     strength: int = 0
+
+
+def normalize_verification_status(
+    status: object,
+    *,
+    success: bool = False,
+    timed_out: bool = False,
+    exit_code: object = None,
+) -> VerificationStatus:
+    '''Return a known verification status with conservative fallback.'''
+    normalized = str(status or '').strip().casefold()
+    if normalized in KNOWN_VERIFICATION_STATUSES:
+        return normalized  # type: ignore[return-value]
+    if timed_out:
+        return 'timed_out'
+    if success:
+        return 'passed'
+    try:
+        return 'passed' if int(exit_code) == 0 else 'failed'
+    except (TypeError, ValueError):
+        return 'failed'
+
+
+def verification_status_requires_repair(status: object) -> bool:
+    '''Return whether a verification status means this revision needs repair.'''
+    return (
+        normalize_verification_status(status)
+        in REPAIR_REQUIRED_VERIFICATION_STATUSES
+    )
+
+
+def tool_result_verification_status(
+    metadata: dict[str, object],
+    *,
+    success: bool,
+) -> VerificationStatus:
+    return normalize_verification_status(
+        metadata.get('verification_status'),
+        success=success,
+        timed_out=bool(metadata.get('timed_out', False)),
+        exit_code=metadata.get('exit_code'),
+    )
 
 
 NON_INTERACTIVE_ENV = {

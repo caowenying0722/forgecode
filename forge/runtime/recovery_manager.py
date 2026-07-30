@@ -11,6 +11,7 @@ from typing import Any
 from forge.runtime.state import ToolCall, VerificationEvidence
 from forge.runtime.tool_targets import mutation_target_paths
 from forge.runtime.tool_runner import ToolRunner
+from forge.runtime.verification import verification_status_requires_repair
 from forge.tools.base import ToolResult
 
 
@@ -249,6 +250,7 @@ class RecoveryManager:
             allowed.add('verify')
             allowed.update({'git_status', 'git_diff'})
         if fix_available:
+            allowed.add('run_command')
             if scope.read_available:
                 allowed.update({'find_files', 'grep', 'read_file'})
         return [
@@ -374,7 +376,11 @@ def repair_target_from_verification(
         )
         if part
     )
-    paths = _changed_paths_for_verification(changed_paths)
+    paths = (
+        _changed_paths_for_verification(changed_paths)
+        if verification_status_requires_repair(verification.status)
+        else ()
+    )
     modules = _extract_modules(diagnostic)
     return RepairTarget(
         source=f'verify:{verification.status}',
@@ -395,11 +401,16 @@ def repair_target_from_verification_result(
 ) -> RepairTarget:
     status = str(result.metadata.get('verification_status', 'failed'))
     diagnostic = _diagnostic_text(result)
+    repair_required = verification_status_requires_repair(status)
     paths = tuple(
         dict.fromkeys(
             [
                 *_extract_paths(diagnostic),
-                *_changed_paths_for_verification(changed_paths),
+                *(
+                    _changed_paths_for_verification(changed_paths)
+                    if repair_required
+                    else ()
+                ),
             ]
         )
     )

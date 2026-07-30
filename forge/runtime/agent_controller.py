@@ -9,6 +9,10 @@ from forge.runtime.acceptance import AcceptanceLedger
 from forge.runtime.intent import InitialToolSurface, TaskContract
 from forge.runtime.recovery_manager import RepairTarget
 from forge.runtime.state import VerificationEvidence
+from forge.runtime.verification import (
+    tool_result_verification_status,
+    verification_status_requires_repair,
+)
 from forge.runtime.verification_ledger import VerificationLedger
 from forge.tools.base import ToolResult
 
@@ -121,7 +125,14 @@ class AgentController:
         elif tool_name == 'verify' and result.success:
             self.state = AgentControlState.VERIFYING
         elif tool_name == 'verify' and not result.success:
-            self.enter_fix_required()
+            status = tool_result_verification_status(
+                result.metadata,
+                success=result.success,
+            )
+            if verification_status_requires_repair(status):
+                self.enter_fix_required()
+            else:
+                self.enter_ready_to_verify()
 
 
 def initial_state(contract: TaskContract) -> AgentControlState:
@@ -221,7 +232,7 @@ class VerificationRecoveryState:
         return (
             control_state is AgentControlState.FIX_REQUIRED
             and self.latest is not None
-            and not self.latest.success
+            and verification_status_requires_repair(self.latest.status)
         )
 
     def recovery_active(self, control_state: AgentControlState) -> bool:

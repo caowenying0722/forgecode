@@ -19,6 +19,7 @@ from forge.runtime.task_model import (
     build_runtime_task_model,
     render_runtime_task_model,
 )
+from forge.runtime.verification import verification_status_requires_repair
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,14 +210,16 @@ class RequestBuilder:
         if completion_context:
             prompt += '\n\n' + completion_context
         repair_target_context = ''
+        latest_verification = _latest_verification(state)
         if (
             _verification_recovery_active(state)
-            and _latest_verification(state) is not None
+            and latest_verification is not None
+            and verification_status_requires_repair(latest_verification.status)
         ):
             target = _verification_repair_target(state)
             if target is None:
                 target = self.recovery_manager.verification_repair_target(
-                    _latest_verification(state),
+                    latest_verification,
                     changed_paths=changed_paths,
                 )
             repair_target_context = render_repair_target_context(
@@ -354,18 +357,36 @@ def recovery_system_suffix(
             'or describe another tool call.'
         )
     if _verification_recovery_active(state):
-        verify_gate = (
-            'A previous verification failed and no later workspace revision '
-            'has been created yet, so verify is intentionally unavailable. '
-            'Use the latest verification output to make a relevant repair '
-            'first. After a real workspace change, the next recovery request '
-            'will expose verify for the new revision.'
-            if _verification_fix_required(state)
-            else (
+        latest = _latest_verification(state)
+        if _verification_fix_required(state):
+            verify_gate = (
+                'A previous verification failed and no later workspace revision '
+                'has been created yet, so verify is intentionally unavailable. '
+                'Use the latest verification output to make a relevant repair '
+                'first. After a real workspace change, the next recovery request '
+                'will expose verify for the new revision.'
+            )
+        elif latest is not None and latest.status == 'invalid':
+            verify_gate = (
+                'The previous verify command was invalid, which is not evidence '
+                'that the current source revision is broken. Do not edit files '
+                'because of that invalid command. Call verify again with '
+                'target=auto, a discovered command_id, or a valid '
+                'non-interactive build, test, lint, type-check, or diff command.'
+            )
+        elif latest is not None and latest.status == 'unavailable':
+            verify_gate = (
+                'ForgeCode could not find an available project validation '
+                'command for the previous verify request. Reassess the '
+                'available validation commands and retry verify with a valid '
+                'target, command_id, or concrete non-interactive validation '
+                'command if one exists.'
+            )
+        else:
+            verify_gate = (
                 'The current recovery request may expose verify because the '
                 'workspace is ready for formal validation.'
             )
-        )
         return (
             '\n\n[ForgeCode Verification Recovery]\n'
             'The workspace already has task-local changes. The current '

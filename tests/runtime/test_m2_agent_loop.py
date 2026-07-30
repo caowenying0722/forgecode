@@ -72,6 +72,11 @@ class EmptyProcessInput(ToolInput):
     pass
 
 
+class FailedTaskInput(ToolInput):
+    task: str
+    focus_paths: list[str] = []
+
+
 class VerifyInput(ToolInput):
     command: str
 
@@ -104,13 +109,13 @@ class ProcessRevertTool(Tool[EmptyProcessInput]):
         return ToolResult.ok('Reverted sample.txt to the turn baseline.')
 
 
-class FailedTaskTool(Tool[EmptyProcessInput]):
+class FailedTaskTool(Tool[FailedTaskInput]):
     name = 'task'
     description = 'Fail like a subagent that reached its round limit.'
-    input_model = EmptyProcessInput
+    input_model = FailedTaskInput
     effect = 'process'
 
-    async def execute(self, arguments: EmptyProcessInput) -> ToolResult:
+    async def execute(self, arguments: FailedTaskInput) -> ToolResult:
         del arguments
         return ToolResult.fail(
             'subagent_no_report',
@@ -689,7 +694,10 @@ def test_unrelated_change_after_failed_verify_does_not_enable_verify(
 
     events = asyncio.run(collect_until_blocked_verify())
 
-    assert not (tmp_path / 'notes' / 'unrelated.txt').exists()
+    assert (tmp_path / 'notes' / 'unrelated.txt').exists()
+    assert 'run_command' in {
+        str(tool.get('name')) for tool in client.calls[2]['tools'] or []
+    }
     assert 'verify' not in {
         str(tool.get('name')) for tool in client.calls[3]['tools'] or []
     }
@@ -1325,6 +1333,7 @@ def test_failed_subagent_delegation_for_change_enters_local_action_recovery(
         ),
     )
     conversation = Conversation(client=client, registry=registry)
+    registry.replace(FailedTaskTool(tmp_path))
 
     events = collect_turn(conversation, 'Change sample.txt to new')
 
@@ -2513,6 +2522,147 @@ def test_missing_verification_recovery_focuses_verify_after_package_change(
     )
 
 
+def test_invalid_then_valid_verification_can_finish_without_stuck(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'invalid-flow-edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    invalid_verify = ToolCall(
+        0,
+        'invalid-flow-verify',
+        'verify',
+        {'command': 'npm install'},
+    )
+    auto_verify = ToolCall(
+        0,
+        'invalid-flow-auto-verify',
+        'verify',
+        {'target': 'auto'},
+    )
+    summary = 'Changed sample.txt and verified with target=auto.'
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(invalid_verify),
+        response_with_tool(auto_verify),
+        finish_response(
+            'invalid-flow-finish',
+            task_kind='change',
+            summary=summary,
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        max_completion_blocks=2,
+        stagnation_warning=1,
+        stagnation_limit=2,
+    )
+
+    events = collect_turn(conversation, 'Change and verify sample.txt')
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == 'completed'
+    assert completed.result.text == summary
+    assert completed.result.changed_paths == ('sample.txt',)
+    assert completed.result.verification is not None
+    assert completed.result.verification.success is True
+    invalid_event = next(
+        event
+        for event in events
+        if isinstance(event, VerificationCompleted)
+        and event.evidence.status == 'invalid'
+    )
+    assert invalid_event.evidence.bound_source_revision == 1
+    invalid_recovery_tools = {
+        definition['name'] for definition in client.calls[2]['tools']
+    }
+    assert {'finish_task', 'git_diff', 'git_status', 'verify'} <= (
+        invalid_recovery_tools
+    )
+    assert 'write_file' not in invalid_recovery_tools
+    assert 'run_command' not in invalid_recovery_tools
+    assert '[ForgeCode Repair Target]' not in (client.calls[2]['system'] or '')
+    assert 'previous verify command was invalid' in (
+        client.calls[2]['system'] or ''
+    )
+
+
+def test_invalid_verify_cannot_be_declared_blocked(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    edit = ToolCall(
+        0,
+        'invalid-blocked-edit',
+        'replace_text',
+        {
+            'path': 'sample.txt',
+            'old_text': 'old\n',
+            'new_text': 'new\n',
+        },
+    )
+    invalid_verify = ToolCall(
+        0,
+        'invalid-blocked-verify',
+        'verify',
+        {'command': 'npm install'},
+    )
+    client = FakeModelClient(
+        response_with_tool(edit),
+        response_with_tool(invalid_verify),
+        finish_response(
+            'invalid-blocked-finish',
+            task_kind='change',
+            status='blocked',
+            summary='Cannot continue after invalid verification.',
+            blocked_reasons=['The verification command was invalid.'],
+        ),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+        max_completion_blocks=2,
+        stagnation_warning=1,
+        stagnation_limit=2,
+    )
+
+    async def collect_until_finish_rejected() -> list[ConversationEvent]:
+        events: list[ConversationEvent] = []
+        async for event in conversation.stream('Change and verify sample.txt'):
+            events.append(event)
+            if (
+                isinstance(event, ToolExecutionCompleted)
+                and event.tool_call.name == 'finish_task'
+                and event.result.error is not None
+            ):
+                break
+        return events
+
+    events = asyncio.run(collect_until_finish_rejected())
+
+    finish_event = next(
+        event
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.tool_call.name == 'finish_task'
+    )
+    assert finish_event.result.error is not None
+    assert finish_event.result.error.code == 'finish_rejected'
+    assert 'blocked is reserved for an external condition' in (
+        finish_event.result.error.details['reasons'][0]
+    )
+
+
 def test_failed_verification_recovery_allows_fix_before_verify(
     tmp_path: Path,
 ) -> None:
@@ -2580,7 +2730,9 @@ def test_failed_verification_recovery_allows_fix_before_verify(
         definition['name'] for definition in failed_recovery_request['tools']
     }
     assert 'verify' not in failed_recovery_tool_names
-    assert 'run_command' not in failed_recovery_tool_names
+    assert 'run_command' in failed_recovery_tool_names
+    assert 'task' not in failed_recovery_tool_names
+    assert 'task_create' not in failed_recovery_tool_names
     assert 'write_file' in failed_recovery_tool_names
     assert 'list_directory' not in failed_recovery_tool_names
     assert '[ForgeCode Verification Recovery]' in (
@@ -2686,7 +2838,8 @@ def test_failed_verification_recovery_limits_reads_then_forces_repair(
     }
     assert {'find_files', 'read_file', 'grep'} <= second_repair_tools
     assert 'write_file' in second_repair_tools
-    assert 'run_command' not in second_repair_tools
+    assert 'run_command' in second_repair_tools
+    assert 'task' not in second_repair_tools
     assert 'verify' not in second_repair_tools
     ready_to_reverify_tools = {
         definition['name'] for definition in client.calls[4]['tools']
