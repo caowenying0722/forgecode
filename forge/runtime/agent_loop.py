@@ -1225,13 +1225,17 @@ class Conversation:
                 ):
                     change = await self.workspace_tracker.refresh()
                     if change is not None:
-                        self.working_state.advance_revision(
-                            change.revision,
-                            change.paths,
-                        )
+                        if change.source_paths:
+                            self.working_state.advance_revision(
+                                change.source_revision,
+                                change.source_paths,
+                            )
                         yield WorkspaceChanged(
                             revision=change.revision,
                             paths=change.paths,
+                            filesystem_revision=change.filesystem_revision,
+                            source_revision=change.source_revision,
+                            source_paths=change.source_paths,
                         )
                     decision = await self.completion_checker.evaluate(
                         verification_state.latest,
@@ -1494,7 +1498,11 @@ class Conversation:
                 if phase_event is not None:
                     yield phase_event
                 revision = (
-                    self.workspace_tracker.revision
+                    getattr(
+                        self.workspace_tracker,
+                        'source_revision',
+                        self.workspace_tracker.revision,
+                    )
                     if self.workspace_tracker is not None
                     else 0
                 )
@@ -1605,7 +1613,12 @@ class Conversation:
                             'finish_rejected',
                             'The finish_task declaration did not match the '
                             'available execution evidence.',
-                            details={'reasons': list(finish_reasons)},
+                            details={
+                                'reasons': list(finish_reasons),
+                                'gap_report': (
+                                    self.completion_checker.last_finish_gap_report
+                                ),
+                            },
                         )
                         if (
                             not pending_required_change
@@ -1666,27 +1679,29 @@ class Conversation:
                 if (
                     tool_call.name == 'task'
                     and not result.success
-                    and self._pending_required_change(
-                        change_required,
-                        mutation_attempted=mutation_attempted,
-                    )
+                    and change_required
+                    and not mutation_attempted
                 ):
                     batch.required_change_rejected = True
                 tool_changed_workspace = False
                 if self.workspace_tracker is not None:
                     change = await self.workspace_tracker.refresh()
                     if change is not None:
-                        tool_changed_workspace = True
-                        batch.last_workspace_change_position = tool_position
-                        self.working_state.advance_revision(
-                            change.revision,
-                            change.paths,
-                        )
-                        if tool_effect == 'process':
+                        tool_changed_workspace = bool(change.source_paths)
+                        if change.source_paths:
+                            batch.last_workspace_change_position = tool_position
+                            self.working_state.advance_revision(
+                                change.source_revision,
+                                change.source_paths,
+                            )
+                        if tool_effect == 'process' and change.source_paths:
                             mutation_attempted = True
                         yield WorkspaceChanged(
                             revision=change.revision,
                             paths=change.paths,
+                            filesystem_revision=change.filesystem_revision,
+                            source_revision=change.source_revision,
+                            source_paths=change.source_paths,
                         )
                     elif is_satisfied_non_diff_workspace_write(
                         tool_call,
@@ -1907,7 +1922,11 @@ class Conversation:
                     verification_state.requires_repair(runtime.control_state)
                     and self.workspace_tracker is not None
                     and verification_state.failed_revision is not None
-                    and self.workspace_tracker.revision
+                    and getattr(
+                        self.workspace_tracker,
+                        'source_revision',
+                        self.workspace_tracker.revision,
+                    )
                     > verification_state.failed_revision
                     and verification_repair_relevant
                 )
@@ -2138,7 +2157,11 @@ class Conversation:
                     raise AssertionError(
                         'Completion readiness requires a workspace tracker.'
                     )
-                revision = self.workspace_tracker.revision
+                revision = getattr(
+                    self.workspace_tracker,
+                    'source_revision',
+                    self.workspace_tracker.revision,
+                )
                 new_ready_revision = completion_ready_revision != revision
                 if new_ready_revision:
                     completion_ready_revision = revision
@@ -2193,6 +2216,15 @@ class Conversation:
                     if self.workspace_tracker is not None
                     else ()
                 ),
+                source_changed_paths=(
+                    getattr(
+                        self.workspace_tracker,
+                        'source_changed_paths',
+                        self.workspace_tracker.changed_paths,
+                    )
+                    if self.workspace_tracker is not None
+                    else ()
+                ),
                 evidence_paths=tuple(
                     sorted(
                         set(self.working_state.evidence_paths)
@@ -2204,6 +2236,11 @@ class Conversation:
                     verification_state.repair_target.paths
                     if verification_state.repair_target is not None
                     else ()
+                ),
+                verification_reused=(
+                    verification_state.latest.verification_reused
+                    if verification_state.latest is not None
+                    else False
                 ),
             )
             if progress.progressed:

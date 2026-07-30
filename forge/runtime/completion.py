@@ -110,6 +110,13 @@ class CompletionGate:
             )
 
         reasons.extend(self._path_violations(changed_paths))
+        if tracker.last_classification.verification_side_effect_paths:
+            reasons.append(
+                'Verification modified undeclared source or workspace paths: '
+                + ', '.join(
+                    tracker.last_classification.verification_side_effect_paths
+                )
+            )
 
         verification_required = self.policy.require_verification or (
             self.policy.require_change_verification
@@ -140,10 +147,10 @@ class CompletionGate:
                         f'The latest verification failed with exit code '
                         f'{verification.exit_code}.'
                     )
-            elif verification.workspace_revision != tracker.revision:
+            elif verification.bound_source_revision != _tracker_source_revision(tracker):
                 reasons.append(
                     'The code changed after verification; run verify again for '
-                    f'workspace revision {tracker.revision}.'
+                    f'source revision {_tracker_source_revision(tracker)}.'
                 )
             elif self._needs_project_validation(changed_paths) and not (
                 command_is_project_validation(verification.command)
@@ -156,7 +163,7 @@ class CompletionGate:
                 )
         elif (
             verification is not None
-            and verification.workspace_revision == tracker.revision
+            and verification.bound_source_revision == _tracker_source_revision(tracker)
             and not verification.success
         ):
             reasons.append(
@@ -298,6 +305,11 @@ class CompletionGate:
 def command_is_project_validation(command: str) -> bool:
     normalized = f' {command.strip().casefold()} '
     return any(marker in normalized for marker in PROJECT_VALIDATION_MARKERS)
+
+
+def _tracker_source_revision(tracker: WorkspaceTracker) -> int:
+    return int(getattr(tracker, 'source_revision', tracker.revision))
+
 
 def matches_any(path: str, patterns: tuple[str, ...]) -> bool:
     candidate = path.replace('\\', '/')

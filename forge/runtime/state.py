@@ -45,7 +45,7 @@ class TokenUsage:
 
 @dataclass(frozen=True, slots=True)
 class VerificationEvidence:
-    '''One verify result tied to an exact workspace revision.'''
+    '''One verify result tied to an exact source revision.'''
 
     command: str
     cwd: str
@@ -56,10 +56,21 @@ class VerificationEvidence:
     status: str = 'passed'
     command_id: str = ''
     failure_signature: str = ''
+    source_revision: int | None = None
+    filesystem_revision: int | None = None
+    verification_type: str = 'auto'
+    verification_reused: bool = False
+    generated_artifact_paths: tuple[str, ...] = ()
+    cache_paths: tuple[str, ...] = ()
+    verification_side_effect_paths: tuple[str, ...] = ()
 
     @property
     def success(self) -> bool:
         return self.status == 'passed' and not self.timed_out and self.exit_code == 0
+
+    @property
+    def bound_source_revision(self) -> int:
+        return self.workspace_revision if self.source_revision is None else self.source_revision
 
 
 TaskStatus = Literal['completed', 'blocked', 'stuck', 'failed']
@@ -209,6 +220,9 @@ class WorkspaceChanged:
 
     revision: int
     paths: tuple[str, ...]
+    filesystem_revision: int | None = None
+    source_revision: int | None = None
+    source_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

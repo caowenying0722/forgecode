@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from pathlib import Path
+from pathlib import Path, PurePath
 import re
 from typing import Literal
 
+from forge.runtime.workspace_classification import (
+    ArtifactRule,
+    VerificationArtifactScope,
+)
 
 ValidationTarget = Literal['auto', 'build', 'test', 'lint', 'typecheck', 'diff']
 VerificationStatus = Literal[
@@ -138,6 +142,170 @@ def classify_verification_command(
         'Verification command is not a recognized non-interactive project '
         'validation command.'
     )
+
+
+def verification_artifact_scope(
+    command: str,
+    *,
+    root: Path,
+    target: ValidationTarget = 'auto',
+) -> VerificationArtifactScope:
+    '''Return declarative side-effect rules for a validation command.'''
+    normalized = command.strip()
+    lowered = normalized.casefold()
+    rules: list[ArtifactRule] = []
+    verification_type = _verification_type(lowered, target)
+    forbidden_sources = (
+        'src/**',
+        'lib/**',
+        'app/**',
+        'packages/**/src/**',
+        'test/**',
+        'tests/**',
+        '__tests__/**',
+        '*.ts',
+        '*.tsx',
+        '*.js',
+        '*.jsx',
+        '*.py',
+        '*.rs',
+        '*.java',
+    )
+
+    if re.search(r'(?i)\btsc\b', normalized):
+        if re.search(r'(?i)(?:--noEmit|--no-emit)\b', normalized):
+            verification_type = 'typecheck'
+        else:
+            # tsc without --noEmit is allowed as a command, but generated
+            # source-like files remain undeclared unless a build adapter below
+            # claims a dedicated output directory.
+            verification_type = 'typecheck'
+
+    if re.search(r'(?i)\bvite\s+build\b', normalized):
+        verification_type = 'build'
+        rules.extend(_vite_output_rules(root))
+
+    if re.search(r'(?i)\bwebpack\b|\brollup\b|\bparcel\b', normalized):
+        verification_type = 'build'
+        rules.extend(
+            [
+                ArtifactRule('dist/**', 'generated_artifact', 'bundler output'),
+                ArtifactRule('build/**', 'generated_artifact', 'bundler output'),
+            ]
+        )
+
+    if re.search(r'(?i)\b(?:pytest|python\s+-m\s+pytest)\b', normalized):
+        verification_type = 'test'
+        rules.append(ArtifactRule('.pytest_cache/**', 'cache', 'pytest cache'))
+
+    if re.search(r'(?i)\bcoverage\b|--cov\b', normalized):
+        rules.extend(
+            [
+                ArtifactRule('.coverage*', 'cache', 'coverage data'),
+                ArtifactRule('coverage/**', 'generated_artifact', 'coverage report'),
+                ArtifactRule('htmlcov/**', 'generated_artifact', 'coverage report'),
+            ]
+        )
+
+    if re.search(r'(?i)\b(?:jest|vitest)\b', normalized):
+        verification_type = 'test'
+        rules.extend(
+            [
+                ArtifactRule('coverage/**', 'generated_artifact', 'test coverage'),
+                ArtifactRule('.vitest/**', 'cache', 'vitest cache'),
+            ]
+        )
+
+    if re.search(r'(?i)\bcargo\s+(?:test|check|clippy|build)\b', normalized):
+        verification_type = 'test' if 'test' in lowered else 'build'
+        rules.append(ArtifactRule('target/**', 'generated_artifact', 'cargo output'))
+
+    if re.search(r'(?i)\b(?:gradle|gradlew)\b', normalized):
+        verification_type = 'test' if 'test' in lowered else 'build'
+        rules.extend(
+            [
+                ArtifactRule('build/**', 'generated_artifact', 'gradle output'),
+                ArtifactRule('.gradle/**', 'cache', 'gradle cache'),
+            ]
+        )
+
+    if re.search(r'(?i)\bmvn(?:w)?\s', normalized):
+        verification_type = 'test' if 'test' in lowered else 'build'
+        rules.append(ArtifactRule('target/**', 'generated_artifact', 'maven output'))
+
+    return VerificationArtifactScope(
+        verification_type=verification_type,
+        read_patterns=(),
+        allowed_writes=tuple(dict.fromkeys(rules)),
+        forbidden_source_patterns=forbidden_sources,
+        allow_network=False,
+        allow_dependency_install=False,
+        cleanup_generated=False,
+        reusable=True,
+    )
+
+
+def verification_cache_key(
+    *,
+    source_revision: int,
+    command: str,
+    cwd: str,
+    scope: VerificationArtifactScope,
+) -> tuple[object, ...]:
+    return (
+        source_revision,
+        command.strip(),
+        cwd.replace('\\', '/'),
+        scope.verification_type,
+        tuple((rule.pattern, rule.kind) for rule in scope.allowed_writes),
+        NON_INTERACTIVE_ENV_KEY,
+    )
+
+
+NON_INTERACTIVE_ENV_KEY = tuple(sorted(NON_INTERACTIVE_ENV.items()))
+
+
+def _verification_type(
+    lowered_command: str,
+    target: ValidationTarget,
+) -> Literal['auto', 'typecheck', 'build', 'test', 'lint', 'smoke']:
+    if target in {'build', 'test', 'lint', 'typecheck'}:
+        return target
+    if 'typecheck' in lowered_command or 'type-check' in lowered_command:
+        return 'typecheck'
+    if 'build' in lowered_command:
+        return 'build'
+    if 'lint' in lowered_command:
+        return 'lint'
+    if 'test' in lowered_command:
+        return 'test'
+    return 'auto'
+
+
+def _vite_output_rules(root: Path) -> list[ArtifactRule]:
+    # Vite defaults to dist. Adapter-specific defaults live here, not in
+    # completion, progress, or revision logic.
+    rules = [ArtifactRule('dist/**', 'generated_artifact', 'vite build output')]
+    config_patterns = ('vite.config.ts', 'vite.config.js', 'vite.config.mjs')
+    for name in config_patterns:
+        config = root / name
+        if not config.is_file():
+            continue
+        try:
+            text = config.read_text(encoding='utf-8')
+        except OSError:
+            continue
+        for match in re.finditer(r'outDir\s*:\s*[\'"]([^\'"]+)[\'"]', text):
+            raw = match.group(1).strip().replace('\\', '/')
+            if raw and not raw.startswith('/') and '..' not in PurePath(raw).parts:
+                rules.append(
+                    ArtifactRule(
+                        f'{raw.rstrip("/")}/**',
+                        'generated_artifact',
+                        'vite configured output',
+                    )
+                )
+    return rules
 
 
 def _package_json_commands(root: Path) -> list[ValidationCommand]:

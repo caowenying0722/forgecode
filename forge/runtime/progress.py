@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 
 from forge.runtime.completion import matches_any
 from forge.runtime.task_scope import DISPOSABLE_PATH_PATTERNS
+from forge.runtime.workspace_classification import WorkspaceChangeClassifier
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,11 +30,13 @@ def evaluate_progress(
     evidence_paths: tuple[str, ...] = (),
     review_paths: tuple[str, ...] = (),
     repair_target_paths: tuple[str, ...] = (),
+    source_changed_paths: tuple[str, ...] = (),
     completed_acceptance_criteria: tuple[str, ...] = (),
     completed_plan_step: bool = False,
     previous_verification_error_count: int | None = None,
     current_verification_error_count: int | None = None,
     failure_signature_changed: bool = False,
+    verification_reused: bool = False,
 ) -> ProgressEvaluation:
     '''Classify whether the last batch materially advanced the task.'''
     if completed_acceptance_criteria:
@@ -42,8 +44,11 @@ def evaluate_progress(
     if completed_plan_step:
         return ProgressEvaluation(True, 'plan_step')
     if workspace_progressed:
+        effective_source_paths = source_changed_paths or changed_paths
+        if not effective_source_paths:
+            return ProgressEvaluation(False, 'filesystem_revision_only')
         if not _paths_relevant(
-            changed_paths,
+            effective_source_paths,
             task_scope_patterns=task_scope_patterns,
             repair_target_paths=repair_target_paths,
         ):
@@ -64,6 +69,8 @@ def evaluate_progress(
             repair_target_paths=repair_target_paths,
         ):
             return ProgressEvaluation(False, 'unrelated_verification_evidence')
+        if verification_reused:
+            return ProgressEvaluation(False, 'reused_verification_evidence')
         return ProgressEvaluation(True, 'verification_evidence')
     if task_progressed:
         return ProgressEvaluation(True, 'task_plan_update')
@@ -99,26 +106,17 @@ def _paths_relevant(
     normalized = tuple(path.replace('\\', '/') for path in paths if path)
     if not normalized:
         return not (task_scope_patterns or repair_target_paths)
+    classification = WorkspaceChangeClassifier().classify(normalized)
+    if not classification.task_candidate_paths:
+        return False
     if all(matches_any(path, DISPOSABLE_PATH_PATTERNS) for path in normalized):
         return False
     if any(matches_any(path, DISPOSABLE_PATH_PATTERNS) for path in normalized):
-        return False
-    if any(_looks_like_generated_source_output(path) for path in normalized):
         return False
     allowed = (*repair_target_paths, *task_scope_patterns)
     if not allowed:
         return True
     return all(_matches_scope(path, allowed) for path in normalized)
-
-
-def _looks_like_generated_source_output(path: str) -> bool:
-    item = PurePosixPath(path)
-    return (
-        item.suffix == '.js'
-        and len(item.parts) >= 2
-        and item.parts[0] == 'src'
-    )
-
 
 def _matches_scope(path: str, patterns: tuple[str, ...]) -> bool:
     if matches_any(path, patterns):

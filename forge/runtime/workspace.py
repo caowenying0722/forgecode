@@ -9,6 +9,11 @@ from pathlib import Path, PurePosixPath
 
 from forge.runtime.paths import normalize_workspace_path
 from forge.runtime.process import run_process
+from forge.runtime.workspace_classification import (
+    ChangeSetClassification,
+    VerificationArtifactScope,
+    WorkspaceChangeClassifier,
+)
 
 DEFAULT_UNWATCHED_PARTS = frozenset(
     {
@@ -42,6 +47,12 @@ class WorkspaceChange:
 
     revision: int
     paths: tuple[str, ...]
+    filesystem_revision: int = 0
+    source_revision: int = 0
+    source_paths: tuple[str, ...] = ()
+    classification: ChangeSetClassification = field(
+        default_factory=ChangeSetClassification
+    )
 
 
 class WorkspaceTracker:
@@ -52,8 +63,14 @@ class WorkspaceTracker:
         self.baseline = WorkspaceSnapshot()
         self.current = WorkspaceSnapshot()
         self.revision = 0
+        self.filesystem_revision = 0
+        self.source_revision = 0
         self.available = False
         self._watched_paths: set[str] = set()
+        self._artifact_paths: set[str] = set()
+        self.classifier = WorkspaceChangeClassifier()
+        self.last_classification = ChangeSetClassification()
+        self.verification_cache: dict[tuple[object, ...], object] = {}
 
     async def begin_turn(self) -> None:
         '''Use the current working tree as the immutable baseline for one turn.'''
@@ -67,6 +84,10 @@ class WorkspaceTracker:
         self.baseline = resolved
         self.current = resolved
         self.revision = 0
+        self.filesystem_revision = 0
+        self.source_revision = 0
+        self._artifact_paths.clear()
+        self.last_classification = ChangeSetClassification()
 
     async def _initialize_internal_repository(self) -> bool:
         '''Create a private gitdir pointer for an otherwise non-Git workspace.'''
@@ -162,9 +183,14 @@ class WorkspaceTracker:
                 files={**self.current.files, normalized: fingerprint}
             )
 
-    async def refresh(self) -> WorkspaceChange | None:
+    async def refresh(
+        self,
+        *,
+        origin: str = 'agent',
+        artifact_scope: VerificationArtifactScope | None = None,
+    ) -> WorkspaceChange | None:
         '''Capture tool-caused changes and advance the revision when needed.'''
-        snapshot = await self._capture()
+        snapshot = await self._capture(artifact_scope=artifact_scope)
         if snapshot is None:
             self.available = False
             return None
@@ -172,16 +198,86 @@ class WorkspaceTracker:
         paths = changed_paths(self.current, snapshot)
         if not paths:
             return None
+        classification = self.classifier.classify(
+            paths,
+            origin='verification' if origin == 'verification' else 'agent',
+            artifact_scope=artifact_scope,
+        )
         self.current = snapshot
-        self.revision += 1
-        return WorkspaceChange(revision=self.revision, paths=paths)
+        self.filesystem_revision += 1
+        self.revision = self.filesystem_revision
+        source_paths = tuple(
+            dict.fromkeys(
+                (
+                    *classification.source_paths,
+                    *(
+                        path
+                        for path in paths
+                        if path in self._watched_paths and origin != 'verification'
+                    ),
+                    *(
+                        path
+                        for path in classification.verification_side_effect_paths
+                        if PurePosixPath(path).suffix.casefold()
+                        in {'.ts', '.tsx', '.py', '.rs', '.java'}
+                    ),
+                )
+            )
+        )
+        if source_paths:
+            self.source_revision += 1
+        self.last_classification = classification
+        self._artifact_paths.update(classification.generated_paths)
+        self._artifact_paths.update(classification.cache_paths)
+        return WorkspaceChange(
+            revision=self.filesystem_revision,
+            paths=paths,
+            filesystem_revision=self.filesystem_revision,
+            source_revision=self.source_revision,
+            source_paths=source_paths,
+            classification=classification,
+        )
 
     @property
     def changed_paths(self) -> tuple[str, ...]:
-        '''Return only paths whose content differs from the turn baseline.'''
+        '''Return task-relevant source/test/config/supporting changed paths.'''
+        return self.source_changed_paths
+
+    @property
+    def source_changed_paths(self) -> tuple[str, ...]:
+        '''Return changed paths that affect the source revision.'''
+        all_paths = changed_paths(self.baseline, self.current)
+        classification = self.classifier.classify(all_paths)
+        non_source_side_effects = {
+            path
+            for path in self.last_classification.verification_side_effect_paths
+            if PurePosixPath(path).suffix.casefold() not in {'.ts', '.tsx', '.py', '.rs', '.java'}
+        }
+        return tuple(
+            path
+            for path in dict.fromkeys(
+                (
+                    *classification.source_paths,
+                    *(
+                        path
+                        for path in all_paths
+                        if path in self._watched_paths
+                    ),
+                )
+            )
+            if path not in non_source_side_effects
+        )
+
+    @property
+    def filesystem_changed_paths(self) -> tuple[str, ...]:
+        '''Return all observed paths whose content differs from turn baseline.'''
         return changed_paths(self.baseline, self.current)
 
-    async def _capture(self) -> WorkspaceSnapshot | None:
+    async def _capture(
+        self,
+        *,
+        artifact_scope: VerificationArtifactScope | None = None,
+    ) -> WorkspaceSnapshot | None:
         result = await run_process(
             [
                 'git',
@@ -204,6 +300,11 @@ class WorkspaceTracker:
         }
         for path in self._watched_paths:
             files[path] = fingerprint_path(self.root, path)
+        for path in self._artifact_paths:
+            files[path] = fingerprint_path(self.root, path)
+        if artifact_scope is not None:
+            for path in scan_artifact_scope_paths(self.root, artifact_scope):
+                files[path] = fingerprint_path(self.root, path)
         return WorkspaceSnapshot(files=files)
 
 
@@ -244,6 +345,52 @@ def parse_porcelain_paths(output: str) -> tuple[str, ...]:
 def should_skip_workspace_path(path: str) -> bool:
     '''Ignore local dependency and tool caches during broad Git snapshots.'''
     return any(part in DEFAULT_UNWATCHED_PARTS for part in PurePosixPath(path).parts)
+
+
+def scan_artifact_scope_paths(
+    root: Path,
+    artifact_scope: VerificationArtifactScope,
+) -> tuple[str, ...]:
+    '''Find files covered by declared verification artifact/cache patterns.'''
+    paths: list[str] = []
+    for pattern in artifact_scope.allowed_write_patterns:
+        paths.extend(_scan_pattern(root, pattern))
+    return tuple(dict.fromkeys(sorted(paths)))
+
+
+def _scan_pattern(root: Path, pattern: str) -> list[str]:
+    normalized = pattern.replace('\\', '/')
+    parts = PurePosixPath(normalized).parts
+    prefix_parts: list[str] = []
+    for part in parts:
+        if any(token in part for token in '*?['):
+            break
+        prefix_parts.append(part)
+    base = root.joinpath(*prefix_parts) if prefix_parts else root
+    if not base.exists():
+        return []
+    candidates = [base] if base.is_file() else list(base.rglob('*'))
+    result: list[str] = []
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            relative = candidate.resolve().relative_to(root)
+        except ValueError:
+            continue
+        path = normalize_workspace_path(str(relative))
+        if _matches_artifact_pattern(path, normalized):
+            result.append(path)
+    return result
+
+
+def _matches_artifact_pattern(path: str, pattern: str) -> bool:
+    from fnmatch import fnmatchcase
+
+    candidate = path.replace('\\', '/')
+    if fnmatchcase(candidate, pattern):
+        return True
+    return bool(pattern.endswith('/**') and candidate == pattern[:-3].rstrip('/'))
 
 
 def fingerprint_path(root: Path, relative_path: str) -> str:

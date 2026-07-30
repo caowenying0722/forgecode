@@ -9,6 +9,7 @@ from typing import Literal
 
 from forge.runtime.completion import matches_any
 from forge.runtime.paths import normalize_workspace_path
+from forge.runtime.workspace_classification import WorkspaceChangeClassifier
 
 
 DISPOSABLE_PATH_PATTERNS = (
@@ -153,13 +154,12 @@ def evaluate_change_relevance(
     blocked = tuple(
         item for item in classified if item.role in {'forbidden', 'unrelated'}
     )
-    generated = tuple(item for item in classified if item.role == 'generated')
     if classified and len(blocked) == len(classified):
         return ChangeRelevance(
             relevant=False,
             reasons=(
                 'The only workspace changes are unrelated, forbidden, '
-                'generated, or temporary files: '
+                'temporary files: '
                 + ', '.join(item.path for item in blocked),
             ),
         )
@@ -172,16 +172,6 @@ def evaluate_change_relevance(
                 + ', '.join(item.path for item in blocked),
             ),
         )
-    if generated:
-        return ChangeRelevance(
-            relevant=False,
-            reasons=(
-                'Generated JavaScript output under src/ cannot satisfy a '
-                'source change on its own: '
-                + ', '.join(item.path for item in generated),
-            ),
-        )
-
     if not scope.constrained:
         return ChangeRelevance(relevant=True)
 
@@ -211,11 +201,11 @@ def classify_changed_paths(
         path.replace('\\', '/') for path in changed_paths if path
     )
     result: list[ClassifiedPath] = []
+    workspace_classifier = WorkspaceChangeClassifier()
     for path in normalized:
-        if matches_any(path, scope.disposable_patterns):
+        base = workspace_classifier.classify_path(path)
+        if base.kind in {'generated_artifact', 'cache', 'unrelated'}:
             result.append(ClassifiedPath(path, 'unrelated'))
-        elif _looks_like_generated_source_output(path):
-            result.append(ClassifiedPath(path, 'generated'))
         elif scope.constrained and _matches_scope(path, scope.patterns):
             role: ChangePathRole = (
                 'supporting'
@@ -288,15 +278,6 @@ def _expand_path_pattern(raw_value: str) -> list[str]:
     if suffix:
         return [normalized]
     return [normalized, f'{normalized}/**']
-
-
-def _looks_like_generated_source_output(path: str) -> bool:
-    item = PurePosixPath(path)
-    return (
-        item.suffix == '.js'
-        and len(item.parts) >= 2
-        and item.parts[0] == 'src'
-    )
 
 
 def _matches_scope(path: str, patterns: tuple[str, ...]) -> bool:

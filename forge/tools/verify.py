@@ -12,6 +12,8 @@ from forge.runtime.verification import (
     choose_validation_command,
     classify_verification_command,
     discover_validation_commands,
+    verification_artifact_scope,
+    verification_cache_key,
 )
 from forge.runtime.workspace import WorkspaceTracker
 from forge.tools.base import (
@@ -56,7 +58,8 @@ class VerifyTool(Tool[VerifyInput]):
 
     async def execute(self, arguments: VerifyInput) -> ToolResult:
         discovered = discover_validation_commands(self.root)
-        revision = self.tracker.revision
+        filesystem_revision = self.tracker.filesystem_revision
+        source_revision = self.tracker.source_revision
         selected = None
         if arguments.command.strip():
             status, reason = classify_verification_command(
@@ -73,7 +76,9 @@ class VerifyTool(Tool[VerifyInput]):
                         'command': arguments.command.strip(),
                         'command_id': 'invalid',
                         'cwd': arguments.cwd,
-                        'workspace_revision': revision,
+                        'workspace_revision': source_revision,
+                        'source_revision': source_revision,
+                        'filesystem_revision': filesystem_revision,
                         'exit_code': -1,
                         'duration_seconds': 0.0,
                         'timed_out': False,
@@ -108,7 +113,9 @@ class VerifyTool(Tool[VerifyInput]):
                         'command': '',
                         'command_id': arguments.command_id.strip(),
                         'cwd': arguments.cwd,
-                        'workspace_revision': revision,
+                        'workspace_revision': source_revision,
+                        'source_revision': source_revision,
+                        'filesystem_revision': filesystem_revision,
                         'exit_code': -1,
                         'duration_seconds': 0.0,
                         'timed_out': False,
@@ -125,6 +132,32 @@ class VerifyTool(Tool[VerifyInput]):
                 'not_a_directory',
                 f'Verification cwd is not a directory: {cwd_argument}',
             )
+        scope = verification_artifact_scope(
+            command,
+            root=self.root,
+            target=arguments.target,
+        )
+        key = verification_cache_key(
+            source_revision=source_revision,
+            command=command,
+            cwd=display_path(self.root, cwd),
+            scope=scope,
+        )
+        cached = self.tracker.verification_cache.get(key)
+        if isinstance(cached, ToolResult):
+            return ToolResult.ok(
+                f'Reused verification evidence for source revision '
+                f'{source_revision}.',
+                content=cached.content,
+                metadata={
+                    **cached.metadata,
+                    'cache_hit': True,
+                    'verification_reused': True,
+                    'workspace_revision': source_revision,
+                    'source_revision': source_revision,
+                    'filesystem_revision': self.tracker.filesystem_revision,
+                },
+            )
         result = await run_process(
             command,
             cwd=cwd,
@@ -132,19 +165,48 @@ class VerifyTool(Tool[VerifyInput]):
             shell=True,
             env=NON_INTERACTIVE_ENV,
         )
+        change = await self.tracker.refresh(
+            origin='verification',
+            artifact_scope=scope,
+        )
+        classification = (
+            change.classification
+            if change is not None
+            else self.tracker.last_classification
+        )
         verification_status = (
             'timed_out'
             if result.timed_out
             else ('passed' if result.exit_code == 0 else 'failed')
         )
+        side_effect_paths = classification.verification_side_effect_paths
+        if side_effect_paths and verification_status == 'passed':
+            verification_status = 'failed'
         metadata = {
             **process_metadata(result),
             'command': command,
             'command_id': command_id,
             'cwd': display_path(self.root, cwd),
-            'workspace_revision': revision,
+            'workspace_revision': source_revision,
+            'source_revision': source_revision,
+            'filesystem_revision': self.tracker.filesystem_revision,
             'verification': True,
             'verification_status': verification_status,
+            'verification_type': scope.verification_type,
+            'verification_artifact_scope': [
+                {
+                    'pattern': rule.pattern,
+                    'kind': rule.kind,
+                    'description': rule.description,
+                }
+                for rule in scope.allowed_writes
+            ],
+            'verification_side_effect_paths': list(side_effect_paths),
+            'generated_artifact_paths': list(classification.generated_paths),
+            'cache_paths': list(classification.cache_paths),
+            'source_revision_changed': (
+                self.tracker.source_revision != source_revision
+            ),
             'available_validation_commands': [
                 {
                     'id': item.id,
@@ -171,8 +233,19 @@ class VerifyTool(Tool[VerifyInput]):
                 content=content,
                 metadata=metadata,
             )
-        return ToolResult.ok(
+        if side_effect_paths:
+            return ToolResult.fail(
+                'verification_side_effect',
+                'Verification modified undeclared source or workspace paths: '
+                + ', '.join(side_effect_paths),
+                content=content,
+                metadata=metadata,
+            )
+        passed = ToolResult.ok(
             f'Verification passed in {result.duration_seconds:.3f}s.',
             content=content,
             metadata=metadata,
         )
+        if scope.reusable:
+            self.tracker.verification_cache[key] = passed
+        return passed

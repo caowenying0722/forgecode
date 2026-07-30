@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 import hashlib
+import re
 
 from forge.context.working import WorkingState
 from forge.runtime.completion import CompletionDecision, CompletionGate
@@ -47,6 +48,7 @@ class CompletionChecker:
         self.tracker = tracker
         self.gate = gate
         self.task_manager = task_manager
+        self.last_finish_gap_report: dict[str, object] = {}
 
     @property
     def available(self) -> bool:
@@ -136,12 +138,116 @@ class CompletionChecker:
                     evidence_paths=evidence_paths,
                 )
                 reasons.extend(decision.reasons)
+            gap_report = self._finish_gap_report(
+                verification,
+                evidence_paths=evidence_paths,
+            )
+            self.last_finish_gap_report = gap_report
+            missing = (
+                tuple(gap_report.get('missing_deliverables', ()))
+                + tuple(gap_report.get('missing_acceptance_criteria', ()))
+                + tuple(gap_report.get('unfinished_plan_steps', ()))
+                + tuple(gap_report.get('missing_runtime_integration', ()))
+                + tuple(gap_report.get('missing_verification_types', ()))
+            )
+            if missing:
+                reasons.append(
+                    'Completion evidence is insufficient. Gap report: '
+                    + repr(gap_report)
+                )
         elif mutation_attempted and not changed_paths:
             reasons.append(
                 'A workspace write was attempted but produced no final Diff; '
                 'continue or declare the task blocked.'
             )
         return tuple(dict.fromkeys(reasons))
+
+    def _finish_gap_report(
+        self,
+        verification: VerificationEvidence | None,
+        *,
+        evidence_paths: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        task = self.task_manager.active
+        if task is None:
+            return {}
+        changed_paths = (
+            self.tracker.changed_paths if self.tracker is not None else ()
+        )
+        all_paths = tuple(
+            dict.fromkeys((*changed_paths, *evidence_paths))
+        )
+        goal = task.goal
+        feature_criteria = _feature_acceptance_criteria(goal)
+        text = self._changed_and_evidence_text(all_paths)
+        completed_criteria = tuple(
+            criterion
+            for criterion, pattern in feature_criteria
+            if pattern.search(text)
+        )
+        missing_criteria = tuple(
+            criterion
+            for criterion, pattern in feature_criteria
+            if not pattern.search(text)
+        )
+        runtime_missing: list[str] = []
+        if feature_criteria and not re.search(
+            r'(?i)(PlayScene|Scene|create\(|update\(|spawn|runtime|运行时|场景)',
+            text,
+        ):
+            runtime_missing.append('runtime scene/system integration evidence')
+        verification_types = _verification_type_evidence(verification)
+        missing_verification = []
+        if feature_criteria and 'typecheck' not in verification_types:
+            missing_verification.append('typecheck')
+        if feature_criteria and not (
+            {'build', 'test', 'smoke'} & verification_types
+        ):
+            missing_verification.append('build/test/smoke')
+        unfinished_steps = tuple(
+            step.title for step in task.steps if step.status != 'completed'
+        )
+        unrelated = (
+            self.tracker.last_classification.unrelated_paths
+            if self.tracker is not None
+            else ()
+        )
+        forbidden = (
+            self.tracker.last_classification.forbidden_paths
+            if self.tracker is not None
+            else ()
+        )
+        return {
+            'completed_deliverables': (
+                ('task-relevant source/config changes',)
+                if changed_paths
+                else ()
+            ),
+            'missing_deliverables': (
+                () if changed_paths else ('task-relevant source/config changes',)
+            ),
+            'satisfied_acceptance_criteria': completed_criteria,
+            'missing_acceptance_criteria': missing_criteria,
+            'unfinished_plan_steps': unfinished_steps,
+            'missing_runtime_integration': tuple(runtime_missing),
+            'missing_verification_types': tuple(missing_verification),
+            'has_unrelated_or_forbidden_changes': bool(unrelated or forbidden),
+            'unrelated_paths': unrelated,
+            'forbidden_paths': forbidden,
+        }
+
+    def _changed_and_evidence_text(self, paths: tuple[str, ...]) -> str:
+        chunks = [' '.join(paths)]
+        if self.tracker is None:
+            return ' '.join(chunks)
+        for path in paths[:20]:
+            candidate = self.tracker.root / path
+            try:
+                if candidate.is_file() and candidate.stat().st_size <= 200_000:
+                    chunks.append(candidate.read_text(encoding='utf-8', errors='ignore'))
+            except OSError:
+                continue
+        return '\n'.join(chunks)
 
     async def can_finalize_after_stagnation(
         self,
@@ -202,6 +308,62 @@ class CompletionChecker:
         task = self.task_manager.active
         if task is None:
             return decision
+        if (
+            _tracker_filesystem_changed_paths(self.tracker)
+            and not self.tracker.changed_paths
+        ):
+            classification = self.tracker.classifier.classify(
+                _tracker_filesystem_changed_paths(self.tracker)
+            )
+            paths = (
+                classification.generated_paths
+                + classification.cache_paths
+                + classification.unrelated_paths
+            )
+            if paths:
+                return CompletionDecision(
+                    allowed=False,
+                    reasons=tuple(
+                        dict.fromkeys(
+                            (
+                                *decision.reasons,
+                                'The only workspace changes are generated, '
+                                'cache, or temporary files and do not satisfy '
+                                'the task: '
+                                + ', '.join(paths),
+                            )
+                        )
+                    ),
+                )
+        elif _tracker_filesystem_changed_paths(self.tracker):
+            source_paths = set(self.tracker.changed_paths)
+            classification = self.tracker.classifier.classify(
+                tuple(
+                    path
+                    for path in _tracker_filesystem_changed_paths(self.tracker)
+                    if path not in source_paths
+                )
+            )
+            extra_paths = (
+                classification.generated_paths
+                + classification.cache_paths
+                + classification.unrelated_paths
+            )
+            if extra_paths:
+                decision = CompletionDecision(
+                    allowed=False,
+                    reasons=tuple(
+                        dict.fromkeys(
+                            (
+                                *decision.reasons,
+                                'The workspace also contains generated, '
+                                'cache, or temporary files outside the task '
+                                'deliverables: '
+                                + ', '.join(extra_paths),
+                            )
+                        )
+                    ),
+                )
         scope = infer_task_scope(
             task.goal,
             evidence_paths=evidence_paths,
@@ -244,6 +406,93 @@ def build_completion_feedback(
     }
 
 
+def _feature_acceptance_criteria(
+    goal: str,
+) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    text = goal.casefold()
+    wants_upgrade = bool(re.search(r'三选一|3\s*选\s*1|upgrade|升级', text))
+    wants_weapon = bool(re.search(r'武器组合|weapon.*combo|combo|组合', text))
+    wants_boss = bool(re.search(r'\bboss\b|Boss|首领|boss', goal))
+    criteria: list[tuple[str, re.Pattern[str]]] = []
+    if wants_upgrade:
+        criteria.extend(
+            [
+                (
+                    'upgrade candidate generation logic exists',
+                    re.compile(r'(?i)(upgrade|升级).{0,80}(candidate|option|choice|候选|选项)'),
+                ),
+                (
+                    'runtime presents three upgrade choices',
+                    re.compile(r'(?i)(three|3|三).{0,40}(upgrade|choice|option|升级|选项)'),
+                ),
+                (
+                    'player can choose one upgrade',
+                    re.compile(r'(?i)(select|choose|pick|选择).{0,80}(upgrade|升级|option|选项)'),
+                ),
+                (
+                    'chosen upgrade mutates player, weapon, or run state',
+                    re.compile(r'(?i)(apply|mutate|update|add|修改|应用).{0,100}(player|weapon|state|玩家|武器|状态)'),
+                ),
+            ]
+        )
+    if wants_weapon:
+        criteria.extend(
+            [
+                (
+                    'weapon combination can be configured and triggered',
+                    re.compile(r'(?i)(weapon|武器).{0,80}(combo|combine|synergy|组合|合成|联动)'),
+                ),
+                (
+                    'runtime state can activate at least one weapon combination',
+                    re.compile(r'(?i)(trigger|activate|unlock|触发|激活|解锁).{0,100}(combo|combination|组合)'),
+                ),
+            ]
+        )
+    if wants_boss:
+        criteria.extend(
+            [
+                (
+                    'boss spawn condition exists',
+                    re.compile(r'(?i)(boss|首领).{0,100}(spawn|wave|time|score|生成|波次|时间|分数|条件)'),
+                ),
+                (
+                    'boss has independent health, behavior, or phase logic',
+                    re.compile(r'(?i)(boss|首领).{0,120}(health|hp|phase|behavior|生命|血量|阶段|行为)'),
+                ),
+            ]
+        )
+    if criteria:
+        criteria.append(
+            (
+                'scene or runtime entry point wires these systems together',
+                re.compile(r'(?i)(PlayScene|Scene|create\(|update\(|运行时|场景).{0,160}(upgrade|weapon|boss|升级|武器|首领)'),
+            )
+        )
+    return tuple(criteria)
+
+
+def _verification_type_evidence(
+    verification: VerificationEvidence | None,
+) -> set[str]:
+    if verification is None or not verification.success:
+        return set()
+    types = {verification.verification_type}
+    command = verification.command.casefold()
+    if 'tsc' in command and ('--noemit' in command or '--no-emit' in command):
+        types.add('typecheck')
+    if 'build' in command or 'vite build' in command:
+        types.add('build')
+    if 'test' in command or 'pytest' in command or 'jest' in command:
+        types.add('test')
+    return types
+
+
+def _tracker_filesystem_changed_paths(tracker: WorkspaceTracker) -> tuple[str, ...]:
+    return tuple(
+        getattr(tracker, 'filesystem_changed_paths', tracker.changed_paths)
+    )
+
+
 def verification_from_result(
     result: ToolResult,
 ) -> VerificationEvidence | None:
@@ -274,6 +523,23 @@ def verification_from_result(
                 hashlib.sha256(signature_text.encode('utf-8')).hexdigest()
                 if status != 'passed'
                 else ''
+            ),
+            source_revision=int(
+                metadata.get('source_revision', metadata['workspace_revision'])
+            ),
+            filesystem_revision=int(metadata.get('filesystem_revision', 0)),
+            verification_type=str(metadata.get('verification_type', 'auto')),
+            verification_reused=bool(metadata.get('verification_reused', False)),
+            generated_artifact_paths=tuple(
+                str(path)
+                for path in metadata.get('generated_artifact_paths', [])
+            ),
+            cache_paths=tuple(
+                str(path) for path in metadata.get('cache_paths', [])
+            ),
+            verification_side_effect_paths=tuple(
+                str(path)
+                for path in metadata.get('verification_side_effect_paths', [])
             ),
         )
     except (KeyError, TypeError, ValueError):
@@ -313,7 +579,8 @@ def render_completion_ready_context(
     changed = ', '.join(changed_paths)
     reviewed = ', '.join(sorted(reviewed_paths)) or 'none'
     verification_status = (
-        f'{verification.command} @ revision {verification.workspace_revision}'
+        f'{verification.command} @ source revision '
+        f'{verification.bound_source_revision}'
         if verification is not None
         else 'not required / not run'
     )
@@ -341,7 +608,8 @@ def build_finalization_recovery_feedback(
     verification: VerificationEvidence | None,
 ) -> dict[str, Any]:
     verification_status = (
-        f'{verification.command} @ revision {verification.workspace_revision}'
+        f'{verification.command} @ source revision '
+        f'{verification.bound_source_revision}'
         if verification is not None
         else 'not required / not run'
     )
