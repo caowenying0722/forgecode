@@ -21,6 +21,7 @@ ChangeKind = Literal[
 ]
 ChangeOrigin = Literal['agent', 'verification']
 ArtifactKind = Literal['generated_artifact', 'cache']
+ArtifactOperation = Literal['created', 'modified', 'deleted']
 VerificationType = Literal['auto', 'typecheck', 'build', 'test', 'lint', 'smoke']
 
 
@@ -133,6 +134,30 @@ class ArtifactRule:
     pattern: str
     kind: ArtifactKind = 'generated_artifact'
     description: str = ''
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactDelta:
+    '''One generated/cache path transition produced by verification.'''
+
+    path: str
+    operation: ArtifactOperation
+    kind: ArtifactKind
+    before_fingerprint: str | None
+    after_fingerprint: str | None
+    rule_pattern: str
+    rule_reason: str = ''
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            'path': self.path,
+            'operation': self.operation,
+            'kind': self.kind,
+            'before_fingerprint': self.before_fingerprint,
+            'after_fingerprint': self.after_fingerprint,
+            'rule_pattern': self.rule_pattern,
+            'rule_reason': self.rule_reason,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +382,47 @@ def _artifact_rule_for(
         (rule for rule in artifact_scope.allowed_writes if _matches(path, rule.pattern)),
         None,
     )
+
+
+def artifact_rule_for(
+    path: str,
+    artifact_scope: VerificationArtifactScope,
+) -> ArtifactRule | None:
+    '''Return the declared rule responsible for one artifact path.'''
+    return _artifact_rule_for(path.replace('\\', '/'), artifact_scope)
+
+
+def artifact_deltas_from_metadata(value: object) -> tuple[ArtifactDelta, ...]:
+    '''Decode additive artifact evidence while tolerating legacy records.'''
+    if not isinstance(value, (list, tuple)):
+        return ()
+    deltas: list[ArtifactDelta] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get('operation', ''))
+        kind = str(item.get('kind', ''))
+        path = str(item.get('path', ''))
+        if (
+            not path
+            or operation not in {'created', 'modified', 'deleted'}
+            or kind not in {'generated_artifact', 'cache'}
+        ):
+            continue
+        before = item.get('before_fingerprint')
+        after = item.get('after_fingerprint')
+        deltas.append(
+            ArtifactDelta(
+                path=path,
+                operation=operation,  # type: ignore[arg-type]
+                kind=kind,  # type: ignore[arg-type]
+                before_fingerprint=(str(before) if before is not None else None),
+                after_fingerprint=(str(after) if after is not None else None),
+                rule_pattern=str(item.get('rule_pattern', '')),
+                rule_reason=str(item.get('rule_reason', '')),
+            )
+        )
+    return tuple(deltas)
 
 
 def _is_likely_handwritten(

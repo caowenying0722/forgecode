@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from time import time
 from typing import TYPE_CHECKING
@@ -24,8 +25,10 @@ from forge.runtime.verification import (
 )
 from forge.runtime.workspace import WorkspaceTracker
 from forge.runtime.workspace_classification import (
+    ArtifactDelta,
     ArtifactRule,
     VerificationArtifactScope,
+    artifact_rule_for,
 )
 from forge.tools.base import ToolResult
 
@@ -147,6 +150,28 @@ class VerificationExecutor:
                 )
             return reused
 
+        before_snapshot = await self.tracker.capture_transaction_snapshot(
+            workspace_scope
+        )
+        if before_snapshot is None:
+            return ToolResult.fail(
+                'workspace_snapshot_unavailable',
+                'Verification was not started because its before snapshot '
+                'could not be captured.',
+                metadata={
+                    'verification': True,
+                    'verification_status': 'failed',
+                    'command': command,
+                    'command_id': command_id,
+                    'cwd': display_cwd,
+                    'workspace_revision': source_revision,
+                    'source_revision': source_revision,
+                    'filesystem_revision': filesystem_revision,
+                    'exit_code': -1,
+                    'duration_seconds': 0.0,
+                    'timed_out': False,
+                },
+            )
         started_at = time()
         process = await run_process(
             command,
@@ -158,6 +183,7 @@ class VerificationExecutor:
         change = await self.tracker.refresh(
             origin='verification',
             artifact_scope=workspace_scope,
+            before_snapshot=before_snapshot,
         )
         if change is None:
             return ToolResult.fail(
@@ -183,6 +209,10 @@ class VerificationExecutor:
             source_revision_before=source_revision,
             filesystem_revision_before=filesystem_revision,
             change=change,
+        )
+        transaction = replace(
+            transaction,
+            artifact_deltas=_artifact_deltas(transaction, workspace_scope),
         )
         classification = transaction.classification
         verification_status = (
@@ -232,6 +262,9 @@ class VerificationExecutor:
             ],
             'cache_fingerprints': [list(item) for item in cache_fingerprints],
             'verification_transaction': transaction.as_metadata(),
+            'artifact_deltas': [
+                delta.as_dict() for delta in transaction.artifact_deltas
+            ],
             'source_revision_changed': (
                 self.tracker.source_revision != source_revision
             ),
@@ -332,3 +365,42 @@ def _current_fingerprints(
         for path in paths
         if path in tracker.current.files
     )
+
+
+def _artifact_deltas(
+    transaction: VerificationTransaction,
+    scope: VerificationArtifactScope,
+) -> tuple[ArtifactDelta, ...]:
+    before = dict(transaction.before_fingerprints)
+    after = dict(transaction.after_fingerprints)
+    operations = {
+        **{path: 'created' for path in transaction.created_paths},
+        **{path: 'modified' for path in transaction.modified_paths},
+        **{path: 'deleted' for path in transaction.deleted_paths},
+    }
+    deltas: list[ArtifactDelta] = []
+    for change in transaction.classification.changes:
+        if change.kind not in {'generated_artifact', 'cache'}:
+            continue
+        rule = artifact_rule_for(change.path, scope)
+        operation = operations.get(change.path)
+        if rule is None or operation is None:
+            continue
+        before_fingerprint = before.get(change.path, 'missing')
+        after_fingerprint = after.get(change.path, 'missing')
+        deltas.append(
+            ArtifactDelta(
+                path=change.path,
+                operation=operation,  # type: ignore[arg-type]
+                kind=change.kind,  # type: ignore[arg-type]
+                before_fingerprint=(
+                    None if before_fingerprint == 'missing' else before_fingerprint
+                ),
+                after_fingerprint=(
+                    None if after_fingerprint == 'missing' else after_fingerprint
+                ),
+                rule_pattern=rule.pattern,
+                rule_reason=rule.description,
+            )
+        )
+    return tuple(deltas)

@@ -69,6 +69,8 @@ class WorkspaceChange:
     deleted_paths: tuple[str, ...] = ()
     before_snapshot_id: str = ''
     after_snapshot_id: str = ''
+    before_fingerprints: tuple[tuple[str, str], ...] = ()
+    after_fingerprints: tuple[tuple[str, str], ...] = ()
 
 
 class WorkspaceTracker:
@@ -204,6 +206,7 @@ class WorkspaceTracker:
         *,
         origin: str = 'agent',
         artifact_scope: VerificationArtifactScope | None = None,
+        before_snapshot: WorkspaceSnapshot | None = None,
     ) -> WorkspaceChange | None:
         '''Capture tool-caused changes and advance the revision when needed.'''
         snapshot = await self._capture(artifact_scope=artifact_scope)
@@ -212,13 +215,24 @@ class WorkspaceTracker:
             return None
         self.available = True
         before = self.current
-        paths = changed_paths(self.current, snapshot)
+        transaction_before = before_snapshot or before
+        paths = changed_paths(transaction_before, snapshot)
+        state_snapshot = snapshot
+        if before_snapshot is not None:
+            state_files = dict(snapshot.files)
+            for path, fingerprint in before_snapshot.files.items():
+                if (
+                    path not in before.files
+                    and snapshot.files.get(path) == fingerprint
+                ):
+                    state_files.pop(path, None)
+            state_snapshot = WorkspaceSnapshot(files=state_files)
         classification = self.classifier.classify(
             paths,
             origin='verification' if origin == 'verification' else 'agent',
             artifact_scope=artifact_scope,
         )
-        self.current = snapshot
+        self.current = state_snapshot
         if paths:
             self.filesystem_revision += 1
         self.revision = self.filesystem_revision
@@ -253,23 +267,38 @@ class WorkspaceTracker:
             source_paths=source_paths,
             classification=classification,
             created_paths=tuple(
-                path
-                for path in paths
-                if path not in before.files and path in snapshot.files
+                path for path in paths
+                if transaction_before.files.get(path, 'missing') == 'missing'
+                and snapshot.files.get(path, 'missing') != 'missing'
             ),
             modified_paths=tuple(
-                path
-                for path in paths
-                if path in before.files and path in snapshot.files
+                path for path in paths
+                if transaction_before.files.get(path, 'missing') != 'missing'
+                and snapshot.files.get(path, 'missing') != 'missing'
             ),
             deleted_paths=tuple(
-                path
-                for path in paths
-                if path in before.files and path not in snapshot.files
+                path for path in paths
+                if transaction_before.files.get(path, 'missing') != 'missing'
+                and snapshot.files.get(path, 'missing') == 'missing'
             ),
-            before_snapshot_id=before.id,
+            before_snapshot_id=transaction_before.id,
             after_snapshot_id=snapshot.id,
+            before_fingerprints=tuple(
+                (path, transaction_before.files.get(path, 'missing'))
+                for path in paths
+            ),
+            after_fingerprints=tuple(
+                (path, snapshot.files.get(path, 'missing'))
+                for path in paths
+            ),
         )
+
+    async def capture_transaction_snapshot(
+        self,
+        artifact_scope: VerificationArtifactScope,
+    ) -> WorkspaceSnapshot | None:
+        '''Capture declared paths immediately before a verification command.'''
+        return await self._capture(artifact_scope=artifact_scope)
 
     @property
     def changed_paths(self) -> tuple[str, ...]:

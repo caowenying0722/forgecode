@@ -8,6 +8,7 @@ import pytest
 
 import forge.runtime.verification as verification_module
 from forge.runtime.process import ProcessResult
+from forge.runtime.completion_checker import verification_from_result
 from forge.runtime.verification import (
     choose_validation_command,
     classify_verification_command,
@@ -237,6 +238,41 @@ def test_verification_ledger_preserves_artifact_fingerprints() -> None:
     )
 
 
+def test_verification_ledger_preserves_artifact_deltas() -> None:
+    ledger = VerificationLedger()
+
+    record = ledger.record_from_metadata(
+        {
+            'verification': True,
+            'verification_status': 'passed',
+            'command': 'npm run build',
+            'cwd': '.',
+            'workspace_revision': 1,
+            'source_revision': 1,
+            'filesystem_revision': 2,
+            'exit_code': 0,
+            'duration_seconds': 0.1,
+            'timed_out': False,
+            'artifact_deltas': [
+                {
+                    'path': 'dist/assets/index-OLD.js',
+                    'operation': 'deleted',
+                    'kind': 'generated_artifact',
+                    'before_fingerprint': 'file:old',
+                    'after_fingerprint': None,
+                    'rule_pattern': 'dist/**',
+                    'rule_reason': 'vite build output',
+                }
+            ],
+        }
+    )
+
+    assert record is not None
+    assert record.artifact_deltas[0].operation == 'deleted'
+    assert record.artifact_deltas[0].before_fingerprint == 'file:old'
+    assert record.to_evidence().artifact_deltas == record.artifact_deltas
+
+
 def test_cached_verification_preserves_artifact_evidence() -> None:
     ledger = VerificationLedger()
     key = ('source', 1, 'npx vite build')
@@ -257,6 +293,17 @@ def test_cached_verification_preserves_artifact_evidence() -> None:
             'generated_artifact_fingerprints': [
                 ['dist/index.html', 'file:abc']
             ],
+            'artifact_deltas': [
+                {
+                    'path': 'dist/assets/index-OLD.js',
+                    'operation': 'deleted',
+                    'kind': 'generated_artifact',
+                    'before_fingerprint': 'file:old',
+                    'after_fingerprint': None,
+                    'rule_pattern': 'dist/**',
+                    'rule_reason': 'vite build output',
+                }
+            ],
         },
         reusable_key=key,
     )
@@ -269,6 +316,42 @@ def test_cached_verification_preserves_artifact_evidence() -> None:
     assert cached.generated_artifact_fingerprints == (
         ('dist/index.html', 'file:abc'),
     )
+    assert cached.artifact_deltas[0].operation == 'deleted'
+
+
+def test_verification_from_result_preserves_artifact_deltas() -> None:
+    result = ToolResult.ok(
+        'passed',
+        metadata={
+            'verification': True,
+            'verification_status': 'passed',
+            'command': 'npm run build',
+            'cwd': '.',
+            'workspace_revision': 1,
+            'source_revision': 1,
+            'filesystem_revision': 2,
+            'exit_code': 0,
+            'duration_seconds': 0.1,
+            'timed_out': False,
+            'artifact_deltas': [
+                {
+                    'path': 'dist/assets/index-OLD.js',
+                    'operation': 'deleted',
+                    'kind': 'generated_artifact',
+                    'before_fingerprint': 'file:old',
+                    'after_fingerprint': None,
+                    'rule_pattern': 'dist/**',
+                    'rule_reason': 'vite build output',
+                }
+            ],
+        },
+    )
+
+    evidence = verification_from_result(result)
+
+    assert evidence is not None
+    assert evidence.artifact_deltas[0].path == 'dist/assets/index-OLD.js'
+    assert evidence.artifact_deltas[0].operation == 'deleted'
 
 
 def _successful_process() -> ProcessResult:

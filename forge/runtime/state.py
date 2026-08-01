@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from forge.runtime.agent_state import AgentPhase
+from forge.runtime.workspace_classification import ArtifactDelta
 from forge.tools.base import ToolResult
 
 
@@ -65,6 +66,7 @@ class VerificationEvidence:
     verification_side_effect_paths: tuple[str, ...] = ()
     generated_artifact_fingerprints: tuple[tuple[str, str], ...] = ()
     cache_fingerprints: tuple[tuple[str, str], ...] = ()
+    artifact_deltas: tuple[ArtifactDelta, ...] = ()
 
     @property
     def success(self) -> bool:

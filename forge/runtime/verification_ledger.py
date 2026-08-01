@@ -8,6 +8,10 @@ from time import time
 from typing import Literal
 
 from forge.runtime.state import VerificationEvidence
+from forge.runtime.workspace_classification import (
+    ArtifactDelta,
+    artifact_deltas_from_metadata,
+)
 
 
 VerificationEvidenceSource = Literal['verify', 'run_command', 'cache']
@@ -30,6 +34,7 @@ class VerificationRecord:
     cache_paths: tuple[str, ...] = ()
     generated_artifact_fingerprints: tuple[tuple[str, str], ...] = ()
     cache_fingerprints: tuple[tuple[str, str], ...] = ()
+    artifact_deltas: tuple[ArtifactDelta, ...] = ()
     stdout_stderr_summary: str = ''
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -64,6 +69,7 @@ class VerificationRecord:
             cache_paths=self.cache_paths,
             generated_artifact_fingerprints=self.generated_artifact_fingerprints,
             cache_fingerprints=self.cache_fingerprints,
+            artifact_deltas=self.artifact_deltas,
         )
 
 
@@ -144,6 +150,9 @@ class VerificationLedger:
             ),
             cache_fingerprints=_fingerprints_from_metadata(
                 metadata.get('cache_fingerprints', [])
+            ),
+            artifact_deltas=artifact_deltas_from_metadata(
+                metadata.get('artifact_deltas', [])
             ),
             stdout_stderr_summary=content[:4_000],
             started_at=float(started_at if started_at is not None else now),

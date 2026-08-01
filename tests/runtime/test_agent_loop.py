@@ -25,6 +25,7 @@ from forge.runtime.model_client import (
     ModelOutputTruncatedError,
     ModelProtocolError,
 )
+from forge.runtime.process import ProcessResult
 from forge.runtime.state import (
     AgentPhaseChanged,
     ConversationEvent,
@@ -606,6 +607,130 @@ def test_todo_required_does_not_count_as_workspace_write_failure(
     assert 'workspace-write attempt' not in final.result.text
     assert final.result.status == 'completed'
     assert (tmp_path / 'sample.txt').read_text(encoding='utf-8') == 'new\n'
+
+
+def test_agent_loop_completes_after_vite_hash_replacement_without_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / 'package.json').write_text(
+        '{"scripts":{"build":"vite build"}}\n',
+        encoding='utf-8',
+    )
+    source = tmp_path / 'src' / 'main.ts'
+    source.parent.mkdir()
+    source.write_text('export const value = 1;\n', encoding='utf-8')
+    subprocess.run(['git', 'init', '--quiet'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'forge@example.test'],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'ForgeCode Tests'],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(['git', 'add', 'package.json', 'src/main.ts'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'vite baseline'],
+        cwd=tmp_path,
+        check=True,
+    )
+    old_bundle = tmp_path / 'dist' / 'assets' / 'index-OLD.js'
+    old_bundle.parent.mkdir(parents=True)
+    old_bundle.write_text('old bundle\n', encoding='utf-8')
+    index = tmp_path / 'dist' / 'index.html'
+    index.write_text('old html\n', encoding='utf-8')
+
+    async def build_process(*_args: object, **_kwargs: object) -> ProcessResult:
+        old_bundle.unlink()
+        (tmp_path / 'dist' / 'assets' / 'index-NEW.js').write_text(
+            'new bundle\n',
+            encoding='utf-8',
+        )
+        index.write_text('new html\n', encoding='utf-8')
+        return ProcessResult(0, 'built\n', '', 0.1)
+
+    monkeypatch.setattr(
+        'forge.runtime.verification_executor.run_process',
+        build_process,
+    )
+    todo_call = ToolCall(
+        0,
+        'toolu_todo',
+        'todo_write',
+        {
+            'todos': [
+                {
+                    'content': 'Update src/main.ts',
+                    'status': 'in_progress',
+                    'priority': 'high',
+                    'id': 'edit',
+                },
+                {
+                    'content': 'Build the project',
+                    'status': 'pending',
+                    'priority': 'high',
+                    'id': 'build',
+                },
+            ]
+        },
+    )
+    edit_call = ToolCall(
+        0,
+        'toolu_edit',
+        'replace_text',
+        {
+            'path': 'src/main.ts',
+            'old_text': 'export const value = 1;\n',
+            'new_text': 'export const value = 2;\n',
+        },
+    )
+    verify_call = ToolCall(
+        0,
+        'toolu_verify',
+        'verify',
+        {'command': 'npm run build', 'target': 'build'},
+    )
+    finish_call = ToolCall(
+        0,
+        'toolu_finish',
+        'finish_task',
+        {
+            'task_kind': 'change',
+            'status': 'completed',
+            'summary': 'Updated src/main.ts and verified the Vite build.',
+            'blocked_reasons': [],
+        },
+    )
+    client = FakeModelClient(
+        tool_response(todo_call),
+        tool_response(edit_call),
+        tool_response(verify_call),
+        tool_response(finish_call),
+    )
+    conversation = Conversation(
+        client=client,
+        registry=create_default_registry(tmp_path),
+    )
+
+    events = collect_turn(conversation, '修改 src/main.ts 并完成 Vite 构建')
+
+    final = events[-1]
+    verify_results = [
+        event
+        for event in events
+        if isinstance(event, ToolExecutionCompleted)
+        and event.tool_call.name == 'verify'
+    ]
+    assert isinstance(final, TurnCompleted)
+    assert final.result.status == 'completed'
+    assert len(verify_results) == 1
+    assert verify_results[0].result.success is True
+    assert not old_bundle.exists()
+    assert (tmp_path / 'dist' / 'assets' / 'index-NEW.js').exists()
+    assert len(client.calls) == 4
 
 
 def test_task_policy_requires_workspace_tracking(tmp_path: Path) -> None:

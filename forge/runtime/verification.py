@@ -10,6 +10,7 @@ import shlex
 from typing import Literal
 
 from forge.runtime.workspace_classification import (
+    ArtifactDelta,
     ArtifactRule,
     ChangeSetClassification,
     VerificationArtifactScope,
@@ -57,6 +58,9 @@ class VerificationTransaction:
     classification: ChangeSetClassification
     before_snapshot_id: str
     after_snapshot_id: str
+    before_fingerprints: tuple[tuple[str, str], ...] = ()
+    after_fingerprints: tuple[tuple[str, str], ...] = ()
+    artifact_deltas: tuple[ArtifactDelta, ...] = ()
 
     @classmethod
     def from_workspace_change(
@@ -82,6 +86,8 @@ class VerificationTransaction:
             classification=change.classification,
             before_snapshot_id=change.before_snapshot_id,
             after_snapshot_id=change.after_snapshot_id,
+            before_fingerprints=change.before_fingerprints,
+            after_fingerprints=change.after_fingerprints,
         )
 
     def as_metadata(self) -> dict[str, object]:
@@ -98,6 +104,9 @@ class VerificationTransaction:
             'deleted_paths': list(self.deleted_paths),
             'before_snapshot_id': self.before_snapshot_id,
             'after_snapshot_id': self.after_snapshot_id,
+            'before_fingerprints': [list(item) for item in self.before_fingerprints],
+            'after_fingerprints': [list(item) for item in self.after_fingerprints],
+            'artifact_deltas': [delta.as_dict() for delta in self.artifact_deltas],
         }
 
 

@@ -15,13 +15,16 @@ from forge.runtime.completion import (
 )
 from forge.runtime.completion_checker import CompletionChecker
 from forge.runtime.agent_tool_calls import early_mutation_relevance_failure
+from forge.runtime.process import ProcessResult
 from forge.runtime.state import VerificationEvidence
 from forge.runtime.state import ToolCall
 from forge.runtime.task_scope import evaluate_change_relevance, infer_task_scope
 from forge.runtime.verification import verification_artifact_scope
+from forge.runtime.verification_ledger import VerificationLedger
 from forge.runtime.workspace import WorkspaceTracker, should_skip_workspace_path
 from forge.tasks.manager import TaskManager
 from forge.tools.filesystem import CreateDirectoryTool
+from forge.tools.verify import VerifyTool
 
 
 def initialize_git_repository(root: Path) -> None:
@@ -868,7 +871,7 @@ def _write_build_outputs(root: Path, directory: str = 'dist') -> tuple[str, ...]
     )
 
 
-def test_current_successful_vite_build_artifacts_do_not_block_completion(
+def test_created_build_artifact_is_trusted(
     tmp_path: Path,
 ) -> None:
     tracker, _ = _prepare_vite_change(tmp_path)
@@ -897,7 +900,7 @@ def test_current_successful_vite_build_artifacts_do_not_block_completion(
     assert decision.allowed is True
 
 
-def test_generated_artifacts_alone_do_not_satisfy_change_task(
+def test_build_outputs_alone_do_not_count_as_task_progress(
     tmp_path: Path,
 ) -> None:
     initialize_git_repository(tmp_path)
@@ -928,7 +931,7 @@ def test_generated_artifacts_alone_do_not_satisfy_change_task(
     assert any('final Diff is empty' in reason for reason in decision.reasons)
 
 
-def test_failed_build_artifacts_still_block_completion(tmp_path: Path) -> None:
+def test_failed_build_outputs_are_not_trusted(tmp_path: Path) -> None:
     tracker, _ = _prepare_vite_change(tmp_path)
     outputs = _write_build_outputs(tmp_path)
     run(
@@ -961,7 +964,7 @@ def test_failed_build_artifacts_still_block_completion(tmp_path: Path) -> None:
     assert any('outside the task deliverables' in item for item in decision.reasons)
 
 
-def test_timed_out_build_artifacts_still_block_completion(
+def test_timed_out_build_outputs_are_not_trusted(
     tmp_path: Path,
 ) -> None:
     tracker, _ = _prepare_vite_change(tmp_path)
@@ -997,7 +1000,7 @@ def test_timed_out_build_artifacts_still_block_completion(
     assert any('outside the task deliverables' in item for item in decision.reasons)
 
 
-def test_stale_build_artifacts_are_not_trusted(tmp_path: Path) -> None:
+def test_stale_revision_outputs_are_not_trusted(tmp_path: Path) -> None:
     tracker, source = _prepare_vite_change(tmp_path)
     outputs = _write_build_outputs(tmp_path)
     run(
@@ -1027,7 +1030,7 @@ def test_stale_build_artifacts_are_not_trusted(tmp_path: Path) -> None:
     assert any('outside the task deliverables' in item for item in decision.reasons)
 
 
-def test_undeclared_generated_output_still_blocks_completion(
+def test_undeclared_output_still_blocks_completion(
     tmp_path: Path,
 ) -> None:
     tracker, _ = _prepare_vite_change(tmp_path)
@@ -1131,7 +1134,7 @@ def test_forbidden_path_is_never_trusted_as_verification_output(
     assert any('Forbidden paths' in item for item in decision.reasons)
 
 
-def test_verified_artifact_modified_after_build_is_not_trusted(
+def test_verified_artifact_modified_after_build_is_untrusted(
     tmp_path: Path,
 ) -> None:
     tracker, _ = _prepare_vite_change(tmp_path)
@@ -1222,7 +1225,7 @@ def test_deleted_verified_artifact_does_not_block_completion(
     assert decision.allowed is True
 
 
-def test_custom_vite_out_dir_is_allowed_as_verified_output(
+def test_custom_vite_out_dir_delta_is_trusted(
     tmp_path: Path,
 ) -> None:
     tracker, _ = _prepare_vite_change(tmp_path)
@@ -1256,6 +1259,148 @@ def test_custom_vite_out_dir_is_allowed_as_verified_output(
     )
 
     assert decision.allowed is True
+
+
+def _run_vite_hash_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[WorkspaceTracker, VerificationEvidence]:
+    initialize_git_repository(tmp_path)
+    (tmp_path / 'package.json').write_text(
+        '{"scripts":{"build":"vite build"}}\n',
+        encoding='utf-8',
+    )
+    source = tmp_path / 'src' / 'main.ts'
+    source.parent.mkdir()
+    source.write_text('export const value = 1;\n', encoding='utf-8')
+    subprocess.run(['git', 'add', 'package.json', 'src/main.ts'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'vite project'],
+        cwd=tmp_path,
+        check=True,
+    )
+    old_bundle = tmp_path / 'dist' / 'assets' / 'index-OLD.js'
+    old_bundle.parent.mkdir(parents=True)
+    old_bundle.write_text('old bundle\n', encoding='utf-8')
+    index = tmp_path / 'dist' / 'index.html'
+    index.write_text('old html\n', encoding='utf-8')
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    source.write_text('export const value = 2;\n', encoding='utf-8')
+    run(tracker.refresh())
+    ledger = VerificationLedger()
+
+    async def build_process(*_args: object, **_kwargs: object) -> ProcessResult:
+        old_bundle.unlink()
+        (tmp_path / 'dist' / 'assets' / 'index-NEW.js').write_text(
+            'new bundle\n',
+            encoding='utf-8',
+        )
+        index.write_text('new html\n', encoding='utf-8')
+        return ProcessResult(0, 'built\n', '', 0.1)
+
+    monkeypatch.setattr(
+        'forge.runtime.verification_executor.run_process',
+        build_process,
+    )
+    result = run(
+        VerifyTool(tmp_path, tracker, ledger).run(
+            {'command': 'npm run build', 'target': 'build'}
+        )
+    )
+    assert result.success is True
+    evidence = ledger.latest_evidence(tracker.source_revision)
+    assert evidence is not None
+    return tracker, evidence
+
+
+def test_vite_hash_replacement_is_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker, evidence = _run_vite_hash_replacement(tmp_path, monkeypatch)
+
+    operations = {
+        delta.path: delta.operation for delta in evidence.artifact_deltas
+    }
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert operations == {
+        'dist/assets/index-NEW.js': 'created',
+        'dist/assets/index-OLD.js': 'deleted',
+        'dist/index.html': 'modified',
+    }
+    assert decision.allowed is True
+
+
+def test_deleted_old_hash_artifact_does_not_block_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker, evidence = _run_vite_hash_replacement(tmp_path, monkeypatch)
+
+    trusted = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert not (tmp_path / 'dist' / 'assets' / 'index-OLD.js').exists()
+    assert trusted.allowed is True
+
+
+def test_modified_build_artifact_is_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker, evidence = _run_vite_hash_replacement(tmp_path, monkeypatch)
+    modified = next(
+        delta
+        for delta in evidence.artifact_deltas
+        if delta.path == 'dist/index.html'
+    )
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert modified.operation == 'modified'
+    assert modified.before_fingerprint is not None
+    assert modified.after_fingerprint is not None
+    assert decision.allowed is True
+
+
+def test_deleted_artifact_recreated_after_build_is_untrusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker, evidence = _run_vite_hash_replacement(tmp_path, monkeypatch)
+    recreated = tmp_path / 'dist' / 'assets' / 'index-OLD.js'
+    recreated.write_text('old bundle\n', encoding='utf-8')
+    run(tracker.refresh())
+
+    decision = run(
+        _checker_for_game_task(tmp_path, tracker).evaluate(
+            evidence,
+            mutation_attempted=True,
+            evidence_paths=('src/main.ts',),
+        )
+    )
+
+    assert decision.allowed is False
+    assert any('index-OLD.js' in reason for reason in decision.reasons)
 
 
 def test_new_npm_project_accepts_package_lock_as_supporting_config() -> None:

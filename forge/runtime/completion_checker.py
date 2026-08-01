@@ -20,7 +20,8 @@ from forge.runtime.task_scope import (
     evaluate_change_relevance,
     infer_task_scope,
 )
-from forge.runtime.workspace import WorkspaceTracker
+from forge.runtime.workspace import WorkspaceTracker, fingerprint_path
+from forge.runtime.workspace_classification import artifact_deltas_from_metadata
 from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolResult
 
@@ -364,6 +365,27 @@ class CompletionChecker:
                 self.gate.policy.forbidden_paths if self.gate is not None else ()
             ),
         )
+        integrity_violations = verification_artifact_integrity_violations(
+            self.tracker,
+            verification,
+            forbidden_patterns=(
+                self.gate.policy.forbidden_paths if self.gate is not None else ()
+            ),
+        )
+        if integrity_violations:
+            decision = CompletionDecision(
+                allowed=False,
+                reasons=tuple(
+                    dict.fromkeys(
+                        (
+                            *decision.reasons,
+                            'Verified artifact state changed after '
+                            'verification: '
+                            + ', '.join(integrity_violations),
+                        )
+                    )
+                ),
+            )
         untrusted_filesystem_paths = tuple(
             path for path in filesystem_paths if path not in trusted_outputs
         )
@@ -599,6 +621,9 @@ def verification_from_result(
             cache_fingerprints=_fingerprints_from_metadata(
                 metadata.get('cache_fingerprints', [])
             ),
+            artifact_deltas=artifact_deltas_from_metadata(
+                metadata.get('artifact_deltas', [])
+            ),
             verification_side_effect_paths=tuple(
                 str(path)
                 for path in metadata.get('verification_side_effect_paths', [])
@@ -632,6 +657,27 @@ def trusted_verification_output_paths(
         verification.cache_paths
     )
     trusted: set[str] = set()
+    for delta in verification.artifact_deltas:
+        path = delta.path.replace('\\', '/')
+        if not _is_workspace_relative_path(path):
+            continue
+        if forbidden_patterns and matches_any(path, forbidden_patterns):
+            continue
+        if not delta.rule_pattern or not matches_any(
+            path,
+            (delta.rule_pattern,),
+        ):
+            continue
+        current_fingerprint = fingerprint_path(tracker.root, path)
+        if delta.operation == 'deleted':
+            if current_fingerprint != 'missing':
+                continue
+        elif (
+            current_fingerprint != 'missing'
+            and current_fingerprint != delta.after_fingerprint
+        ):
+            continue
+        trusted.add(path)
     for raw_path in declared:
         path = str(raw_path).replace('\\', '/')
         if path not in filesystem_paths:
@@ -647,6 +693,43 @@ def trusted_verification_output_paths(
             continue
         trusted.add(path)
     return frozenset(trusted)
+
+
+def verification_artifact_integrity_violations(
+    tracker: WorkspaceTracker,
+    verification: VerificationEvidence | None,
+    *,
+    forbidden_patterns: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    '''Return verified outputs whose current state contradicts their delta.'''
+    if verification is None or not verification.success:
+        return ()
+    if verification.bound_source_revision != tracker.source_revision:
+        return ()
+    if verification.verification_side_effect_paths:
+        return ()
+    violations: list[str] = []
+    for delta in verification.artifact_deltas:
+        path = delta.path.replace('\\', '/')
+        if not _is_workspace_relative_path(path):
+            violations.append(path)
+            continue
+        if forbidden_patterns and matches_any(path, forbidden_patterns):
+            violations.append(path)
+            continue
+        if not delta.rule_pattern or not matches_any(
+            path,
+            (delta.rule_pattern,),
+        ):
+            violations.append(path)
+            continue
+        current = fingerprint_path(tracker.root, path)
+        if delta.operation == 'deleted':
+            if current != 'missing':
+                violations.append(path)
+        elif current not in {'missing', delta.after_fingerprint}:
+            violations.append(path)
+    return tuple(dict.fromkeys(violations))
 
 
 def _is_workspace_relative_path(path: str) -> bool:
