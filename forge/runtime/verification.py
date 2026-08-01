@@ -670,6 +670,7 @@ def verification_cache_key(
     cwd: str,
     scope: VerificationArtifactScope,
     resolved_commands: tuple[str, ...] = (),
+    dependency_fingerprint: str = '',
 ) -> tuple[object, ...]:
     return (
         source_revision,
@@ -678,6 +679,7 @@ def verification_cache_key(
         scope.verification_type,
         tuple((rule.pattern, rule.kind) for rule in scope.allowed_writes),
         resolved_commands,
+        dependency_fingerprint,
         NON_INTERACTIVE_ENV_KEY,
     )
 

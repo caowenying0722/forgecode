@@ -208,14 +208,21 @@ class CompletionChecker:
         pending_steps = tuple(
             step.title for step in task.steps if step.status != 'completed'
         )
-        unrelated = (
-            self.tracker.last_classification.unrelated_paths
+        current_classification = (
+            self.tracker.classifier.classify(
+                _tracker_filesystem_changed_paths(self.tracker)
+            )
             if self.tracker is not None
+            else None
+        )
+        unrelated = (
+            current_classification.unrelated_paths
+            if current_classification is not None
             else ()
         )
         forbidden = (
-            self.tracker.last_classification.forbidden_paths
-            if self.tracker is not None
+            current_classification.forbidden_paths
+            if current_classification is not None
             else ()
         )
         deliverables = (

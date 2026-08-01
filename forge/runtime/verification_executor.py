@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from time import time
 from typing import TYPE_CHECKING
@@ -28,6 +29,7 @@ from forge.runtime.workspace_classification import (
     ArtifactDelta,
     ArtifactRule,
     VerificationArtifactScope,
+    artifact_deltas_from_metadata,
     artifact_rule_for,
 )
 from forge.tools.base import ToolResult
@@ -124,9 +126,13 @@ class VerificationExecutor:
             cwd=display_cwd,
             scope=workspace_scope,
             resolved_commands=resolved.effective_commands,
+            dependency_fingerprint=_dependency_manifest_fingerprint(cwd),
         )
         cached = self.tracker.verification_cache.get(key)
-        if isinstance(cached, ToolResult):
+        if isinstance(cached, ToolResult) and _cached_artifacts_match(
+            self.tracker,
+            cached,
+        ):
             reused = ToolResult.ok(
                 f'Reused verification evidence for source revision '
                 f'{source_revision}.',
@@ -149,6 +155,8 @@ class VerificationExecutor:
                     reusable_key=key,
                 )
             return reused
+        if cached is not None:
+            self.tracker.verification_cache.pop(key, None)
 
         before_snapshot = await self.tracker.capture_transaction_snapshot(
             workspace_scope
@@ -404,3 +412,76 @@ def _artifact_deltas(
             )
         )
     return tuple(deltas)
+
+
+def _cached_artifacts_match(
+    tracker: WorkspaceTracker,
+    cached: ToolResult,
+) -> bool:
+    metadata = cached.metadata
+    deltas = artifact_deltas_from_metadata(metadata.get('artifact_deltas', []))
+    for delta in deltas:
+        current = _path_fingerprint(tracker.root, delta.path)
+        if delta.operation == 'deleted':
+            if current != 'missing':
+                return False
+        elif current != delta.after_fingerprint:
+            return False
+    fingerprint_pairs = (
+        *metadata.get('generated_artifact_fingerprints', []),
+        *metadata.get('cache_fingerprints', []),
+    )
+    checked_paths: set[str] = {delta.path for delta in deltas}
+    for item in fingerprint_pairs:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return False
+        path, expected = str(item[0]), str(item[1])
+        if path in checked_paths:
+            continue
+        if _path_fingerprint(tracker.root, path) != expected:
+            return False
+        checked_paths.add(path)
+    declared = {
+        str(path)
+        for path in (
+            *metadata.get('generated_artifact_paths', []),
+            *metadata.get('cache_paths', []),
+        )
+    }
+    return declared <= checked_paths
+
+
+def _path_fingerprint(root: Path, path: str) -> str:
+    from forge.runtime.workspace import fingerprint_path
+
+    return fingerprint_path(root, path)
+
+
+def _dependency_manifest_fingerprint(root: Path) -> str:
+    names = (
+        'package.json',
+        'package-lock.json',
+        'pnpm-lock.yaml',
+        'yarn.lock',
+        'bun.lock',
+        'bun.lockb',
+        'pyproject.toml',
+        'uv.lock',
+        'Cargo.toml',
+        'Cargo.lock',
+        'go.mod',
+        'go.sum',
+    )
+    digest = sha256()
+    for name in names:
+        path = root / name
+        if not path.is_file():
+            continue
+        digest.update(name.encode('utf-8'))
+        digest.update(b'\0')
+        try:
+            digest.update(path.read_bytes())
+        except OSError as error:
+            digest.update(f'unreadable:{error.errno}'.encode('utf-8'))
+        digest.update(b'\0')
+    return digest.hexdigest()

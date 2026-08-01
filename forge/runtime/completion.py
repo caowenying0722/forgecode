@@ -120,11 +120,16 @@ class CompletionGate:
             )
 
         reasons.extend(self._path_violations(changed_paths))
-        if tracker.last_classification.verification_side_effect_paths:
+        if (
+            verification is not None
+            and verification.bound_source_revision
+            == _tracker_source_revision(tracker)
+            and verification.verification_side_effect_paths
+        ):
             reasons.append(
                 'Verification modified undeclared source or workspace paths: '
                 + ', '.join(
-                    tracker.last_classification.verification_side_effect_paths
+                    verification.verification_side_effect_paths
                 )
             )
 

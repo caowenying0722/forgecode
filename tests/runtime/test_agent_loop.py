@@ -407,6 +407,27 @@ def test_conversation_forks_saved_session(tmp_path: Path) -> None:
     assert child.parent_session_id == parent_id
 
 
+def test_resume_does_not_restore_unsafe_verification_cache(
+    tmp_path: Path,
+) -> None:
+    registry = create_default_registry(tmp_path)
+    conversation = Conversation(
+        client=FakeModelClient(streamed_response('saved')),
+        registry=registry,
+    )
+    session_id = conversation.save_session()
+    tracker = conversation.workspace_tracker
+    assert tracker is not None
+    tracker.verification_cache[('old-session',)] = object()
+    conversation.verification_ledger.reusable_successes[('old-session',)] = object()  # type: ignore[assignment]
+
+    conversation.resume_session(session_id)
+
+    assert tracker.verification_cache == {}
+    assert conversation.verification_ledger.records == []
+    assert conversation.verification_ledger.reusable_successes == {}
+
+
 def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(
     tmp_path: Path,
     monkeypatch,

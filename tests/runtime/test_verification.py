@@ -796,3 +796,122 @@ def test_verify_and_promoted_run_command_share_execution_path(
         (VerificationExecutor, 'git diff --check'),
         (VerificationExecutor, 'git diff --check'),
     ]
+
+
+def test_verification_cache_is_cleared_at_begin_turn(tmp_path: Path) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    tracker.verification_cache[('old-turn',)] = object()
+
+    run(tracker.begin_turn())
+
+    assert tracker.verification_cache == {}
+
+
+def test_same_relative_revision_in_new_turn_does_not_reuse_old_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    ledger = VerificationLedger()
+    calls = 0
+
+    async def process(*_args: object, **_kwargs: object) -> ProcessResult:
+        nonlocal calls
+        calls += 1
+        return _successful_process()
+
+    monkeypatch.setattr('forge.runtime.verification_executor.run_process', process)
+    tool = VerifyTool(tmp_path, tracker, ledger)
+    run(tracker.begin_turn())
+    (tmp_path / 'sample.txt').write_text('turn a\n', encoding='utf-8')
+    run(tracker.refresh())
+    first = run(tool.run({'command': 'git diff --check'}))
+
+    run(tracker.begin_turn())
+    ledger.clear_turn()
+    (tmp_path / 'sample.txt').write_text('turn b\n', encoding='utf-8')
+    run(tracker.refresh())
+    second = run(tool.run({'command': 'git diff --check'}))
+
+    assert first.metadata['source_revision'] == 1
+    assert second.metadata['source_revision'] == 1
+    assert first.metadata.get('verification_reused') is not True
+    assert second.metadata.get('verification_reused') is not True
+    assert calls == 2
+
+
+def test_same_turn_same_snapshot_can_reuse_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    ledger = VerificationLedger()
+    calls = 0
+
+    async def process(*_args: object, **_kwargs: object) -> ProcessResult:
+        nonlocal calls
+        calls += 1
+        return _successful_process()
+
+    monkeypatch.setattr('forge.runtime.verification_executor.run_process', process)
+    tool = VerifyTool(tmp_path, tracker, ledger)
+    first = run(tool.run({'command': 'git diff --check'}))
+    second = run(tool.run({'command': 'git diff --check'}))
+
+    assert first.success is True
+    assert second.success is True
+    assert second.metadata['verification_reused'] is True
+    assert calls == 1
+
+
+def test_cached_verification_rechecks_artifact_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize_git_repository(tmp_path)
+    _write_package_json(tmp_path, {'build': 'vite build'})
+    source = tmp_path / 'src' / 'main.ts'
+    source.parent.mkdir()
+    source.write_text('export const value = 1;\n', encoding='utf-8')
+    subprocess.run(['git', 'add', '.'], cwd=tmp_path, check=True)
+    subprocess.run(
+        ['git', 'commit', '--quiet', '-m', 'vite project'],
+        cwd=tmp_path,
+        check=True,
+    )
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    source.write_text('export const value = 2;\n', encoding='utf-8')
+    run(tracker.refresh())
+    ledger = VerificationLedger()
+    calls = 0
+
+    async def process(*_args: object, **_kwargs: object) -> ProcessResult:
+        nonlocal calls
+        calls += 1
+        output = tmp_path / 'dist' / 'index.html'
+        output.parent.mkdir(exist_ok=True)
+        output.write_text(f'built {calls}\n', encoding='utf-8')
+        return _successful_process()
+
+    monkeypatch.setattr('forge.runtime.verification_executor.run_process', process)
+    tool = VerifyTool(tmp_path, tracker, ledger)
+    first = run(tool.run({'command': 'npm run build', 'target': 'build'}))
+    (tmp_path / 'dist' / 'index.html').write_text(
+        'tampered\n',
+        encoding='utf-8',
+    )
+    run(tracker.refresh())
+    second = run(tool.run({'command': 'npm run build', 'target': 'build'}))
+
+    assert first.success is True
+    assert second.success is True
+    assert second.metadata.get('verification_reused') is not True
+    assert calls == 2
+    assert (tmp_path / 'dist' / 'index.html').read_text(encoding='utf-8') == (
+        'built 2\n'
+    )

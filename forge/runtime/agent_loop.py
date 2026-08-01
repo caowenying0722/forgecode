@@ -3176,6 +3176,9 @@ class Conversation:
         )
 
     def _apply_session_snapshot(self, snapshot: Any) -> None:
+        if self.workspace_tracker is not None:
+            self.workspace_tracker.verification_cache.clear()
+        self.verification_ledger.clear_turn()
         self.messages[:] = snapshot.messages
         self.session_id = snapshot.id
         self.task_manager.active = snapshot.active_task

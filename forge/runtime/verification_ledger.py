@@ -84,6 +84,7 @@ class VerificationLedger:
 
     def clear_turn(self) -> None:
         self.records.clear()
+        self.reusable_successes.clear()
 
     def record(self, record: VerificationRecord) -> VerificationRecord:
         self.records.append(record)

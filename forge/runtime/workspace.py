@@ -86,6 +86,7 @@ class WorkspaceTracker:
         self.available = False
         self._watched_paths: set[str] = set()
         self._artifact_paths: set[str] = set()
+        self._verification_side_effect_paths: set[str] = set()
         self.classifier = WorkspaceChangeClassifier()
         self.last_classification = ChangeSetClassification()
         self.verification_cache: dict[tuple[object, ...], object] = {}
@@ -105,7 +106,9 @@ class WorkspaceTracker:
         self.filesystem_revision = 0
         self.source_revision = 0
         self._artifact_paths.clear()
+        self._verification_side_effect_paths.clear()
         self.last_classification = ChangeSetClassification()
+        self.verification_cache.clear()
 
     async def _initialize_internal_repository(self) -> bool:
         '''Create a private gitdir pointer for an otherwise non-Git workspace.'''
@@ -259,6 +262,17 @@ class WorkspaceTracker:
         self.last_classification = classification
         self._artifact_paths.update(classification.generated_paths)
         self._artifact_paths.update(classification.cache_paths)
+        self._verification_side_effect_paths.update(
+            path
+            for path in classification.verification_side_effect_paths
+            if PurePosixPath(path).suffix.casefold()
+            not in {'.ts', '.tsx', '.py', '.rs', '.java'}
+        )
+        self._verification_side_effect_paths = {
+            path
+            for path in self._verification_side_effect_paths
+            if state_snapshot.files.get(path, 'missing') != 'missing'
+        }
         return WorkspaceChange(
             revision=self.filesystem_revision,
             paths=paths,
@@ -310,11 +324,6 @@ class WorkspaceTracker:
         '''Return changed paths that affect the source revision.'''
         all_paths = changed_paths(self.baseline, self.current)
         classification = self.classifier.classify(all_paths)
-        non_source_side_effects = {
-            path
-            for path in self.last_classification.verification_side_effect_paths
-            if PurePosixPath(path).suffix.casefold() not in {'.ts', '.tsx', '.py', '.rs', '.java'}
-        }
         return tuple(
             path
             for path in dict.fromkeys(
@@ -327,7 +336,7 @@ class WorkspaceTracker:
                     ),
                 )
             )
-            if path not in non_source_side_effects
+            if path not in self._verification_side_effect_paths
             and not (path in self._artifact_paths and path not in self._watched_paths)
         )
 

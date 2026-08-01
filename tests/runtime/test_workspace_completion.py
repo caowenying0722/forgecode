@@ -22,6 +22,10 @@ from forge.runtime.task_scope import evaluate_change_relevance, infer_task_scope
 from forge.runtime.verification import verification_artifact_scope
 from forge.runtime.verification_ledger import VerificationLedger
 from forge.runtime.workspace import WorkspaceTracker, should_skip_workspace_path
+from forge.runtime.workspace_classification import (
+    ChangeSetClassification,
+    ClassifiedChange,
+)
 from forge.tasks.manager import TaskManager
 from forge.tools.filesystem import CreateDirectoryTool
 from forge.tools.verify import VerifyTool
@@ -1401,6 +1405,116 @@ def test_deleted_artifact_recreated_after_build_is_untrusted(
 
     assert decision.allowed is False
     assert any('index-OLD.js' in reason for reason in decision.reasons)
+
+
+def _stale_side_effect_classification() -> ChangeSetClassification:
+    return ChangeSetClassification(
+        (
+            ClassifiedChange(
+                'old-failure.log',
+                'verification_side_effect',
+                'verification',
+                'old verification failure',
+            ),
+        )
+    )
+
+
+def test_completion_gate_ignores_stale_last_classification(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    (tmp_path / 'sample.txt').write_text('changed\n', encoding='utf-8')
+    run(tracker.refresh())
+    tracker.last_classification = _stale_side_effect_classification()
+    current = VerificationEvidence(
+        command='python -m pytest -q',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=tracker.source_revision,
+        source_revision=tracker.source_revision,
+    )
+
+    decision = run(
+        CompletionGate(tmp_path, TaskPolicy(require_verification=True)).evaluate(
+            tracker,
+            current,
+            mutation_attempted=True,
+        )
+    )
+
+    assert decision.allowed is True
+
+
+def test_current_successful_ledger_record_overrides_old_failed_classification(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    (tmp_path / 'sample.txt').write_text('changed\n', encoding='utf-8')
+    run(tracker.refresh())
+    tracker.last_classification = _stale_side_effect_classification()
+    ledger = VerificationLedger()
+    ledger.record_from_metadata(
+        {
+            'verification': True,
+            'verification_status': 'passed',
+            'command': 'python -m pytest -q',
+            'cwd': '.',
+            'workspace_revision': tracker.source_revision,
+            'source_revision': tracker.source_revision,
+            'filesystem_revision': tracker.filesystem_revision,
+            'exit_code': 0,
+            'duration_seconds': 0.1,
+            'timed_out': False,
+            'verification_side_effect_paths': [],
+        }
+    )
+
+    decision = run(
+        CompletionGate(tmp_path, TaskPolicy(require_verification=True)).evaluate(
+            tracker,
+            ledger.latest_evidence(tracker.source_revision),
+            mutation_attempted=True,
+        )
+    )
+
+    assert decision.allowed is True
+
+
+def test_old_side_effects_do_not_create_sticky_completion_failure(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    (tmp_path / 'sample.txt').write_text('changed\n', encoding='utf-8')
+    run(tracker.refresh())
+    tracker.last_classification = _stale_side_effect_classification()
+    current = VerificationEvidence(
+        command='git diff --check',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=tracker.source_revision,
+        source_revision=tracker.source_revision,
+    )
+
+    decision = run(
+        CompletionGate(tmp_path).evaluate(
+            tracker,
+            current,
+            mutation_attempted=True,
+        )
+    )
+
+    assert decision.allowed is True
 
 
 def test_new_npm_project_accepts_package_lock_as_supporting_config() -> None:
