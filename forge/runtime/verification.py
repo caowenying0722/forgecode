@@ -10,8 +10,10 @@ from typing import Literal
 
 from forge.runtime.workspace_classification import (
     ArtifactRule,
+    ChangeSetClassification,
     VerificationArtifactScope,
 )
+from forge.runtime.workspace import WorkspaceChange
 
 ValidationTarget = Literal['auto', 'build', 'test', 'lint', 'typecheck', 'diff']
 VerificationStatus = Literal[
@@ -35,6 +37,67 @@ class ValidationCommand:
     target: ValidationTarget = 'auto'
     source: str = 'discovered'
     strength: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationTransaction:
+    '''Filesystem evidence owned by exactly one verification command.'''
+
+    command: str
+    cwd: str
+    source_revision_before: int
+    source_revision_after: int
+    filesystem_revision_before: int
+    filesystem_revision_after: int
+    changed_paths: tuple[str, ...]
+    created_paths: tuple[str, ...]
+    modified_paths: tuple[str, ...]
+    deleted_paths: tuple[str, ...]
+    classification: ChangeSetClassification
+    before_snapshot_id: str
+    after_snapshot_id: str
+
+    @classmethod
+    def from_workspace_change(
+        cls,
+        *,
+        command: str,
+        cwd: str,
+        source_revision_before: int,
+        filesystem_revision_before: int,
+        change: WorkspaceChange,
+    ) -> VerificationTransaction:
+        return cls(
+            command=command,
+            cwd=cwd,
+            source_revision_before=source_revision_before,
+            source_revision_after=change.source_revision,
+            filesystem_revision_before=filesystem_revision_before,
+            filesystem_revision_after=change.filesystem_revision,
+            changed_paths=change.paths,
+            created_paths=change.created_paths,
+            modified_paths=change.modified_paths,
+            deleted_paths=change.deleted_paths,
+            classification=change.classification,
+            before_snapshot_id=change.before_snapshot_id,
+            after_snapshot_id=change.after_snapshot_id,
+        )
+
+    def as_metadata(self) -> dict[str, object]:
+        return {
+            'command': self.command,
+            'cwd': self.cwd,
+            'source_revision_before': self.source_revision_before,
+            'source_revision_after': self.source_revision_after,
+            'filesystem_revision_before': self.filesystem_revision_before,
+            'filesystem_revision_after': self.filesystem_revision_after,
+            'changed_paths': list(self.changed_paths),
+            'created_paths': list(self.created_paths),
+            'modified_paths': list(self.modified_paths),
+            'deleted_paths': list(self.deleted_paths),
+            'before_snapshot_id': self.before_snapshot_id,
+            'after_snapshot_id': self.after_snapshot_id,
+        }
 
 
 def normalize_verification_status(

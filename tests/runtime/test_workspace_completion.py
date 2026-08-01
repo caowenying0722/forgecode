@@ -361,7 +361,9 @@ def test_workspace_tracker_watches_ignored_write_targets(
     assert change.revision == 1
     assert change.paths == ('ignored/app.js', 'ignored/new.js')
     assert tracker.changed_paths == ('ignored/app.js', 'ignored/new.js')
-    assert unchanged is None
+    assert unchanged is not None
+    assert unchanged.paths == ()
+    assert unchanged.classification.changes == ()
 
 
 def test_workspace_tracker_watched_paths_can_include_local_caches(

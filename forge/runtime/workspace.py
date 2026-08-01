@@ -40,6 +40,17 @@ class WorkspaceSnapshot:
 
     files: dict[str, str] = field(default_factory=dict)
 
+    @property
+    def id(self) -> str:
+        '''Return a stable identity for this observed workspace state.'''
+        digest = sha256()
+        for path, fingerprint in sorted(self.files.items()):
+            digest.update(path.encode('utf-8'))
+            digest.update(b'\0')
+            digest.update(fingerprint.encode('utf-8'))
+            digest.update(b'\0')
+        return digest.hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceChange:
@@ -53,6 +64,11 @@ class WorkspaceChange:
     classification: ChangeSetClassification = field(
         default_factory=ChangeSetClassification
     )
+    created_paths: tuple[str, ...] = ()
+    modified_paths: tuple[str, ...] = ()
+    deleted_paths: tuple[str, ...] = ()
+    before_snapshot_id: str = ''
+    after_snapshot_id: str = ''
 
 
 class WorkspaceTracker:
@@ -195,16 +211,16 @@ class WorkspaceTracker:
             self.available = False
             return None
         self.available = True
+        before = self.current
         paths = changed_paths(self.current, snapshot)
-        if not paths:
-            return None
         classification = self.classifier.classify(
             paths,
             origin='verification' if origin == 'verification' else 'agent',
             artifact_scope=artifact_scope,
         )
         self.current = snapshot
-        self.filesystem_revision += 1
+        if paths:
+            self.filesystem_revision += 1
         self.revision = self.filesystem_revision
         source_paths = tuple(
             dict.fromkeys(
@@ -224,7 +240,7 @@ class WorkspaceTracker:
                 )
             )
         )
-        if source_paths:
+        if paths and source_paths:
             self.source_revision += 1
         self.last_classification = classification
         self._artifact_paths.update(classification.generated_paths)
@@ -236,6 +252,23 @@ class WorkspaceTracker:
             source_revision=self.source_revision,
             source_paths=source_paths,
             classification=classification,
+            created_paths=tuple(
+                path
+                for path in paths
+                if path not in before.files and path in snapshot.files
+            ),
+            modified_paths=tuple(
+                path
+                for path in paths
+                if path in before.files and path in snapshot.files
+            ),
+            deleted_paths=tuple(
+                path
+                for path in paths
+                if path in before.files and path not in snapshot.files
+            ),
+            before_snapshot_id=before.id,
+            after_snapshot_id=snapshot.id,
         )
 
     @property

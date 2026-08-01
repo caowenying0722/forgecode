@@ -11,6 +11,7 @@ from pydantic import Field
 from forge.runtime.verification import (
     NON_INTERACTIVE_ENV,
     ValidationTarget,
+    VerificationTransaction,
     choose_validation_command,
     classify_verification_command,
     discover_validation_commands,
@@ -190,11 +191,20 @@ class VerifyTool(Tool[VerifyInput]):
             origin='verification',
             artifact_scope=scope,
         )
-        classification = (
-            change.classification
-            if change is not None
-            else self.tracker.last_classification
+        if change is None:
+            raise ToolExecutionError(
+                'workspace_snapshot_unavailable',
+                'Verification completed, but the workspace delta could not '
+                'be captured.',
+            )
+        transaction = VerificationTransaction.from_workspace_change(
+            command=command,
+            cwd=display_path(self.root, cwd),
+            source_revision_before=source_revision,
+            filesystem_revision_before=filesystem_revision,
+            change=change,
         )
+        classification = transaction.classification
         verification_status = (
             'timed_out'
             if result.timed_out
@@ -237,6 +247,7 @@ class VerifyTool(Tool[VerifyInput]):
                 list(item) for item in generated_artifact_fingerprints
             ],
             'cache_fingerprints': [list(item) for item in cache_fingerprints],
+            'verification_transaction': transaction.as_metadata(),
             'source_revision_changed': (
                 self.tracker.source_revision != source_revision
             ),

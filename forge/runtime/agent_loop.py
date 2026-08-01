@@ -1334,7 +1334,7 @@ class Conversation:
                     and self.completion_checker.available
                 ):
                     change = await self.workspace_tracker.refresh()
-                    if change is not None:
+                    if change is not None and change.paths:
                         if change.source_paths:
                             self.working_state.advance_revision(
                                 change.source_revision,
@@ -1834,7 +1834,7 @@ class Conversation:
                 tool_changed_workspace = False
                 if self.workspace_tracker is not None:
                     change = await self.workspace_tracker.refresh()
-                    if change is not None:
+                    if change is not None and change.paths:
                         task_changed_paths = (
                             self.workspace_tracker.changed_paths
                         )
