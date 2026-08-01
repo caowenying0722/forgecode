@@ -35,6 +35,7 @@ def test_default_registry_exposes_all_tool_schemas(
         'apply_patch',
         'run_command',
         'verify',
+        'cleanup_verification_artifacts',
         'git_status',
         'git_diff',
         'task_create',
@@ -71,6 +72,7 @@ def test_default_registry_exposes_all_tool_schemas(
     assert registry.effect('replace_text') == 'workspace_write'
     assert registry.effect('apply_patch') == 'workspace_write'
     assert registry.effect('run_command') == 'process'
+    assert registry.effect('cleanup_verification_artifacts') == 'process'
     assert registry.effect('task') == 'process'
     assert registry.effect('task_create') == 'workspace_write'
     assert registry.effect('task_list') == 'read_only'
