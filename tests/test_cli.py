@@ -766,6 +766,53 @@ def test_cli_version() -> None:
     assert 'ForgeCode 0.1.0' in result.stdout
 
 
+def test_version_command_reports_runtime_identity_without_secrets(
+    tmp_path: Path,
+) -> None:
+    result = runner.invoke(
+        app,
+        ['--cwd', str(tmp_path), '--no-git-root', 'version'],
+        env={'ANTHROPIC_API_KEY': 'do-not-print-this-secret'},
+    )
+
+    assert result.exit_code == 0
+    assert 'ForgeCode version: 0.1.0' in result.stdout
+    assert 'Git commit:' in result.stdout
+    assert 'Editable install:' in result.stdout
+    assert 'Runtime schema version:' in result.stdout
+    assert 'Python executable:' in result.stdout
+    assert 'ForgeCode package path:' in result.stdout
+    assert f'Workspace: {tmp_path.resolve()}' in result.stdout
+    assert f'Actual cwd: {tmp_path.resolve()}' in result.stdout
+    assert 'do-not-print-this-secret' not in result.stdout
+
+
+def test_doctor_reports_runtime_identity_before_model_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('FORGE_HOME', str(tmp_path / 'home'))
+    result = runner.invoke(
+        app,
+        ['--cwd', str(tmp_path), '--no-git-root', 'doctor'],
+        env={
+            'ANTHROPIC_API_KEY': 'doctor-secret-key',
+            'MODEL_ID': 'claude-test',
+        },
+    )
+
+    assert result.exit_code == 0
+    assert 'ForgeCode version: 0.1.0' in result.stdout
+    assert 'Git commit:' in result.stdout
+    assert 'Editable install:' in result.stdout
+    assert 'Runtime schema version:' in result.stdout
+    assert 'Python executable:' in result.stdout
+    assert 'ForgeCode package path:' in result.stdout
+    assert f'Workspace: {tmp_path.resolve()}' in result.stdout
+    assert f'Actual cwd: {tmp_path.resolve()}' in result.stdout
+    assert 'doctor-secret-key' not in result.stdout
+
+
 def test_cli_rejects_removed_prompt_option() -> None:
     result = runner.invoke(app, ['-p', 'hello'])
 

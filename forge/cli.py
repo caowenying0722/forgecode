@@ -19,6 +19,7 @@ from forge.config import (
     write_user_config,
 )
 from forge.runtime.agent_loop import Conversation
+from forge.runtime.diagnostics import collect_runtime_diagnostics
 from forge.runtime.state import (
     AgentPhaseChanged,
     CompletionBlocked,
@@ -552,9 +553,13 @@ def doctor(ctx: typer.Context) -> None:
     '''Diagnose global command, workspace, Git, and model configuration.'''
     location: WorkspaceLocation = ctx.obj['workspace']
     typer.echo('ForgeCode doctor')
+    for line in collect_runtime_diagnostics(
+        location.root,
+        actual_cwd=Path.cwd(),
+    ).lines():
+        typer.echo(line)
     typer.echo(f'Executable: {shutil.which("forge") or "not on PATH"}')
-    typer.echo(f'Workspace: {location.root} ({location.source})')
-    typer.echo(f'Cwd: {location.cwd}')
+    typer.echo(f'Workspace source: {location.source}')
     typer.echo(f'User config: {forge_home() / "config.toml"}')
     typer.echo(
         f'Project config: {location.root / ".forge" / "config.toml"}'
@@ -565,6 +570,17 @@ def doctor(ctx: typer.Context) -> None:
         typer.echo(f'Model config: invalid ({error})')
         raise typer.Exit(code=1) from error
     typer.echo(f'Model config: ready ({config.model_id})')
+
+
+@app.command('version')
+def show_version(ctx: typer.Context) -> None:
+    '''Show the complete ForgeCode runtime identity.'''
+    location: WorkspaceLocation = ctx.obj['workspace']
+    for line in collect_runtime_diagnostics(
+        location.root,
+        actual_cwd=Path.cwd(),
+    ).lines():
+        typer.echo(line)
 
 
 if __name__ == '__main__':
