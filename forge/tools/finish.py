@@ -11,7 +11,14 @@ from forge.tools.base import Tool, ToolInput, ToolResult
 
 
 TaskKind = Literal['answer', 'inspection', 'change']
-FinishStatus = Literal['completed', 'blocked']
+FinishStatus = Literal[
+    'completed',
+    'task_completed',
+    'progressed',
+    'step_completed',
+    'partially_completed',
+    'blocked',
+]
 
 
 class FinishTaskInput(ToolInput):
@@ -19,6 +26,7 @@ class FinishTaskInput(ToolInput):
     status: FinishStatus
     summary: str = Field(min_length=1, max_length=20_000)
     blocked_reasons: list[str] = Field(default_factory=list, max_length=20)
+    remaining_work: list[str] = Field(default_factory=list, max_length=50)
 
     @model_validator(mode='after')
     def validate_status(self) -> FinishTaskInput:
@@ -27,9 +35,21 @@ class FinishTaskInput(ToolInput):
                 'blocked_reasons must explain why a blocked task cannot '
                 'continue'
             )
-        if self.status == 'completed' and self.blocked_reasons:
+        if self.status != 'blocked' and self.blocked_reasons:
             raise ValueError(
-                'blocked_reasons must be empty when status is completed'
+                'blocked_reasons must be empty unless status is blocked'
+            )
+        if self.status in {'completed', 'task_completed'} and self.remaining_work:
+            raise ValueError(
+                'remaining_work must be empty for task completion'
+            )
+        if self.status in {
+            'progressed',
+            'step_completed',
+            'partially_completed',
+        } and not self.remaining_work:
+            raise ValueError(
+                'remaining_work must identify what prevents task completion'
             )
         return self
 
@@ -46,6 +66,9 @@ class FinishTaskTool(Tool[FinishTaskInput]):
         'is rejected. Use status=blocked with '
         'specific blocked_reasons when the goal cannot be completed. The '
         'runtime validates the declaration against objective evidence.'
+        ' Use task_completed only for the whole user goal. Use progressed, '
+        'step_completed, or partially_completed with structured remaining_work '
+        'when the active task must continue.'
     )
     input_model = FinishTaskInput
 
@@ -61,5 +84,11 @@ class FinishTaskTool(Tool[FinishTaskInput]):
                 'status': arguments.status,
                 'summary': arguments.summary,
                 'blocked_reasons': arguments.blocked_reasons,
+                'remaining_work': arguments.remaining_work,
+                'task_outcome': (
+                    'task_completed'
+                    if arguments.status in {'completed', 'task_completed'}
+                    else arguments.status
+                ),
             },
         )

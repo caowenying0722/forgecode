@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import PurePosixPath
 import re
-from typing import Any
+from typing import Any, Literal
 
 from forge.runtime.state import ToolCall, VerificationEvidence
 from forge.runtime.tool_targets import mutation_target_paths
@@ -16,6 +16,15 @@ from forge.tools.base import ToolResult
 
 
 MAX_DIAGNOSTIC_EXCERPT = 1_000
+RecoveryKind = Literal[
+    'source_repair',
+    'verification_command_repair',
+    'dependency_setup',
+    'artifact_recovery',
+    'environment_recovery',
+    'planning_recovery',
+    'summary_recovery',
+]
 
 PATH_LINE_PATTERNS = (
     re.compile(
@@ -98,10 +107,15 @@ class RepairTarget:
     baseline_source_revision: int | None = None
     read_ranges: tuple[str, ...] = ()
     attempted_edits: tuple[str, ...] = ()
+    recovery_kind: RecoveryKind = 'source_repair'
 
     @property
     def has_specific_location(self) -> bool:
         return bool(self.paths or self.line_numbers or self.symbols)
+
+    @property
+    def requires_source_edit(self) -> bool:
+        return self.recovery_kind == 'source_repair'
 
 
 class RecoveryManager:
@@ -241,6 +255,7 @@ class RecoveryManager:
         fix_available: bool,
         scope: RecoveryScope,
         verify_available: bool = True,
+        recovery_kind: RecoveryKind = 'source_repair',
     ) -> list[dict[str, Any]] | None:
         if self.tools is None:
             return None
@@ -249,7 +264,19 @@ class RecoveryManager:
         if verify_available:
             allowed.add('verify')
             allowed.update({'git_status', 'git_diff'})
-        if fix_available:
+        if recovery_kind == 'artifact_recovery':
+            allowed.add('cleanup_verification_artifacts')
+        elif recovery_kind == 'verification_command_repair':
+            allowed.add('verify')
+            allowed.update({'git_status', 'git_diff'})
+        elif fix_available and recovery_kind in {
+            'dependency_setup',
+            'environment_recovery',
+        }:
+            allowed.add('run_command')
+            if scope.read_available:
+                allowed.update({'find_files', 'grep', 'read_file'})
+        elif fix_available and recovery_kind == 'source_repair':
             allowed.add('run_command')
             if scope.read_available:
                 allowed.update({'find_files', 'grep', 'read_file'})
@@ -260,6 +287,7 @@ class RecoveryManager:
                 str(definition.get('name', '')) in allowed
                 or (
                     fix_available
+                    and recovery_kind == 'source_repair'
                     and
                     self.tool_runner is not None
                     and self.tool_runner.effect(str(definition.get('name', '')))
@@ -269,6 +297,37 @@ class RecoveryManager:
                 )
             )
         ]
+
+    def repair_progressed(
+        self,
+        target: RepairTarget,
+        *,
+        source_revision: int,
+        changed_paths: tuple[str, ...],
+    ) -> bool:
+        '''Return whether workspace progress actually addresses this recovery.'''
+        baseline = target.baseline_source_revision
+        if target.recovery_kind == 'source_repair':
+            if baseline is not None and source_revision <= baseline:
+                return False
+            focus = set((*target.paths, *target.direct_dependencies))
+            if not focus:
+                return bool(changed_paths)
+            return bool(focus & set(changed_paths))
+        if target.recovery_kind == 'dependency_setup':
+            manifests = {
+                'package.json',
+                'package-lock.json',
+                'pnpm-lock.yaml',
+                'yarn.lock',
+                'bun.lock',
+                'bun.lockb',
+                'pyproject.toml',
+                'uv.lock',
+                'requirements.txt',
+            }
+            return bool(manifests & set(changed_paths))
+        return False
 
     def finalization_tools(self) -> list[dict[str, Any]] | None:
         if self.tools is None:
@@ -391,6 +450,7 @@ def repair_target_from_verification(
         failure_signature=verification.failure_signature,
         diagnostic_excerpt=_excerpt(diagnostic),
         baseline_source_revision=verification.bound_source_revision,
+        recovery_kind=_recovery_kind_for_status(verification.status),
     )
 
 
@@ -402,13 +462,24 @@ def repair_target_from_verification_result(
     status = str(result.metadata.get('verification_status', 'failed'))
     diagnostic = _diagnostic_text(result)
     repair_required = verification_status_requires_repair(status)
+    recovery_kind = _recovery_kind_from_result(result, status=status)
+    metadata_paths = tuple(
+        str(path)
+        for key in (
+            'generated_artifact_paths',
+            'cache_paths',
+            'verification_side_effect_paths',
+        )
+        for path in result.metadata.get(key, [])
+    )
     paths = tuple(
         dict.fromkeys(
             [
                 *_extract_paths(diagnostic),
+                *(metadata_paths if recovery_kind == 'artifact_recovery' else ()),
                 *(
                     _changed_paths_for_verification(changed_paths)
-                    if repair_required
+                    if repair_required and recovery_kind == 'source_repair'
                     else ()
                 ),
             ]
@@ -427,6 +498,7 @@ def repair_target_from_verification_result(
         failure_signature=_failure_signature_from_result(result),
         diagnostic_excerpt=_excerpt(diagnostic),
         baseline_source_revision=_metadata_source_revision(result),
+        recovery_kind=recovery_kind,
     )
 
 
@@ -436,6 +508,7 @@ def render_repair_target_context(target: RepairTarget | None) -> str:
     lines = [
         '[ForgeCode Repair Target]',
         f'- source: {target.source}',
+        f'- recovery kind: {target.recovery_kind}',
         f'- expected action: {target.expected_action}',
     ]
     if target.paths:
@@ -616,6 +689,54 @@ def _expected_action_for_verification_status(status: str) -> str:
     if status == 'unavailable':
         return 'add or discover a project validation command'
     return 'repair the failing changed code or project configuration'
+
+
+def _recovery_kind_for_status(status: str) -> RecoveryKind:
+    if status in {'invalid', 'unavailable'}:
+        return 'verification_command_repair'
+    if status == 'timed_out':
+        return 'environment_recovery'
+    return 'source_repair'
+
+
+def _recovery_kind_from_result(
+    result: ToolResult,
+    *,
+    status: str,
+) -> RecoveryKind:
+    if status in {'invalid', 'unavailable'} or (
+        result.error is not None
+        and result.error.code in {
+            'verification_command_invalid',
+            'missing_package_script',
+            'invalid_package_json',
+            'recursive_package_script',
+        }
+    ):
+        return 'verification_command_repair'
+    if result.metadata.get('artifact_deltas') or result.metadata.get(
+        'generated_artifact_paths'
+    ):
+        if result.error is not None and result.error.code in {
+            'verification_side_effect',
+            'artifact_integrity_failed',
+        }:
+            return 'artifact_recovery'
+    diagnostic = _diagnostic_text(result).casefold()
+    if any(
+        marker in diagnostic
+        for marker in (
+            'modulenotfounderror',
+            'cannot find module',
+            'command not found',
+            'not recognized as an internal or external command',
+            'is not recognized as the name of a cmdlet',
+        )
+    ):
+        return 'dependency_setup'
+    if status == 'timed_out':
+        return 'environment_recovery'
+    return 'source_repair'
 
 
 def _excerpt(text: str) -> str:

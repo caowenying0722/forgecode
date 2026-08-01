@@ -13,7 +13,9 @@ from forge.tools.git import GitDiffTool, GitStatusTool
 from forge.tools.patch import ApplyPatchTool
 from forge.tools.shell import RunCommandTool
 from forge.tools.verify import VerifyTool
-from forge.runtime.workspace import WorkspaceTracker
+from forge.runtime.verification import verification_artifact_scope
+from forge.runtime.verification_ledger import VerificationLedger
+from forge.runtime.workspace import WorkspaceTracker, fingerprint_path
 
 
 def run(coroutine: object) -> ToolResult:
@@ -237,6 +239,81 @@ def test_verify_failure_is_structured(tmp_path: Path) -> None:
     assert result.error.code == 'verification_failed'
     assert result.metadata['verification_status'] == 'failed'
     assert result.metadata['exit_code'] != 0
+
+
+def test_runtime_artifact_cleanup_cannot_delete_user_owned_files(
+    tmp_path: Path,
+) -> None:
+    from forge.tools.artifacts import CleanupVerificationArtifactsTool
+
+    initialize_git_repository(tmp_path)
+    user_owned = tmp_path / 'dist' / 'user.html'
+    user_owned.parent.mkdir()
+    user_owned.write_text('user baseline\n', encoding='utf-8')
+    tracker = WorkspaceTracker(tmp_path)
+    asyncio.run(tracker.begin_turn())
+    user_before = fingerprint_path(tmp_path, 'dist/user.html')
+    user_owned.write_text('build modified\n', encoding='utf-8')
+    created = tmp_path / 'dist' / 'created.js'
+    created.write_text('generated\n', encoding='utf-8')
+    asyncio.run(
+        tracker.refresh(
+            origin='verification',
+            artifact_scope=verification_artifact_scope(
+                'npx vite build',
+                root=tmp_path,
+                target='build',
+            ),
+        )
+    )
+    ledger = VerificationLedger()
+    ledger.record_from_metadata(
+        {
+            'verification': True,
+            'verification_status': 'passed',
+            'command': 'npx vite build',
+            'cwd': '.',
+            'workspace_revision': tracker.source_revision,
+            'source_revision': tracker.source_revision,
+            'filesystem_revision': tracker.filesystem_revision,
+            'exit_code': 0,
+            'duration_seconds': 0.1,
+            'timed_out': False,
+            'artifact_deltas': [
+                {
+                    'path': 'dist/created.js',
+                    'operation': 'created',
+                    'kind': 'generated_artifact',
+                    'before_fingerprint': None,
+                    'after_fingerprint': fingerprint_path(
+                        tmp_path, 'dist/created.js'
+                    ),
+                    'rule_pattern': 'dist/**',
+                },
+                {
+                    'path': 'dist/user.html',
+                    'operation': 'modified',
+                    'kind': 'generated_artifact',
+                    'before_fingerprint': user_before,
+                    'after_fingerprint': fingerprint_path(
+                        tmp_path, 'dist/user.html'
+                    ),
+                    'rule_pattern': 'dist/**',
+                },
+            ],
+        }
+    )
+
+    result = run(
+        CleanupVerificationArtifactsTool(tmp_path, tracker, ledger).run({})
+    )
+
+    assert result.success is True
+    assert not created.exists()
+    assert user_owned.exists()
+    assert user_owned.read_text(encoding='utf-8') == 'build modified\n'
+    assert result.metadata['deleted_paths'] == ['dist/created.js']
+    assert result.metadata['preserved_paths'] == ['dist/user.html']
 
 
 def test_write_file_rejects_empty_content(tmp_path: Path) -> None:

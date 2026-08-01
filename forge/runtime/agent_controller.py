@@ -235,6 +235,16 @@ class VerificationRecoveryState:
             and verification_status_requires_repair(self.latest.status)
         )
 
+    def requires_source_repair(
+        self,
+        control_state: AgentControlState,
+    ) -> bool:
+        return (
+            self.requires_repair(control_state)
+            and self.repair_target is not None
+            and self.repair_target.requires_source_edit
+        )
+
     def recovery_active(self, control_state: AgentControlState) -> bool:
         if control_state is AgentControlState.READY_TO_VERIFY:
             return True

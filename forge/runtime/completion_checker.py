@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 import hashlib
+from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
+import re
 
 from forge.context.working import WorkingState
 from forge.runtime.acceptance import AcceptanceLedger
@@ -119,6 +121,17 @@ class CompletionChecker:
             )
         task_kind = str(metadata.get('task_kind', ''))
         reasons: list[str] = []
+        declaration_status = str(metadata.get('status', ''))
+        remaining_work = tuple(
+            str(item).strip()
+            for item in metadata.get('remaining_work', [])
+            if str(item).strip()
+        )
+        if declaration_status in {'completed', 'task_completed'} and remaining_work:
+            reasons.append(
+                'The structured finish declaration still has remaining work: '
+                + ', '.join(remaining_work)
+            )
         changed_paths = self.tracker.changed_paths if self.tracker else ()
         if change_required and task_kind != 'change' and not changed_paths:
             reasons.append(
@@ -148,6 +161,21 @@ class CompletionChecker:
                 'The workspace changed during this turn; declare '
                 'task_kind=change and provide current verification evidence.'
             )
+        if declaration_status in {
+            'progressed',
+            'step_completed',
+            'partially_completed',
+        }:
+            if not remaining_work:
+                reasons.append(
+                    'A non-terminal finish outcome requires structured '
+                    'remaining_work.'
+                )
+            if task_kind == 'change' and mutation_attempted and not changed_paths:
+                reasons.append(
+                    'A workspace write was attempted but produced no final Diff.'
+                )
+            return tuple(dict.fromkeys(reasons))
         if task_kind == 'change':
             if self.tracker is None or self.gate is None:
                 reasons.append(
@@ -176,6 +204,7 @@ class CompletionChecker:
                 tuple(gap_report.get('pending_deliverables', ()))
                 + tuple(gap_report.get('missing_criteria', ()))
                 + tuple(gap_report.get('pending_plan_steps', ()))
+                + tuple(gap_report.get('pending_plan_deliverables', ()))
                 + tuple(gap_report.get('missing_verification', ()))
                 + tuple(gap_report.get('unresolved_repair_target', ()))
             )
@@ -207,6 +236,11 @@ class CompletionChecker:
         ledger_report = self.acceptance_ledger.gap_report()
         pending_steps = tuple(
             step.title for step in task.steps if step.status != 'completed'
+        )
+        pending_plan_deliverables = _pending_plan_deliverables(
+            task.steps,
+            changed_paths=changed_paths,
+            evidence_paths=evidence_paths,
         )
         current_classification = (
             self.tracker.classifier.classify(
@@ -263,6 +297,7 @@ class CompletionChecker:
             'missing_criteria': missing_criteria,
             'missing_evidence': tuple(ledger_report['missing_evidence']),
             'pending_plan_steps': pending_steps,
+            'pending_plan_deliverables': pending_plan_deliverables,
             'missing_verification': missing_verification,
             'unresolved_repair_target': unresolved_repair_target,
             'unrelated_changes': unrelated,
@@ -517,6 +552,65 @@ def _deliverable_status(
         else:
             pending.append(deliverable)
     return tuple(completed), tuple(pending)
+
+
+def _pending_plan_deliverables(
+    steps: tuple[object, ...],
+    *,
+    changed_paths: tuple[str, ...],
+    evidence_paths: tuple[str, ...],
+) -> tuple[str, ...]:
+    available_paths = {
+        path.replace('\\', '/') for path in (*changed_paths, *evidence_paths)
+    }
+    pending: list[str] = []
+    for step in steps:
+        if getattr(step, 'status', '') != 'completed':
+            continue
+        title = str(getattr(step, 'title', 'step'))
+        step_evidence = tuple(
+            str(item).replace('\\', '/')
+            for item in getattr(step, 'evidence', ())
+        )
+        for deliverable in getattr(step, 'deliverables', ()):
+            value = str(deliverable).strip()
+            if not value:
+                continue
+            if not _deliverable_matches_evidence(
+                value,
+                paths=available_paths,
+                step_evidence=step_evidence,
+            ):
+                pending.append(f'{title}: {value}')
+    return tuple(dict.fromkeys(pending))
+
+
+def _deliverable_matches_evidence(
+    deliverable: str,
+    *,
+    paths: set[str],
+    step_evidence: tuple[str, ...],
+) -> bool:
+    normalized = deliverable.replace('\\', '/').strip()
+    if (
+        '/' in normalized
+        or '*' in normalized
+        or PurePosixPath(normalized).suffix
+    ):
+        candidates = (*paths, *step_evidence)
+        return any(
+            candidate == normalized
+            or fnmatchcase(candidate, normalized)
+            or fnmatchcase(normalized, candidate)
+            for candidate in candidates
+        )
+    terms = tuple(
+        token
+        for token in re.findall(r'[A-Za-z0-9_\u4e00-\u9fff]+', normalized.casefold())
+        if len(token) >= 3
+    )
+    evidence_text = ' '.join(step_evidence).casefold()
+    return bool(terms and all(term in evidence_text for term in terms))
 
 
 def _missing_verification(

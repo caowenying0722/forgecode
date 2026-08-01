@@ -65,6 +65,7 @@ class ToolBatchState:
     workspace_writes: list[
         tuple[int, ToolCall, ToolResult, bool]
     ] = field(default_factory=list)
+    new_source_paths: list[str] = field(default_factory=list)
     last_workspace_change_position: int = -1
     task_progressed: bool = False
     evidence_progressed: bool = False

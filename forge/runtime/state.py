@@ -77,7 +77,15 @@ class VerificationEvidence:
         return self.workspace_revision if self.source_revision is None else self.source_revision
 
 
-TaskStatus = Literal['completed', 'blocked', 'stuck', 'failed']
+TaskStatus = Literal[
+    'completed',
+    'progressed',
+    'step_completed',
+    'partially_completed',
+    'blocked',
+    'stuck',
+    'failed',
+]
 
 
 @dataclass(frozen=True, slots=True)

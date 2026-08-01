@@ -150,6 +150,7 @@ from forge.runtime.verification import verification_status_requires_repair
 from forge.sessions.store import SessionStore
 from forge.tasks.manager import TaskManager
 from forge.tools.base import ToolRegistry, ToolResult
+from forge.tools.artifacts import CleanupVerificationArtifactsTool
 from forge.tools.shell import RunCommandTool
 from forge.tools.subagent import TaskSubagentTool
 from forge.tools.task import create_task_tools
@@ -368,6 +369,17 @@ class Conversation:
                         background_manager=self.background_manager,
                         workspace_tracker=tracker,
                         verification_ledger=self.verification_ledger,
+                    )
+                )
+            if (
+                'cleanup_verification_artifacts' in registry.names
+                and tracker is not None
+            ):
+                registry.replace(
+                    CleanupVerificationArtifactsTool(
+                        resolved_context_root,
+                        tracker,
+                        self.verification_ledger,
                     )
                 )
             for task_tool in create_task_tools(
@@ -1336,6 +1348,7 @@ class Conversation:
                     change = await self.workspace_tracker.refresh()
                     if change is not None and change.paths:
                         if change.source_paths:
+                            batch.new_source_paths.extend(change.source_paths)
                             self.working_state.advance_revision(
                                 change.source_revision,
                                 change.source_paths,
@@ -1844,6 +1857,7 @@ class Conversation:
                         if change.source_paths or task_changed_paths:
                             batch.last_workspace_change_position = tool_position
                         if change.source_paths:
+                            batch.new_source_paths.extend(change.source_paths)
                             self.working_state.advance_revision(
                                 change.source_revision,
                                 change.source_paths,
@@ -2197,8 +2211,10 @@ class Conversation:
                 )
                 if declaration_status == 'blocked':
                     self.task_manager.block(blocked_reasons)
-                else:
+                elif declaration_status in {'completed', 'task_completed'}:
                     self.task_manager.complete()
+                else:
+                    self.task_manager.continue_next_turn()
                 self.messages[:] = request_messages
                 self.context.capture_explicit_memory(prompt)
                 yield TurnCompleted(
@@ -2212,6 +2228,8 @@ class Conversation:
                             'blocked'
                             if declaration_status == 'blocked'
                             else 'completed'
+                            if declaration_status in {'completed', 'task_completed'}
+                            else declaration_status  # type: ignore[arg-type]
                         ),
                         changed_paths=(
                             self.workspace_tracker.changed_paths
@@ -2240,35 +2258,34 @@ class Conversation:
                 had_required_verification_repair = (
                     verification_state.requires_repair(runtime.control_state)
                 )
-                verification_repair_relevant = True
+                verification_repair_progressed = False
                 if (
-                    verification_state.requires_repair(runtime.control_state)
+                    had_required_verification_repair
                     and self.workspace_tracker is not None
+                    and verification_state.repair_target is not None
                 ):
-                    repair_patterns = (
-                        (
-                            *verification_state.repair_target.paths,
-                            *verification_state.repair_target.direct_dependencies,
+                    verification_repair_progressed = (
+                        self.recovery_manager.repair_progressed(
+                            verification_state.repair_target,
+                            source_revision=getattr(
+                                self.workspace_tracker,
+                                'source_revision',
+                                self.workspace_tracker.revision,
+                            ),
+                            changed_paths=tuple(
+                                dict.fromkeys(batch.new_source_paths)
+                            ),
                         )
-                        if verification_state.repair_target is not None
-                        else self._static_task_scope_patterns(task_contract)
                     )
-                    verification_repair_relevant = evaluate_change_relevance(
-                        self.workspace_tracker.changed_paths,
-                        TaskScope(patterns=repair_patterns),
-                    ).relevant
-                verification_repair_progressed = (
-                    verification_state.requires_repair(runtime.control_state)
-                    and self.workspace_tracker is not None
-                    and verification_state.failed_revision is not None
-                    and getattr(
-                        self.workspace_tracker,
-                        'source_revision',
-                        self.workspace_tracker.revision,
-                    )
-                    > verification_state.failed_revision
-                    and verification_repair_relevant
-                )
+                    if (
+                        verification_state.repair_target.recovery_kind
+                        == 'artifact_recovery'
+                    ):
+                        verification_repair_progressed = any(
+                            result.metadata.get('artifact_cleanup') is True
+                            for _, result in batch.results
+                            if result.success
+                        )
                 edit_recovery.failure_count = 0
                 edit_recovery.failures.clear()
                 edit_recovery.read_used = False

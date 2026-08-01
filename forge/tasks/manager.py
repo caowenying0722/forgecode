@@ -189,6 +189,15 @@ class TaskManager:
             self.store.save(self.active)
         return self.active
 
+    def continue_next_turn(self) -> ActiveTask | None:
+        '''Keep the active non-terminal task for the next user directive.'''
+        if self.active is None or self.active.status != 'in_progress':
+            return self.active
+        self._resume_next_turn = True
+        if self.active.planned:
+            self.store.save(self.active)
+        return self.active
+
     def block(self, reasons: tuple[str, ...]) -> ActiveTask | None:
         if self.active is None:
             return None

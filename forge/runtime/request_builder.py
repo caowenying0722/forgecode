@@ -145,6 +145,11 @@ class RequestBuilder:
                     read_budget=read_budget,
                 ),
                 verify_available=not _verification_fix_required(state),
+                recovery_kind=(
+                    target.recovery_kind
+                    if target is not None
+                    else 'source_repair'
+                ),
             )
         if (
             control_state is AgentControlState.TARGETED_ANALYSIS
@@ -546,7 +551,7 @@ def _verification_recovery_active(state: RequestState) -> bool:
 
 def _verification_fix_required(state: RequestState) -> bool:
     if state.runtime is not None:
-        return state.runtime.verification.requires_repair(
+        return state.runtime.verification.requires_source_repair(
             state.runtime.control_state
         )
     return False

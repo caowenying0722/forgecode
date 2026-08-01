@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from forge.context.working import WorkingState
 from forge.runtime.completion import (
     CompletionGate,
     TaskPolicy,
@@ -28,6 +29,7 @@ from forge.runtime.workspace_classification import (
 )
 from forge.tasks.manager import TaskManager
 from forge.tools.filesystem import CreateDirectoryTool
+from forge.tools.base import ToolResult
 from forge.tools.verify import VerifyTool
 
 
@@ -208,22 +210,18 @@ def test_invalid_scope_hints_leave_scope_unconstrained() -> None:
     assert scope.constrained is False
 
 
-def test_game_scaffold_paths_are_allowed_for_game_goal() -> None:
-    scope = infer_task_scope('使用 Phaser 创建游戏')
+def test_unknown_domain_goal_does_not_infer_keyword_specific_scope() -> None:
+    scope = infer_task_scope('Implement the orbital telemetry reconciler')
     paths = (
         'package.json',
-        'tsconfig.json',
-        'vite.config.ts',
-        'index.html',
-        'src/game/scenes/MainScene.ts',
-        'src/game/entities/Player.ts',
-        'src/game/systems/CollisionSystem.ts',
-        'src/game/configs/game.ts',
-        'tests/game.test.ts',
-        'public/assets/player.png',
-        'assets/sfx.wav',
+        'src/orbit/reconcile.py',
+        'firmware/telemetry.c',
+        'tests/test_orbit.py',
+        'docs/protocol.md',
     )
 
+    assert scope.constrained is False
+    assert 'domain_default' not in scope.source_labels
     assert all(
         evaluate_change_relevance((path,), scope).relevant
         for path in paths
@@ -1515,6 +1513,141 @@ def test_old_side_effects_do_not_create_sticky_completion_failure(
     )
 
     assert decision.allowed is True
+
+
+def test_active_plan_deliverables_are_checked_before_task_completion(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    player = tmp_path / 'src' / 'Player.ts'
+    player.parent.mkdir()
+    player.write_text('old\n', encoding='utf-8')
+    subprocess.run(['git', 'add', '.'], cwd=tmp_path, check=True)
+    subprocess.run(['git', 'commit', '--quiet', '-m', 'game'], cwd=tmp_path, check=True)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    player.write_text('implemented\n', encoding='utf-8')
+    run(tracker.refresh())
+    manager = TaskManager(tmp_path)
+    manager.begin_turn('实现 Player 和 Enemy 的完整战斗行为')
+    manager.plan(
+        ['Implement player', 'Implement enemy'],
+        step_deliverables={
+            'step-1': ('src/Player.ts',),
+            'step-2': ('src/Enemy.ts',),
+        },
+    )
+    manager.update_step('step-1', 'completed', evidence=['src/Player.ts'])
+    manager.update_step('step-2', 'completed', evidence=['build passed'])
+    checker = CompletionChecker(tracker, CompletionGate(tmp_path), manager)
+    finish = ToolResult.ok(
+        'completed',
+        metadata={
+            'finish_task': True,
+            'task_kind': 'change',
+            'status': 'completed',
+            'summary': 'Implemented Player and Enemy.',
+        },
+    )
+    verification = VerificationEvidence(
+        command='npm run build',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=tracker.source_revision,
+        source_revision=tracker.source_revision,
+        verification_type='build',
+    )
+
+    reasons = run(
+        checker.finish_rejection_reasons(
+            finish,
+            working_state=WorkingState(),
+            mutation_attempted=True,
+            change_required=True,
+            verification=verification,
+            evidence_paths=('src/Player.ts',),
+        )
+    )
+
+    assert reasons
+    assert checker.last_finish_gap_report['pending_plan_deliverables'] == (
+        'Implement enemy: src/Enemy.ts',
+    )
+
+
+def test_partial_step_is_not_task_completed(tmp_path: Path) -> None:
+    manager = TaskManager(tmp_path)
+    task = manager.begin_turn('实现四项玩法')
+    manager.plan(['Types and input', 'Combat loop'])
+    manager.update_step('step-1', 'completed', evidence=['src/types.ts'])
+
+    active = manager.active
+
+    assert active is not None
+    assert active.id == task.id
+    assert active.status == 'in_progress'
+    assert active.steps[0].status == 'completed'
+    assert active.steps[1].status == 'in_progress'
+
+
+def test_step_completed_and_task_completed_are_distinct(tmp_path: Path) -> None:
+    manager = TaskManager(tmp_path)
+    manager.begin_turn('实现两步功能')
+    manager.plan(['Step one', 'Step two'])
+
+    manager.update_step('step-1', 'completed', evidence=['src/one.py'])
+
+    assert manager.active is not None
+    assert manager.active.status == 'in_progress'
+    assert manager.active.steps[0].status == 'completed'
+
+
+def test_completed_summary_cannot_declare_core_work_remains(
+    tmp_path: Path,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    (tmp_path / 'sample.txt').write_text('changed\n', encoding='utf-8')
+    run(tracker.refresh())
+    manager = TaskManager(tmp_path)
+    manager.begin_turn('实现移动、射击、敌人与碰撞')
+    checker = CompletionChecker(tracker, CompletionGate(tmp_path), manager)
+    finish = ToolResult.ok(
+        'completed',
+        metadata={
+            'finish_task': True,
+            'task_kind': 'change',
+            'status': 'completed',
+            'summary': '类型修复完成；下一步再实现自动射击和碰撞。',
+            'remaining_work': ['实现自动射击', '实现碰撞'],
+        },
+    )
+    verification = VerificationEvidence(
+        command='python -m pytest -q',
+        cwd='.',
+        exit_code=0,
+        duration_seconds=0.1,
+        timed_out=False,
+        workspace_revision=tracker.source_revision,
+        source_revision=tracker.source_revision,
+        verification_type='test',
+    )
+
+    reasons = run(
+        checker.finish_rejection_reasons(
+            finish,
+            working_state=WorkingState(),
+            mutation_attempted=True,
+            change_required=True,
+            verification=verification,
+            evidence_paths=('sample.txt',),
+        )
+    )
+
+    assert any('structured finish declaration' in reason for reason in reasons)
 
 
 def test_new_npm_project_accepts_package_lock_as_supporting_config() -> None:

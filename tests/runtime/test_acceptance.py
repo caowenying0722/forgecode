@@ -311,6 +311,71 @@ def test_business_behavior_without_smoke_stays_partial() -> None:
     assert ledger.criteria['criterion-1'].status == 'partially_satisfied'
 
 
+def test_build_success_alone_does_not_satisfy_gameplay_acceptance() -> None:
+    ledger = AcceptanceLedger.from_contract(
+        change_contract(
+            criteria=(
+                'Player movement, enemy behavior, auto fire, and collision '
+                'have runtime smoke evidence.',
+            )
+        )
+    )
+    ledger.observe_source_change(('src/game.ts',), source_revision=1)
+    ledger.observe_verification(
+        VerificationEvidence(
+            command='npm run build',
+            cwd='.',
+            exit_code=0,
+            duration_seconds=0.1,
+            timed_out=False,
+            workspace_revision=1,
+            source_revision=1,
+            verification_type='build',
+        )
+    )
+
+    assert ledger.criteria['criterion-1'].status != 'satisfied'
+
+
+def test_unknown_domain_acceptance_uses_declared_evidence_type() -> None:
+    ledger = AcceptanceLedger.from_contract(
+        change_contract(
+            criteria=(
+                'Orbital telemetry reconciliation has runtime smoke evidence.',
+            )
+        )
+    )
+    ledger.observe_source_change(('src/orbit.py',), source_revision=1)
+    ledger.observe_verification(
+        VerificationEvidence(
+            command='python -m compileall src',
+            cwd='.',
+            exit_code=0,
+            duration_seconds=0.1,
+            timed_out=False,
+            workspace_revision=1,
+            source_revision=1,
+            verification_type='build',
+        )
+    )
+    assert ledger.criteria['criterion-1'].status == 'partially_satisfied'
+
+    ledger.observe_verification(
+        VerificationEvidence(
+            command='python -m pytest tests/smoke',
+            cwd='.',
+            exit_code=0,
+            duration_seconds=0.1,
+            timed_out=False,
+            workspace_revision=1,
+            source_revision=1,
+            verification_type='smoke',
+        )
+    )
+
+    assert ledger.criteria['criterion-1'].status == 'satisfied'
+
+
 def test_finish_task_gap_report_names_missing_criterion(tmp_path: Path) -> None:
     manager = TaskManager(tmp_path)
     manager.begin_turn('Implement behavior')

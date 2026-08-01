@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from forge.tools.artifacts import CleanupVerificationArtifactsTool
 from forge.tools.base import ToolRegistry
 from forge.tools.filesystem import (
     CreateDirectoryTool,
@@ -48,6 +49,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
             ApplyPatchTool(root),
             RunCommandTool(root),
             VerifyTool(root, tracker),
+            CleanupVerificationArtifactsTool(root, tracker),
             GitStatusTool(root),
             GitDiffTool(root),
             *create_task_graph_tools(root),
@@ -63,6 +65,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
 
 __all__ = [
     'ApplyPatchTool',
+    'CleanupVerificationArtifactsTool',
     'CreateDirectoryTool',
     'FindFilesTool',
     'FinishTaskTool',

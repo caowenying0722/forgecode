@@ -955,6 +955,126 @@ def test_invalid_verify_does_not_create_source_repair_target() -> None:
     )
 
 
+def test_artifact_recovery_does_not_require_source_edit() -> None:
+    recovery = RecoveryManager(
+        [{'name': 'verify'}, {'name': 'write_file'}],
+        EffectByName({'write_file'}),
+        read_tools=frozenset(),
+        excluded_write_tools=frozenset(),
+    )
+    result = ToolResult.fail(
+        'verification_side_effect',
+        'Build output integrity changed.',
+        metadata={
+            'verification_status': 'failed',
+            'generated_artifact_paths': ['dist/index.html'],
+            'artifact_deltas': [{'path': 'dist/index.html'}],
+        },
+    )
+
+    target = recovery.verification_repair_target_from_result(
+        result,
+        changed_paths=('src/app.ts',),
+    )
+    tools = recovery.verification_tools(
+        fix_available=True,
+        scope=RecoveryScope.verification(read_count=0, read_budget=1),
+        recovery_kind=target.recovery_kind,
+    )
+
+    assert target.recovery_kind == 'artifact_recovery'
+    assert target.requires_source_edit is False
+    assert 'write_file' not in {tool['name'] for tool in tools or ()}
+
+
+def test_verification_command_recovery_does_not_require_source_edit() -> None:
+    recovery = RecoveryManager(
+        [{'name': 'verify'}, {'name': 'write_file'}],
+        EffectByName({'write_file'}),
+        read_tools=frozenset(),
+        excluded_write_tools=frozenset(),
+    )
+    result = ToolResult.fail(
+        'verification_command_invalid',
+        'Invalid verification command.',
+        metadata={'verification_status': 'invalid'},
+    )
+
+    target = recovery.verification_repair_target_from_result(
+        result,
+        changed_paths=('src/app.ts',),
+    )
+
+    assert target.recovery_kind == 'verification_command_repair'
+    assert target.requires_source_edit is False
+
+
+def test_source_compile_failure_still_requires_source_repair() -> None:
+    recovery = RecoveryManager(
+        [{'name': 'read_file'}],
+        None,
+        read_tools=frozenset({'read_file'}),
+        excluded_write_tools=frozenset(),
+    )
+    result = ToolResult.fail(
+        'verification_failed',
+        'TypeScript compilation failed.',
+        content="src/app.ts:12: error TS2304: Cannot find name 'missingValue'.",
+        metadata={'verification_status': 'failed', 'source_revision': 1},
+    )
+
+    target = recovery.verification_repair_target_from_result(
+        result,
+        changed_paths=('src/app.ts',),
+    )
+
+    assert target.recovery_kind == 'source_repair'
+    assert target.requires_source_edit is True
+
+
+def test_model_cannot_escape_artifact_recovery_with_unrelated_source_edit() -> None:
+    recovery = RecoveryManager(
+        [],
+        None,
+        read_tools=frozenset(),
+        excluded_write_tools=frozenset(),
+    )
+    result = ToolResult.fail(
+        'verification_side_effect',
+        'Build artifact recovery is required.',
+        metadata={
+            'verification_status': 'failed',
+            'source_revision': 1,
+            'generated_artifact_paths': ['dist/index.html'],
+        },
+    )
+    target = recovery.verification_repair_target_from_result(
+        result,
+        changed_paths=('src/app.ts',),
+    )
+
+    progressed = recovery.repair_progressed(
+        target,
+        source_revision=2,
+        changed_paths=('src/unrelated.ts',),
+    )
+
+    assert progressed is False
+
+
+def test_summary_recovery_does_not_open_source_write_tools() -> None:
+    recovery = RecoveryManager(
+        [{'name': 'finish_task'}, {'name': 'write_file'}, {'name': 'verify'}],
+        EffectByName({'write_file'}),
+        read_tools=frozenset(),
+        excluded_write_tools=frozenset(),
+    )
+
+    tools = recovery.finalization_tools()
+
+    assert {tool['name'] for tool in tools or ()} == {'finish_task'}
+
+
 def test_recovery_manager_extracts_ts2305_repair_target() -> None:
     recovery = RecoveryManager(
         [{'name': 'read_file'}],

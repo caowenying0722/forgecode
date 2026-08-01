@@ -54,39 +54,6 @@ PROJECT_SUPPORT_PATTERNS = (
 PACKAGE_LOCKFILE_PATHS = frozenset(
     {'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'}
 )
-GAME_SCOPE_PATTERNS = (
-    'game/**',
-    'play/**',
-    'src/game/**',
-    'src/**/game/**',
-    'src/**/scenes/**',
-    'src/**/entities/**',
-    'src/**/systems/**',
-    'src/**/components/**',
-    'src/**/physics/**',
-    'src/**/assets/**',
-    'public/assets/**',
-    'assets/**',
-    *PROJECT_SUPPORT_PATTERNS,
-)
-GENERIC_CODE_SCOPE_PATTERNS = (
-    'src/**',
-    'lib/**',
-    'app/**',
-    'packages/**',
-    'components/**',
-    'server/**',
-    'client/**',
-    *PROJECT_SUPPORT_PATTERNS,
-)
-GAME_TERMS = re.compile(
-    r'(?i)(?:game|phaser|scene|player|enemy|collision|sprite|'
-    r'游戏|场景|玩家|敌人|碰撞|骨架)'
-)
-CODE_TERMS = re.compile(
-    r'(?i)(?:code|source|src|test|tests|build|lint|typecheck|'
-    r'代码|源码|测试|构建)'
-)
 PATH_TOKEN = re.compile(
     r'(?<![\w.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.*{}@()[\]-]*'
 )
@@ -130,7 +97,6 @@ PatternSource = Literal[
     'scope_hint',
     'allowed_path',
     'evidence',
-    'domain_default',
 ]
 
 
@@ -210,15 +176,6 @@ def infer_task_scope(
             source='evidence',
         )
     )
-
-    if GAME_TERMS.search(goal):
-        entries.extend(
-            _pattern_entries(GAME_SCOPE_PATTERNS, source='domain_default')
-        )
-    elif CODE_TERMS.search(goal):
-        entries.extend(
-            _pattern_entries(GENERIC_CODE_SCOPE_PATTERNS, source='domain_default')
-        )
 
     return _dedupe_scope(entries)
 
