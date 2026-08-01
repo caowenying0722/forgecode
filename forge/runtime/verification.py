@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path, PurePath
 import re
+import shlex
 from typing import Literal
 
 from forge.runtime.workspace_classification import (
@@ -98,6 +99,290 @@ class VerificationTransaction:
             'before_snapshot_id': self.before_snapshot_id,
             'after_snapshot_id': self.after_snapshot_id,
         }
+
+
+class ProjectCommandResolutionError(ValueError):
+    '''Structured package-script resolution failure.'''
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        path: Path | None = None,
+        script_chain: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.path = path
+        self.script_chain = script_chain
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedProjectCommand:
+    '''Static expansion of a project command into validation semantics.'''
+
+    invoked_command: str
+    effective_commands: tuple[str, ...]
+    verification_types: tuple[str, ...]
+    artifact_scope: VerificationArtifactScope
+    script_chain: tuple[str, ...]
+
+
+_PACKAGE_MANAGERS = frozenset({'npm', 'pnpm', 'yarn', 'bun'})
+_MAX_SCRIPT_DEPTH = 12
+_MAX_PROJECT_COMMAND_LENGTH = 8_192
+
+
+def resolve_project_command(
+    command: str,
+    root: Path,
+) -> ResolvedProjectCommand:
+    '''Resolve package-manager scripts without executing project code.'''
+    invoked = command.strip()
+    if not invoked:
+        raise ProjectCommandResolutionError(
+            'empty_project_command',
+            'Project command is empty.',
+        )
+    if len(invoked) > _MAX_PROJECT_COMMAND_LENGTH:
+        raise ProjectCommandResolutionError(
+            'project_command_too_long',
+            'Project command exceeds the safe static analysis limit.',
+        )
+    resolved_root = root.resolve()
+    invocation = _package_script_invocation(invoked)
+    if invocation is None:
+        effective = (invoked,)
+        scope = _verification_artifact_scope_direct(
+            invoked,
+            root=resolved_root,
+            target='auto',
+        )
+        return ResolvedProjectCommand(
+            invoked_command=invoked,
+            effective_commands=effective,
+            verification_types=_effective_verification_types(effective),
+            artifact_scope=scope,
+            script_chain=effective,
+        )
+
+    manager, script = invocation
+    package_path = resolved_root / 'package.json'
+    try:
+        package_path.resolve().relative_to(resolved_root)
+    except ValueError as error:
+        raise ProjectCommandResolutionError(
+            'package_json_outside_workspace',
+            'package.json resolves outside the project root.',
+            path=package_path,
+        ) from error
+    try:
+        payload = json.loads(package_path.read_text(encoding='utf-8'))
+    except FileNotFoundError as error:
+        raise ProjectCommandResolutionError(
+            'missing_package_json',
+            f'No package.json exists for {invoked!r}.',
+            path=package_path,
+        ) from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise ProjectCommandResolutionError(
+            'invalid_package_json',
+            f'Cannot parse package.json: {error}',
+            path=package_path,
+        ) from error
+    if not isinstance(payload, dict):
+        raise ProjectCommandResolutionError(
+            'invalid_package_json',
+            'package.json must contain a JSON object.',
+            path=package_path,
+        )
+    raw_scripts = payload.get('scripts', {})
+    if not isinstance(raw_scripts, dict):
+        raise ProjectCommandResolutionError(
+            'invalid_package_json',
+            'package.json scripts must be an object.',
+            path=package_path,
+        )
+    scripts = {
+        str(name): value.strip()
+        for name, value in raw_scripts.items()
+        if isinstance(value, str) and value.strip()
+    }
+    chain = [invoked]
+    effective: list[str] = []
+    _expand_package_script(
+        manager=manager,
+        script=script,
+        scripts=scripts,
+        chain=chain,
+        effective=effective,
+        active=(),
+        depth=0,
+        include_invocation=False,
+        package_path=package_path,
+    )
+    verification_types = list(_effective_verification_types(tuple(effective)))
+    declared_type = _script_verification_type(script)
+    if declared_type and declared_type not in verification_types:
+        verification_types.append(declared_type)
+    target = (
+        declared_type
+        if declared_type in {'build', 'test', 'lint', 'typecheck'}
+        else 'auto'
+    )
+    combined = ' && '.join(effective) or invoked
+    return ResolvedProjectCommand(
+        invoked_command=invoked,
+        effective_commands=tuple(effective),
+        verification_types=tuple(verification_types),
+        artifact_scope=_verification_artifact_scope_direct(
+            combined,
+            root=resolved_root,
+            target=target,  # type: ignore[arg-type]
+        ),
+        script_chain=tuple(chain),
+    )
+
+
+def _expand_package_script(
+    *,
+    manager: str,
+    script: str,
+    scripts: dict[str, str],
+    chain: list[str],
+    effective: list[str],
+    active: tuple[str, ...],
+    depth: int,
+    include_invocation: bool,
+    package_path: Path,
+) -> None:
+    if depth >= _MAX_SCRIPT_DEPTH:
+        raise ProjectCommandResolutionError(
+            'package_script_depth_exceeded',
+            f'Package script expansion exceeded {_MAX_SCRIPT_DEPTH} levels.',
+            path=package_path,
+            script_chain=tuple(chain),
+        )
+    if script in active:
+        cycle = (*active, script)
+        raise ProjectCommandResolutionError(
+            'recursive_package_script',
+            'Recursive package script chain: ' + ' -> '.join(cycle),
+            path=package_path,
+            script_chain=tuple(chain),
+        )
+    if script not in scripts:
+        raise ProjectCommandResolutionError(
+            'missing_package_script',
+            f'package.json does not define script {script!r}.',
+            path=package_path,
+            script_chain=tuple(chain),
+        )
+    if include_invocation:
+        chain.append(f'{manager} run {script}')
+    next_active = (*active, script)
+    for lifecycle_script in (f'pre{script}', script, f'post{script}'):
+        content = scripts.get(lifecycle_script)
+        if content is None:
+            continue
+        if lifecycle_script != script:
+            chain.append(f'{manager} run {lifecycle_script}')
+        for segment in _shell_command_segments(content):
+            nested = _package_script_invocation(segment)
+            if nested is None:
+                chain.append(segment)
+                effective.append(segment)
+                continue
+            nested_manager, nested_script = nested
+            chain.append(segment)
+            _expand_package_script(
+                manager=nested_manager,
+                script=nested_script,
+                scripts=scripts,
+                chain=chain,
+                effective=effective,
+                active=next_active,
+                depth=depth + 1,
+                include_invocation=False,
+                package_path=package_path,
+            )
+
+
+def _shell_command_segments(command: str) -> tuple[str, ...]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|')
+        lexer.whitespace_split = True
+        lexer.commenters = ''
+        tokens = list(lexer)
+    except ValueError as error:
+        raise ProjectCommandResolutionError(
+            'invalid_package_script_command',
+            f'Cannot parse package script command: {error}',
+        ) from error
+    segments: list[str] = []
+    current: list[str] = []
+    for token in tokens:
+        if token and all(character in ';&|' for character in token):
+            if current:
+                segments.append(shlex.join(current))
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(shlex.join(current))
+    return tuple(segments)
+
+
+def _package_script_invocation(command: str) -> tuple[str, str] | None:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens or tokens[0].casefold() not in _PACKAGE_MANAGERS:
+        return None
+    manager = tokens[0].casefold()
+    arguments = [token for token in tokens[1:] if token != '--if-present']
+    if not arguments:
+        return None
+    if manager == 'npm' and arguments[0] == 'test':
+        return manager, 'test'
+    if arguments[0] == 'run' and len(arguments) >= 2:
+        return manager, arguments[1]
+    if manager in {'pnpm', 'yarn'} and not arguments[0].startswith('-'):
+        return manager, arguments[0]
+    return None
+
+
+def _effective_verification_types(
+    commands: tuple[str, ...],
+) -> tuple[str, ...]:
+    kinds: list[str] = []
+    for command in commands:
+        lowered = command.casefold()
+        if re.search(r'\btsc\b.*(?:--noemit|--no-emit)', lowered):
+            kind = 'typecheck'
+        elif re.search(r'\b(?:vite|webpack|rollup|parcel)\s+build\b', lowered):
+            kind = 'build'
+        elif re.search(r'\b(?:pytest|vitest|jest|mocha)\b', lowered):
+            kind = 'test'
+        elif re.search(r'\b(?:eslint|ruff|clippy)\b', lowered):
+            kind = 'lint'
+        else:
+            candidate = _verification_type(lowered, 'auto')
+            kind = '' if candidate == 'auto' else candidate
+        if kind and kind not in kinds:
+            kinds.append(kind)
+    return tuple(kinds)
+
+
+def _script_verification_type(script: str) -> str:
+    normalized = script.casefold()
+    if normalized in {'typecheck', 'type-check', 'check-types'}:
+        return 'typecheck'
+    if normalized in {'build', 'test', 'lint'}:
+        return normalized
+    return ''
 
 
 def normalize_verification_status(
@@ -260,6 +545,21 @@ def verification_artifact_scope(
     target: ValidationTarget = 'auto',
 ) -> VerificationArtifactScope:
     '''Return declarative side-effect rules for a validation command.'''
+    if _package_script_invocation(command.strip()) is not None:
+        return resolve_project_command(command, root).artifact_scope
+    return _verification_artifact_scope_direct(
+        command,
+        root=root,
+        target=target,
+    )
+
+
+def _verification_artifact_scope_direct(
+    command: str,
+    *,
+    root: Path,
+    target: ValidationTarget = 'auto',
+) -> VerificationArtifactScope:
     normalized = command.strip()
     lowered = normalized.casefold()
     rules: list[ArtifactRule] = []
@@ -360,6 +660,7 @@ def verification_cache_key(
     command: str,
     cwd: str,
     scope: VerificationArtifactScope,
+    resolved_commands: tuple[str, ...] = (),
 ) -> tuple[object, ...]:
     return (
         source_revision,
@@ -367,6 +668,7 @@ def verification_cache_key(
         cwd.replace('\\', '/'),
         scope.verification_type,
         tuple((rule.pattern, rule.kind) for rule in scope.allowed_writes),
+        resolved_commands,
         NON_INTERACTIVE_ENV_KEY,
     )
 

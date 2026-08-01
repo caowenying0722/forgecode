@@ -5,19 +5,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
-from time import time
 from typing import TYPE_CHECKING
 
 from pydantic import Field
 
 from forge.runtime.verification import (
-    NON_INTERACTIVE_ENV,
-    VerificationTransaction,
     classify_verification_command,
     discover_validation_commands,
-    verification_artifact_scope,
-    verification_cache_key,
 )
+from forge.runtime.verification_executor import VerificationExecutor
 from forge.runtime.process import (
     ProcessResult,
     process_metadata,
@@ -228,182 +224,20 @@ class RunCommandTool(Tool[RunCommandInput]):
             return None
         command = arguments.command.strip()
         display_cwd = display_path(self.root, cwd)
-        source_revision = self.workspace_tracker.source_revision
-        filesystem_revision = self.workspace_tracker.filesystem_revision
-        scope = verification_artifact_scope(
-            command,
-            root=self.root,
-            target='auto',
-        )
-        key = verification_cache_key(
-            source_revision=source_revision,
+        return await VerificationExecutor(
+            self.root,
+            self.workspace_tracker,
+            self.verification_ledger,
+        ).execute(
             command=command,
-            cwd=display_cwd,
-            scope=scope,
-        )
-        reusable = self.verification_ledger.reusable(key)
-        if reusable is not None:
-            result = ToolResult.ok(
-                f'Reused verification evidence for source revision '
-                f'{source_revision}.',
-                content=reusable.stdout_stderr_summary,
-                metadata={
-                    'verification': True,
-                    'verification_reused': True,
-                    'verification_status': reusable.status,
-                    'verification_type': reusable.kind,
-                    'command': reusable.command,
-                    'command_id': reusable.target,
-                    'cwd': reusable.cwd,
-                    'workspace_revision': source_revision,
-                    'source_revision': source_revision,
-                    'filesystem_revision': filesystem_revision,
-                    'exit_code': reusable.exit_code,
-                    'duration_seconds': reusable.duration_seconds,
-                    'timed_out': reusable.timed_out,
-                    'verification_side_effect_paths': list(
-                        reusable.side_effect_paths
-                    ),
-                    'generated_artifact_paths': list(
-                        reusable.generated_artifact_paths
-                    ),
-                    'cache_paths': list(reusable.cache_paths),
-                    'generated_artifact_fingerprints': [
-                        list(item)
-                        for item in reusable.generated_artifact_fingerprints
-                    ],
-                    'cache_fingerprints': [
-                        list(item) for item in reusable.cache_fingerprints
-                    ],
-                    'verification_ledger_recorded': True,
-                },
-            )
-            self.verification_ledger.record_from_metadata(
-                result.metadata,
-                content=result.content,
-                evidence_source='cache',
-                reusable_key=key,
-            )
-            return result
-        started_at = time()
-        process = await run_process(
-            command,
             cwd=cwd,
+            display_cwd=display_cwd,
             timeout_seconds=arguments.timeout_seconds,
-            shell=True,
-            env=NON_INTERACTIVE_ENV,
-        )
-        change = await self.workspace_tracker.refresh(
-            origin='verification',
-            artifact_scope=scope,
-        )
-        if change is None:
-            raise ToolExecutionError(
-                'workspace_snapshot_unavailable',
-                'Verification completed, but the workspace delta could not '
-                'be captured.',
-            )
-        transaction = VerificationTransaction.from_workspace_change(
-            command=command,
-            cwd=display_cwd,
-            source_revision_before=source_revision,
-            filesystem_revision_before=filesystem_revision,
-            change=change,
-        )
-        classification = transaction.classification
-        verification_status = (
-            'timed_out'
-            if process.timed_out
-            else ('passed' if process.exit_code == 0 else 'failed')
-        )
-        side_effect_paths = classification.verification_side_effect_paths
-        if side_effect_paths and verification_status == 'passed':
-            verification_status = 'failed'
-        generated_artifact_fingerprints = _current_fingerprints(
-            self.workspace_tracker,
-            classification.generated_paths,
-        )
-        cache_fingerprints = _current_fingerprints(
-            self.workspace_tracker,
-            classification.cache_paths,
-        )
-        metadata = {
-            **process_metadata(process),
-            'command': command,
-            'cwd': display_cwd,
-            'stdin_characters': 0,
-            'verification': True,
-            'verification_status': verification_status,
-            'verification_type': scope.verification_type,
-            'command_id': 'run_command',
-            'workspace_revision': source_revision,
-            'source_revision': source_revision,
-            'filesystem_revision': self.workspace_tracker.filesystem_revision,
-            'verification_artifact_scope': [
-                {
-                    'pattern': rule.pattern,
-                    'kind': rule.kind,
-                    'description': rule.description,
-                }
-                for rule in scope.allowed_writes
-            ],
-            'verification_side_effect_paths': list(side_effect_paths),
-            'generated_artifact_paths': list(classification.generated_paths),
-            'cache_paths': list(classification.cache_paths),
-            'generated_artifact_fingerprints': [
-                list(item) for item in generated_artifact_fingerprints
-            ],
-            'cache_fingerprints': [list(item) for item in cache_fingerprints],
-            'verification_transaction': transaction.as_metadata(),
-            'verification_ledger_recorded': True,
-        }
-        content = render_process_output(process)
-        self.verification_ledger.record_from_metadata(
-            metadata,
-            content=content,
+            command_id='run_command',
+            target='auto',
             evidence_source='run_command',
-            reusable_key=key,
-            started_at=started_at,
-            finished_at=time(),
+            discovered_commands=discovered,
         )
-        if process.timed_out:
-            return ToolResult.fail(
-                'verification_timeout',
-                f'Verification timed out after {arguments.timeout_seconds:g}s.',
-                content=content,
-                metadata=metadata,
-            )
-        if process.exit_code != 0:
-            return ToolResult.fail(
-                'verification_failed',
-                f'Verification exited with code {process.exit_code}.',
-                content=content,
-                metadata=metadata,
-            )
-        if side_effect_paths:
-            return ToolResult.fail(
-                'verification_side_effect',
-                'Verification modified undeclared source or workspace paths: '
-                + ', '.join(side_effect_paths),
-                content=content,
-                metadata=metadata,
-            )
-        return ToolResult.ok(
-            f'Verification passed in {process.duration_seconds:.3f}s.',
-            content=content,
-            metadata=metadata,
-        )
-
-
-def _current_fingerprints(
-    tracker: 'WorkspaceTracker',
-    paths: tuple[str, ...],
-) -> tuple[tuple[str, str], ...]:
-    return tuple(
-        (path, tracker.current.files[path])
-        for path in paths
-        if path in tracker.current.files
-    )
 
 
 SCRIPT_WRITE_PATTERNS = (

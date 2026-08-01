@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+import forge.runtime.verification as verification_module
 from forge.runtime.process import ProcessResult
 from forge.runtime.verification import (
     choose_validation_command,
@@ -17,6 +18,7 @@ from forge.runtime.verification_ledger import VerificationLedger
 from forge.runtime.workspace import WorkspaceTracker
 from forge.tools.shell import RunCommandTool
 from forge.tools.verify import VerifyTool
+from forge.tools.base import ToolResult
 
 
 def run(coroutine: object):
@@ -306,7 +308,10 @@ def test_verify_no_change_uses_empty_classification(
     async def clean_process(*_args: object, **_kwargs: object) -> ProcessResult:
         return _successful_process()
 
-    monkeypatch.setattr('forge.tools.verify.run_process', clean_process)
+    monkeypatch.setattr(
+        'forge.runtime.verification_executor.run_process',
+        clean_process,
+    )
     result = run(
         VerifyTool(tmp_path, tracker).run({'command': 'git diff --check'})
     )
@@ -331,7 +336,10 @@ def test_run_command_no_change_uses_empty_classification(
     async def clean_process(*_args: object, **_kwargs: object) -> ProcessResult:
         return _successful_process()
 
-    monkeypatch.setattr('forge.tools.shell.run_process', clean_process)
+    monkeypatch.setattr(
+        'forge.runtime.verification_executor.run_process',
+        clean_process,
+    )
     result = run(
         RunCommandTool(
             tmp_path,
@@ -374,7 +382,7 @@ def test_typecheck_after_build_does_not_inherit_build_outputs(
             output.write_text('bundle\n', encoding='utf-8')
         return _successful_process()
 
-    monkeypatch.setattr('forge.tools.verify.run_process', process)
+    monkeypatch.setattr('forge.runtime.verification_executor.run_process', process)
     tool = VerifyTool(tmp_path, tracker, ledger)
     build = run(tool.run({'target': 'build'}))
     typecheck = run(
@@ -410,7 +418,7 @@ def test_failed_verification_does_not_contaminate_next_verification(
             return ProcessResult(2, '', 'type error', 0.01)
         return _successful_process()
 
-    monkeypatch.setattr('forge.tools.verify.run_process', process)
+    monkeypatch.setattr('forge.runtime.verification_executor.run_process', process)
     tool = VerifyTool(tmp_path, tracker, ledger)
     failed = run(tool.run({'command': 'npx tsc --noEmit'}))
     clean = run(tool.run({'command': 'git diff --check'}))
@@ -438,7 +446,7 @@ def test_clean_command_does_not_reuse_previous_side_effect_paths(
             return ProcessResult(2, '', 'type error', 0.01)
         return _successful_process()
 
-    monkeypatch.setattr('forge.tools.shell.run_process', process)
+    monkeypatch.setattr('forge.runtime.verification_executor.run_process', process)
     tool = RunCommandTool(
         tmp_path,
         workspace_tracker=tracker,
@@ -471,3 +479,237 @@ def test_empty_workspace_delta_is_a_first_class_transaction(
     assert change.before_snapshot_id == change.after_snapshot_id
     assert tracker.filesystem_revision == 0
     assert tracker.source_revision == 0
+
+
+def _write_package_json(root: Path, scripts: dict[str, str]) -> None:
+    import json
+
+    (root / 'package.json').write_text(
+        json.dumps({'scripts': scripts}),
+        encoding='utf-8',
+    )
+
+
+def test_explicit_npm_build_resolves_vite_artifact_scope(
+    tmp_path: Path,
+) -> None:
+    _write_package_json(
+        tmp_path,
+        {'build': 'tsc --noEmit && vite build'},
+    )
+
+    resolved = verification_module.resolve_project_command(
+        'npm run build',
+        tmp_path,
+    )
+
+    assert resolved.invoked_command == 'npm run build'
+    assert resolved.effective_commands == ('tsc --noEmit', 'vite build')
+    assert resolved.verification_types == ('typecheck', 'build')
+    assert 'dist/**' in resolved.artifact_scope.allowed_write_patterns
+
+
+def test_npm_test_resolves_test_script(tmp_path: Path) -> None:
+    _write_package_json(tmp_path, {'test': 'vitest run'})
+
+    resolved = verification_module.resolve_project_command('npm test', tmp_path)
+    explicit_run = verification_module.resolve_project_command(
+        'npm run test',
+        tmp_path,
+    )
+
+    assert resolved.effective_commands == ('vitest run',)
+    assert explicit_run.effective_commands == resolved.effective_commands
+    assert resolved.verification_types == ('test',)
+    assert 'coverage/**' in resolved.artifact_scope.allowed_write_patterns
+
+
+def _assert_package_manager_build_resolves(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    _write_package_json(tmp_path, {'build': 'vite build'})
+
+    resolved = verification_module.resolve_project_command(command, tmp_path)
+
+    assert resolved.invoked_command == command
+    assert resolved.effective_commands == ('vite build',)
+    assert resolved.verification_types == ('build',)
+    assert 'dist/**' in resolved.artifact_scope.allowed_write_patterns
+
+
+def test_pnpm_build_resolves_package_script(tmp_path: Path) -> None:
+    _assert_package_manager_build_resolves(tmp_path, 'pnpm build')
+    _assert_package_manager_build_resolves(tmp_path, 'pnpm run build')
+
+
+def test_yarn_build_resolves_package_script(tmp_path: Path) -> None:
+    _assert_package_manager_build_resolves(tmp_path, 'yarn run build')
+    _assert_package_manager_build_resolves(tmp_path, 'yarn build')
+
+
+def test_bun_run_build_resolves_package_script(tmp_path: Path) -> None:
+    _assert_package_manager_build_resolves(tmp_path, 'bun run build')
+
+
+def test_nested_package_scripts_are_resolved(tmp_path: Path) -> None:
+    _write_package_json(
+        tmp_path,
+        {'build': 'npm run compile', 'compile': 'vite build'},
+    )
+
+    resolved = verification_module.resolve_project_command(
+        'npm run build',
+        tmp_path,
+    )
+
+    assert resolved.effective_commands == ('vite build',)
+    assert resolved.script_chain == (
+        'npm run build',
+        'npm run compile',
+        'vite build',
+    )
+    assert 'dist/**' in resolved.artifact_scope.allowed_write_patterns
+
+
+def test_package_script_lifecycle_hooks_are_resolved_in_order(
+    tmp_path: Path,
+) -> None:
+    _write_package_json(
+        tmp_path,
+        {
+            'prebuild': 'eslint src',
+            'build': 'vite build',
+            'postbuild': 'vitest run',
+        },
+    )
+
+    resolved = verification_module.resolve_project_command(
+        'npm run build',
+        tmp_path,
+    )
+
+    assert resolved.effective_commands == (
+        'eslint src',
+        'vite build',
+        'vitest run',
+    )
+    assert resolved.script_chain == (
+        'npm run build',
+        'npm run prebuild',
+        'eslint src',
+        'vite build',
+        'npm run postbuild',
+        'vitest run',
+    )
+    assert resolved.verification_types == ('lint', 'build', 'test')
+
+
+def test_recursive_package_script_is_rejected(tmp_path: Path) -> None:
+    _write_package_json(
+        tmp_path,
+        {'build': 'npm run compile', 'compile': 'npm run build'},
+    )
+
+    with pytest.raises(Exception) as caught:
+        verification_module.resolve_project_command('npm run build', tmp_path)
+
+    assert getattr(caught.value, 'code', '') == 'recursive_package_script'
+    assert 'build' in str(caught.value)
+    assert 'compile' in str(caught.value)
+
+
+def test_missing_package_script_is_reported(tmp_path: Path) -> None:
+    _write_package_json(tmp_path, {'test': 'vitest run'})
+
+    with pytest.raises(Exception) as caught:
+        verification_module.resolve_project_command('npm run build', tmp_path)
+
+    assert getattr(caught.value, 'code', '') == 'missing_package_script'
+
+
+def test_invalid_package_json_is_reported_structurally(tmp_path: Path) -> None:
+    (tmp_path / 'package.json').write_text('{invalid', encoding='utf-8')
+
+    with pytest.raises(Exception) as caught:
+        verification_module.resolve_project_command('npm run build', tmp_path)
+
+    assert getattr(caught.value, 'code', '') == 'invalid_package_json'
+    assert getattr(caught.value, 'path', None) == tmp_path / 'package.json'
+
+
+def test_explicit_npm_build_and_auto_build_have_equivalent_artifact_scope(
+    tmp_path: Path,
+) -> None:
+    _write_package_json(
+        tmp_path,
+        {'build': 'tsc --noEmit && vite build'},
+    )
+    (tmp_path / 'tsconfig.json').write_text('{}', encoding='utf-8')
+    automatic = choose_validation_command(tmp_path, target='build')
+    assert automatic is not None
+
+    explicit = verification_module.resolve_project_command(
+        'npm run build',
+        tmp_path,
+    )
+    automatic_scope = verification_artifact_scope(
+        automatic.command,
+        root=tmp_path,
+        target='build',
+    )
+
+    assert explicit.artifact_scope.verification_type == (
+        automatic_scope.verification_type
+    )
+    assert explicit.artifact_scope.allowed_writes == automatic_scope.allowed_writes
+
+
+def test_verify_and_promoted_run_command_share_execution_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize_git_repository(tmp_path)
+    tracker = WorkspaceTracker(tmp_path)
+    run(tracker.begin_turn())
+    ledger = VerificationLedger()
+    from forge.runtime.verification_executor import VerificationExecutor
+
+    calls: list[tuple[type[object], str]] = []
+
+    async def execute(
+        self: object,
+        *,
+        command: str,
+        **_kwargs: object,
+    ) -> ToolResult:
+        calls.append((type(self), command))
+        return ToolResult.ok(
+            'verification passed',
+            metadata={
+                'verification': True,
+                'verification_status': 'passed',
+                'command': command,
+            },
+        )
+
+    monkeypatch.setattr(VerificationExecutor, 'execute', execute)
+    verify_result = run(
+        VerifyTool(tmp_path, tracker, ledger).run(
+            {'command': 'git diff --check'}
+        )
+    )
+    run_result = run(
+        RunCommandTool(
+            tmp_path,
+            workspace_tracker=tracker,
+            verification_ledger=ledger,
+        ).run({'command': 'git diff --check'})
+    )
+
+    assert verify_result.success is True
+    assert run_result.success is True
+    assert calls == [
+        (VerificationExecutor, 'git diff --check'),
+        (VerificationExecutor, 'git diff --check'),
+    ]

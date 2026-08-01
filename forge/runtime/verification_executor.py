@@ -1,0 +1,334 @@
+'''Single authoritative execution path for formal verification commands.'''
+
+from __future__ import annotations
+
+from pathlib import Path
+from time import time
+from typing import TYPE_CHECKING
+
+from forge.runtime.process import (
+    process_metadata,
+    render_process_output,
+    run_process,
+)
+from forge.runtime.verification import (
+    NON_INTERACTIVE_ENV,
+    ProjectCommandResolutionError,
+    ResolvedProjectCommand,
+    ValidationCommand,
+    ValidationTarget,
+    VerificationTransaction,
+    resolve_project_command,
+    verification_artifact_scope,
+    verification_cache_key,
+)
+from forge.runtime.workspace import WorkspaceTracker
+from forge.runtime.workspace_classification import (
+    ArtifactRule,
+    VerificationArtifactScope,
+)
+from forge.tools.base import ToolResult
+
+if TYPE_CHECKING:
+    from forge.runtime.verification_ledger import (
+        VerificationEvidenceSource,
+        VerificationLedger,
+    )
+
+
+class VerificationExecutor:
+    '''Execute, classify, cache, and record one formal verification.'''
+
+    def __init__(
+        self,
+        root: Path,
+        tracker: WorkspaceTracker,
+        ledger: VerificationLedger | None = None,
+    ) -> None:
+        self.root = root.resolve()
+        self.tracker = tracker
+        self.ledger = ledger
+
+    async def execute(
+        self,
+        *,
+        command: str,
+        cwd: Path,
+        display_cwd: str,
+        timeout_seconds: float,
+        command_id: str,
+        target: ValidationTarget,
+        evidence_source: VerificationEvidenceSource,
+        discovered_commands: tuple[ValidationCommand, ...] = (),
+    ) -> ToolResult:
+        source_revision = self.tracker.source_revision
+        filesystem_revision = self.tracker.filesystem_revision
+        try:
+            resolved = resolve_project_command(command, cwd)
+        except ProjectCommandResolutionError as error:
+            return ToolResult.fail(
+                error.code,
+                str(error),
+                metadata={
+                    'verification': True,
+                    'verification_status': 'invalid',
+                    'command': command,
+                    'command_id': command_id,
+                    'cwd': display_cwd,
+                    'workspace_revision': source_revision,
+                    'source_revision': source_revision,
+                    'filesystem_revision': filesystem_revision,
+                    'exit_code': -1,
+                    'duration_seconds': 0.0,
+                    'timed_out': False,
+                    'stderr': str(error),
+                    'resolution_error': {
+                        'code': error.code,
+                        'path': str(error.path) if error.path is not None else '',
+                        'script_chain': list(error.script_chain),
+                    },
+                },
+            )
+        scope = resolved.artifact_scope
+        if resolved.effective_commands == (command.strip(),):
+            scope = verification_artifact_scope(
+                command,
+                root=cwd,
+                target=target,
+            )
+            resolved = ResolvedProjectCommand(
+                invoked_command=resolved.invoked_command,
+                effective_commands=resolved.effective_commands,
+                verification_types=(
+                    resolved.verification_types
+                    or (
+                        (scope.verification_type,)
+                        if scope.verification_type != 'auto'
+                        else ()
+                    )
+                ),
+                artifact_scope=scope,
+                script_chain=resolved.script_chain,
+            )
+        workspace_scope = _workspace_relative_scope(
+            scope,
+            workspace_root=self.root,
+            command_cwd=cwd,
+        )
+        key = verification_cache_key(
+            source_revision=source_revision,
+            command=command,
+            cwd=display_cwd,
+            scope=workspace_scope,
+            resolved_commands=resolved.effective_commands,
+        )
+        cached = self.tracker.verification_cache.get(key)
+        if isinstance(cached, ToolResult):
+            reused = ToolResult.ok(
+                f'Reused verification evidence for source revision '
+                f'{source_revision}.',
+                content=cached.content,
+                metadata={
+                    **cached.metadata,
+                    'cache_hit': True,
+                    'verification_reused': True,
+                    'workspace_revision': source_revision,
+                    'source_revision': source_revision,
+                    'filesystem_revision': self.tracker.filesystem_revision,
+                },
+            )
+            if self.ledger is not None:
+                reused.metadata['verification_ledger_recorded'] = True
+                self.ledger.record_from_metadata(
+                    reused.metadata,
+                    content=reused.content,
+                    evidence_source='cache',
+                    reusable_key=key,
+                )
+            return reused
+
+        started_at = time()
+        process = await run_process(
+            command,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            shell=True,
+            env=NON_INTERACTIVE_ENV,
+        )
+        change = await self.tracker.refresh(
+            origin='verification',
+            artifact_scope=workspace_scope,
+        )
+        if change is None:
+            return ToolResult.fail(
+                'workspace_snapshot_unavailable',
+                'Verification completed, but the workspace delta could not '
+                'be captured.',
+                content=render_process_output(process),
+                metadata={
+                    **process_metadata(process),
+                    'verification': True,
+                    'verification_status': 'failed',
+                    'command': command,
+                    'command_id': command_id,
+                    'cwd': display_cwd,
+                    'workspace_revision': source_revision,
+                    'source_revision': source_revision,
+                    'filesystem_revision': filesystem_revision,
+                },
+            )
+        transaction = VerificationTransaction.from_workspace_change(
+            command=command,
+            cwd=display_cwd,
+            source_revision_before=source_revision,
+            filesystem_revision_before=filesystem_revision,
+            change=change,
+        )
+        classification = transaction.classification
+        verification_status = (
+            'timed_out'
+            if process.timed_out
+            else ('passed' if process.exit_code == 0 else 'failed')
+        )
+        side_effect_paths = classification.verification_side_effect_paths
+        if side_effect_paths and verification_status == 'passed':
+            verification_status = 'failed'
+        generated_fingerprints = _current_fingerprints(
+            self.tracker,
+            classification.generated_paths,
+        )
+        cache_fingerprints = _current_fingerprints(
+            self.tracker,
+            classification.cache_paths,
+        )
+        metadata = {
+            **process_metadata(process),
+            'command': command,
+            'invoked_command': resolved.invoked_command,
+            'effective_commands': list(resolved.effective_commands),
+            'verification_types': list(resolved.verification_types),
+            'script_chain': list(resolved.script_chain),
+            'command_id': command_id,
+            'cwd': display_cwd,
+            'workspace_revision': source_revision,
+            'source_revision': source_revision,
+            'filesystem_revision': self.tracker.filesystem_revision,
+            'verification': True,
+            'verification_status': verification_status,
+            'verification_type': workspace_scope.verification_type,
+            'verification_artifact_scope': [
+                {
+                    'pattern': rule.pattern,
+                    'kind': rule.kind,
+                    'description': rule.description,
+                }
+                for rule in workspace_scope.allowed_writes
+            ],
+            'verification_side_effect_paths': list(side_effect_paths),
+            'generated_artifact_paths': list(classification.generated_paths),
+            'cache_paths': list(classification.cache_paths),
+            'generated_artifact_fingerprints': [
+                list(item) for item in generated_fingerprints
+            ],
+            'cache_fingerprints': [list(item) for item in cache_fingerprints],
+            'verification_transaction': transaction.as_metadata(),
+            'source_revision_changed': (
+                self.tracker.source_revision != source_revision
+            ),
+            'available_validation_commands': [
+                {
+                    'id': item.id,
+                    'command': item.command,
+                    'target': item.target,
+                    'source': item.source,
+                }
+                for item in discovered_commands
+            ],
+        }
+        content = render_process_output(process)
+        if self.ledger is not None:
+            metadata['verification_ledger_recorded'] = True
+            self.ledger.record_from_metadata(
+                metadata,
+                content=content,
+                evidence_source=evidence_source,
+                reusable_key=key,
+                started_at=started_at,
+                finished_at=time(),
+            )
+        if process.timed_out:
+            return ToolResult.fail(
+                'verification_timeout',
+                f'Verification timed out after {timeout_seconds:g}s.',
+                content=content,
+                metadata=metadata,
+            )
+        if process.exit_code != 0:
+            return ToolResult.fail(
+                'verification_failed',
+                f'Verification exited with code {process.exit_code}.',
+                content=content,
+                metadata=metadata,
+            )
+        if side_effect_paths:
+            return ToolResult.fail(
+                'verification_side_effect',
+                'Verification modified undeclared source or workspace paths: '
+                + ', '.join(side_effect_paths),
+                content=content,
+                metadata=metadata,
+            )
+        passed = ToolResult.ok(
+            f'Verification passed in {process.duration_seconds:.3f}s.',
+            content=content,
+            metadata=metadata,
+        )
+        if workspace_scope.reusable:
+            self.tracker.verification_cache[key] = passed
+        return passed
+
+
+def _workspace_relative_scope(
+    scope: VerificationArtifactScope,
+    *,
+    workspace_root: Path,
+    command_cwd: Path,
+) -> VerificationArtifactScope:
+    relative = command_cwd.resolve().relative_to(workspace_root.resolve())
+    prefix = relative.as_posix().strip('.')
+    if not prefix:
+        return scope
+
+    def prefixed(pattern: str) -> str:
+        return f'{prefix}/{pattern.lstrip("/")}'
+
+    return VerificationArtifactScope(
+        verification_type=scope.verification_type,
+        read_patterns=tuple(prefixed(item) for item in scope.read_patterns),
+        allowed_writes=tuple(
+            ArtifactRule(
+                prefixed(rule.pattern),
+                rule.kind,
+                rule.description,
+            )
+            for rule in scope.allowed_writes
+        ),
+        forbidden_source_patterns=tuple(
+            prefixed(item) for item in scope.forbidden_source_patterns
+        ),
+        allow_network=scope.allow_network,
+        allow_dependency_install=scope.allow_dependency_install,
+        cleanup_generated=scope.cleanup_generated,
+        reusable=scope.reusable,
+    )
+
+
+def _current_fingerprints(
+    tracker: WorkspaceTracker,
+    paths: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (path, tracker.current.files[path])
+        for path in paths
+        if path in tracker.current.files
+    )
