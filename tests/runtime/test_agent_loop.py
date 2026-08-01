@@ -26,6 +26,7 @@ from forge.runtime.model_client import (
     ModelProtocolError,
 )
 from forge.runtime.process import ProcessResult
+from forge.runtime.verification_ledger import VerificationRecord
 from forge.runtime.state import (
     AgentPhaseChanged,
     ConversationEvent,
@@ -46,6 +47,7 @@ from forge.runtime.state import (
     ToolCall,
 )
 from forge.runtime.agent_state import AgentPhase
+from forge.tasks.state import SourceSection, TaskSpecDigest
 from forge.tools.base import Tool, ToolInput, ToolRegistry, ToolResult
 from forge.tools import create_default_registry
 from forge.tools.filesystem import ReadFileTool
@@ -426,6 +428,73 @@ def test_resume_does_not_restore_unsafe_verification_cache(
     assert tracker.verification_cache == {}
     assert conversation.verification_ledger.records == []
     assert conversation.verification_ledger.reusable_successes == {}
+
+
+def test_resume_injects_active_plan_and_next_step(tmp_path: Path) -> None:
+    conversation = Conversation(
+        client=FakeModelClient(streamed_response('saved')),
+        tools=[],
+        context_root=tmp_path,
+    )
+    conversation.task_manager.start('Implement the task document')
+    conversation.task_manager.plan(
+        ['Inspect requirements', 'Implement change', 'Run acceptance'],
+        scope_hints=['forge/runtime/**'],
+        task_spec_digest=TaskSpecDigest(
+            source_paths=('docs/task.md',),
+            goal='Implement the task document',
+            requirements=('Preserve current public interfaces.',),
+            acceptance_criteria=('The focused suite passes.',),
+            relevant_sections=(
+                SourceSection('docs/task.md', 12, 28, 'Acceptance'),
+            ),
+        ),
+    )
+    conversation.task_manager.update_step('step-1', 'completed')
+    conversation.verification_ledger.record(
+        VerificationRecord(
+            target='unit',
+            kind='test',
+            command='pytest -q tests/unit',
+            cwd='.',
+            status='passed',
+            exit_code=0,
+            source_revision=2,
+            filesystem_revision=2,
+            failure_signature='',
+        )
+    )
+    conversation.verification_ledger.record(
+        VerificationRecord(
+            target='typecheck',
+            kind='typecheck',
+            command='pyright forge',
+            cwd='.',
+            status='failed',
+            exit_code=1,
+            source_revision=2,
+            filesystem_revision=2,
+            failure_signature='failure',
+            stdout_stderr_summary='One type error remains.',
+        )
+    )
+    session_id = conversation.save_session()
+    client = FakeModelClient(streamed_response('continuing'))
+    resumed = Conversation(client=client, tools=[], context_root=tmp_path)
+    resumed.resume_session(session_id)
+
+    collect_turn(resumed, 'Continue the next step')
+
+    system = client.calls[0]['system']
+    assert 'Goal:\nImplement the task document' in system
+    assert 'Current step:\nImplement change' in system
+    assert 'Next pending step:\nRun acceptance' in system
+    assert 'Completed steps:\n- Inspect requirements' in system
+    assert 'Source documents:\n- docs/task.md' in system
+    assert 'docs/task.md:12-28' in system
+    assert 'Acceptance criteria:\n- The focused suite passes.' in system
+    assert 'Latest successful verification:\npassed: pytest -q tests/unit' in system
+    assert 'Latest failed diagnostic:\nfailed: pyright forge' in system
 
 
 def test_plan_mode_uses_read_only_tools_and_does_not_require_diff(

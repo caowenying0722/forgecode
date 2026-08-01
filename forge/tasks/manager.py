@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
-from forge.tasks.state import ActiveTask, StepStatus, TaskStep
+from forge.tasks.state import ActiveTask, StepStatus, TaskSpecDigest, TaskStep
 from forge.tasks.store import TaskStore
 
 
@@ -19,6 +19,7 @@ class TaskManager:
         self.active: ActiveTask | None = None
         self._resume_next_turn = False
         self._latest_directive = ''
+        self._resume_context: dict[str, object] = {}
 
     def begin_turn(self, goal: str) -> ActiveTask:
         if self._resume_next_turn and self.active is not None:
@@ -61,12 +62,11 @@ class TaskManager:
         step_deliverables: dict[str, tuple[str, ...]] | None = None,
         step_criterion_ids: dict[str, tuple[str, ...]] | None = None,
         replace_existing: bool = False,
+        task_spec_digest: TaskSpecDigest | None = None,
     ) -> ActiveTask:
         task = self._require_active()
         if task.planned and not replace_existing:
-            raise ValueError(
-                'The current task already has a plan. Update its steps instead.'
-            )
+            raise ExistingPlanError(task)
         clean_steps = clean_strings(steps, name='steps', maximum=20)
         if len(clean_steps) < 2:
             raise ValueError('A task plan requires at least two steps.')
@@ -99,6 +99,7 @@ class TaskManager:
                 clean_strings(scope_hints or [], name='scope_hints')
             ),
             blocked_reasons=(),
+            task_spec_digest=task_spec_digest or task.task_spec_digest,
         )
         self.store.save(self.active)
         return self.active
@@ -189,6 +190,67 @@ class TaskManager:
             self.store.save(self.active)
         return self.active
 
+    def append_steps(
+        self,
+        steps: list[str],
+        *,
+        constraints: list[str] | None = None,
+        scope_hints: list[str] | None = None,
+        task_spec_digest: TaskSpecDigest | None = None,
+        step_deliverables: dict[str, tuple[str, ...]] | None = None,
+        step_criterion_ids: dict[str, tuple[str, ...]] | None = None,
+    ) -> ActiveTask:
+        task = self._require_planned()
+        additions = clean_strings(steps, name='steps', maximum=20)
+        if not additions:
+            raise ValueError('At least one appended step is required.')
+        if len(task.steps) + len(additions) > 20:
+            raise ValueError('A task plan may contain at most 20 steps.')
+        new_steps = tuple(
+            TaskStep(
+                id=f'step-{len(task.steps) + index}',
+                title=title,
+                deliverables=(step_deliverables or {}).get(
+                    f'step-{index}',
+                    (),
+                ),
+                criterion_ids=(step_criterion_ids or {}).get(
+                    f'step-{index}',
+                    (),
+                ),
+            )
+            for index, title in enumerate(additions, start=1)
+        )
+        self.active = replace(
+            task,
+            steps=(*task.steps, *new_steps),
+            constraints=tuple(
+                dict.fromkeys(
+                    (
+                        *task.constraints,
+                        *clean_strings(
+                            constraints or [],
+                            name='constraints',
+                        ),
+                    )
+                )
+            ),
+            scope_hints=tuple(
+                dict.fromkeys(
+                    (
+                        *task.scope_hints,
+                        *clean_strings(
+                            scope_hints or [],
+                            name='scope_hints',
+                        ),
+                    )
+                )
+            ),
+            task_spec_digest=task_spec_digest or task.task_spec_digest,
+        )
+        self.store.save(self.active)
+        return self.active
+
     def continue_next_turn(self) -> ActiveTask | None:
         '''Keep the active non-terminal task for the next user directive.'''
         if self.active is None or self.active.status != 'in_progress':
@@ -233,6 +295,9 @@ class TaskManager:
         self.store.save(self.active)
         return self.active
 
+    def set_resume_context(self, context: dict[str, object] | None) -> None:
+        self._resume_context = dict(context or {})
+
     def system_suffix(self) -> str:
         task = self.active
         if task is None:
@@ -249,6 +314,12 @@ class TaskManager:
             lines.extend(
                 ['', 'Current step:', task.current_step.title]
             )
+        next_pending = next(
+            (step for step in task.steps if step.status == 'pending'),
+            None,
+        )
+        if next_pending is not None:
+            lines.extend(['', 'Next pending step:', next_pending.title])
         completed = [
             step.title for step in task.steps if step.status == 'completed'
         ]
@@ -263,6 +334,35 @@ class TaskManager:
         if task.scope_hints:
             lines.extend(
                 ['', 'Focus paths:', *[f'- {item}' for item in task.scope_hints]]
+            )
+        if task.task_spec_digest is not None:
+            lines.extend(['', bounded(task.task_spec_digest.render(), 20_000)])
+        latest_success = self._resume_context.get('latest_success')
+        latest_failure = self._resume_context.get('latest_failure')
+        changed_paths = self._resume_context.get('changed_paths')
+        if latest_success:
+            lines.extend(
+                ['', 'Latest successful verification:', str(latest_success)]
+            )
+        if latest_failure:
+            lines.extend(
+                ['', 'Latest failed diagnostic:', str(latest_failure)]
+            )
+        if isinstance(changed_paths, (list, tuple)) and changed_paths:
+            lines.extend(
+                [
+                    '',
+                    'Current changed paths:',
+                    *[f'- {item}' for item in changed_paths],
+                ]
+            )
+        if task.blocked_reasons:
+            lines.extend(
+                [
+                    '',
+                    'Current blockers:',
+                    *[f'- {item}' for item in task.blocked_reasons],
+                ]
             )
         if self._latest_directive:
             lines.extend(
@@ -316,6 +416,37 @@ class TaskManager:
         if not task.planned:
             raise ValueError('The current task does not have a plan.')
         return task
+
+
+class ExistingPlanError(ValueError):
+    '''An actionable rejection when create is used for an existing plan.'''
+
+    def __init__(self, task: ActiveTask) -> None:
+        self.task_id = task.id
+        self.active_step_id = task.current_step_id
+        super().__init__(
+            'The current task already has a plan. Use task_update to update or '
+            'complete a step, operation="append" to add steps, or '
+            'operation="replace" to replace the plan.'
+        )
+
+    @property
+    def details(self) -> dict[str, object]:
+        return {
+            'task_id': self.task_id,
+            'active_step_id': self.active_step_id,
+            'allowed_operations': [
+                'append',
+                'replace',
+                'update_step',
+                'mark_step_completed',
+                'activate_next_step',
+            ],
+            'example': {
+                'operation': 'append',
+                'steps': ['Run remaining acceptance checks'],
+            },
+        }
 
 
 def clean_strings(

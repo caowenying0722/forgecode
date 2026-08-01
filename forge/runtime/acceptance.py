@@ -174,6 +174,12 @@ class AcceptanceLedger:
             if self.criteria[key].status in {'pending', 'blocked'}
         )
 
+    @property
+    def acceptance_verified(self) -> bool:
+        return bool(self.criteria) and all(
+            state.status == 'satisfied' for state in self.criteria.values()
+        )
+
     def evidence_snapshot(
         self,
         *,

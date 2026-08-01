@@ -7,7 +7,11 @@ import hashlib
 from time import time
 from typing import Literal
 
-from forge.runtime.state import VerificationEvidence
+from forge.runtime.state import (
+    VerificationEvidence,
+    VerificationLevel,
+    normalize_verification_levels,
+)
 from forge.runtime.workspace_classification import (
     ArtifactDelta,
     artifact_deltas_from_metadata,
@@ -44,6 +48,7 @@ class VerificationRecord:
     timed_out: bool = False
     command_id: str = ''
     reused: bool = False
+    verification_levels: tuple[VerificationLevel, ...] = ()
 
     @property
     def success(self) -> bool:
@@ -70,6 +75,7 @@ class VerificationRecord:
             generated_artifact_fingerprints=self.generated_artifact_fingerprints,
             cache_fingerprints=self.cache_fingerprints,
             artifact_deltas=self.artifact_deltas,
+            verification_levels=self.verification_levels,
         )
 
 
@@ -164,6 +170,9 @@ class VerificationLedger:
             timed_out=bool(metadata.get('timed_out', False)),
             command_id=str(metadata.get('command_id', '')),
             reused=bool(metadata.get('verification_reused', False)),
+            verification_levels=normalize_verification_levels(
+                metadata.get('verification_levels', [])
+            ),
         )
         return self.record(record)
 

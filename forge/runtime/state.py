@@ -10,6 +10,42 @@ from forge.runtime.workspace_classification import ArtifactDelta
 from forge.tools.base import ToolResult
 
 
+VerificationLevel = Literal[
+    'diff_verified',
+    'typecheck_verified',
+    'unit_tests_verified',
+    'build_verified',
+    'dev_server_verified',
+    'browser_smoke_verified',
+    'interaction_verified',
+    'acceptance_verified',
+]
+VALID_VERIFICATION_LEVELS = frozenset(
+    {
+        'diff_verified',
+        'typecheck_verified',
+        'unit_tests_verified',
+        'build_verified',
+        'dev_server_verified',
+        'browser_smoke_verified',
+        'interaction_verified',
+        'acceptance_verified',
+    }
+)
+
+
+def normalize_verification_levels(
+    value: object,
+) -> tuple[VerificationLevel, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        item  # type: ignore[misc]
+        for item in dict.fromkeys(str(item) for item in value)
+        if item in VALID_VERIFICATION_LEVELS
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class TokenUsage:
     '''Token counts reported by one model request.'''
@@ -67,6 +103,7 @@ class VerificationEvidence:
     generated_artifact_fingerprints: tuple[tuple[str, str], ...] = ()
     cache_fingerprints: tuple[tuple[str, str], ...] = ()
     artifact_deltas: tuple[ArtifactDelta, ...] = ()
+    verification_levels: tuple[VerificationLevel, ...] = ()
 
     @property
     def success(self) -> bool:
@@ -75,6 +112,18 @@ class VerificationEvidence:
     @property
     def bound_source_revision(self) -> int:
         return self.workspace_revision if self.source_revision is None else self.source_revision
+
+    @property
+    def build_verified(self) -> bool:
+        return self.success and 'build_verified' in self.verification_levels
+
+    @property
+    def runtime_verified(self) -> bool:
+        '''Runtime claims require a successful browser observation.'''
+        return (
+            self.success
+            and 'browser_smoke_verified' in self.verification_levels
+        )
 
 
 TaskStatus = Literal[

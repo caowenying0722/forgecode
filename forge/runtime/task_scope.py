@@ -33,6 +33,8 @@ PROJECT_SUPPORT_PATTERNS = (
     'package-lock.json',
     'pnpm-lock.yaml',
     'yarn.lock',
+    'bun.lock',
+    'bun.lockb',
     'tsconfig*.json',
     'vite.config.*',
     'webpack.config.*',
@@ -51,8 +53,16 @@ PROJECT_SUPPORT_PATTERNS = (
     'test/**',
     '__tests__/**',
 )
+PACKAGE_MANAGER_LOCKFILES = {
+    'npm': frozenset({'package-lock.json'}),
+    'pnpm': frozenset({'pnpm-lock.yaml'}),
+    'yarn': frozenset({'yarn.lock'}),
+    'bun': frozenset({'bun.lock', 'bun.lockb'}),
+}
 PACKAGE_LOCKFILE_PATHS = frozenset(
-    {'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'}
+    path
+    for lockfiles in PACKAGE_MANAGER_LOCKFILES.values()
+    for path in lockfiles
 )
 PATH_TOKEN = re.compile(
     r'(?<![\w.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.*{}@()[\]-]*'
@@ -244,11 +254,20 @@ def classify_changed_paths(
         base = workspace_classifier.classify_path(path)
         if base.kind in {'generated_artifact', 'cache', 'unrelated'}:
             result.append(ClassifiedPath(path, 'unrelated'))
-        elif (
-            path in PACKAGE_LOCKFILE_PATHS
-            and 'package.json' in normalized_set
-        ):
-            result.append(ClassifiedPath(path, 'supporting'))
+        elif path in PACKAGE_LOCKFILE_PATHS:
+            dependency_scope_allowed = scope.constrained and (
+                _matches_scope(path, scope.patterns)
+                or (
+                    'package.json' in normalized_set
+                    and _matches_scope('package.json', scope.patterns)
+                )
+            )
+            result.append(
+                ClassifiedPath(
+                    path,
+                    'supporting' if dependency_scope_allowed else 'unrelated',
+                )
+            )
         elif scope.constrained and _matches_scope(path, scope.patterns):
             role: ChangePathRole = (
                 'supporting'

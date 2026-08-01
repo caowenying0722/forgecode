@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from forge.tasks.manager import TaskManager
+from forge.tasks.state import SourceSection, TaskSpecDigest
 
 
 def test_simple_task_stays_in_memory_without_creating_files(
@@ -109,3 +110,82 @@ def test_resume_rejects_invalid_task_id(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match='Invalid task ID'):
         manager.resume('../../outside')
+
+
+def test_continue_next_step_does_not_rebuild_existing_plan(
+    tmp_path: Path,
+) -> None:
+    manager = TaskManager(tmp_path)
+    original = manager.start('Deliver the requested change')
+    manager.plan(['Inspect', 'Implement', 'Verify'])
+    manager.update_step('step-1', 'completed')
+    manager.continue_next_turn()
+
+    continued = manager.begin_turn('Continue the next step')
+
+    assert continued.id == original.id
+    assert continued.current_step_id == 'step-2'
+    assert [step.title for step in continued.steps] == [
+        'Inspect',
+        'Implement',
+        'Verify',
+    ]
+
+
+def test_task_spec_digest_preserves_acceptance_criteria() -> None:
+    digest = TaskSpecDigest(
+        source_paths=('docs/task.md',),
+        goal='Implement the documented behavior',
+        requirements=('Keep existing public APIs compatible.',),
+        acceptance_criteria=(
+            'The focused unit suite passes.',
+            'The changed behavior has revision-bound evidence.',
+        ),
+        required_commands=('pytest -q tests/unit',),
+        required_modules=('forge/runtime',),
+        forbidden_changes=('tests/fixtures/frozen/**',),
+    )
+
+    restored = TaskSpecDigest.from_dict(digest.as_dict())
+
+    assert restored.acceptance_criteria == digest.acceptance_criteria
+    assert restored.required_commands == ('pytest -q tests/unit',)
+
+
+def test_task_spec_digest_can_link_back_to_source_lines() -> None:
+    section = SourceSection(
+        path='docs/task.md',
+        start_line=41,
+        end_line=58,
+        title='Acceptance',
+    )
+    digest = TaskSpecDigest(
+        source_paths=('docs/task.md',),
+        goal='Apply the task specification',
+        relevant_sections=(section,),
+    )
+
+    rendered = digest.render()
+
+    assert 'docs/task.md:41-58' in rendered
+    assert 'authoritative source' in rendered.lower()
+
+
+def test_resume_context_renders_changed_paths_and_blockers(
+    tmp_path: Path,
+) -> None:
+    manager = TaskManager(tmp_path)
+    manager.start('Continue structured work')
+    manager.set_resume_context(
+        {
+            'changed_paths': ['forge/runtime/process.py'],
+            'latest_failure': 'failed: typecheck (exit 1)',
+        }
+    )
+    manager.block(('A required external service is unavailable.',))
+
+    suffix = manager.system_suffix()
+
+    assert 'Current changed paths:\n- forge/runtime/process.py' in suffix
+    assert 'Latest failed diagnostic:\nfailed: typecheck' in suffix
+    assert 'Current blockers:' in suffix

@@ -1219,6 +1219,7 @@ class Conversation:
                         self.workspace_tracker,
                         verification_state.latest,
                         self.working_state,
+                        self.acceptance_ledger,
                     )
                     if (
                         completion_evidence.has_authoritative_items
@@ -3168,6 +3169,8 @@ class Conversation:
             active_task=self.task_manager.active,
             interaction_mode=self.interaction_mode,
             permission_mode=self.permission.mode,
+            resume_context=self._session_resume_context(),
+            acceptance_ledger=self.acceptance_ledger.as_dict(),
         )
         self.session_id = snapshot.id
         return snapshot.id
@@ -3199,6 +3202,14 @@ class Conversation:
         self.messages[:] = snapshot.messages
         self.session_id = snapshot.id
         self.task_manager.active = snapshot.active_task
+        self.task_manager.set_resume_context(
+            getattr(snapshot, 'resume_context', None)
+        )
+        if (
+            self.task_manager.active is not None
+            and self.task_manager.active.status == 'in_progress'
+        ):
+            self.task_manager.continue_next_turn()
         if isinstance(getattr(snapshot, 'acceptance_ledger', None), dict):
             restored = AcceptanceLedger.from_dict(
                 snapshot.acceptance_ledger
@@ -3207,6 +3218,9 @@ class Conversation:
             self.acceptance_ledger.current_source_revision = (
                 restored.current_source_revision
             )
+        else:
+            self.acceptance_ledger.criteria.clear()
+            self.acceptance_ledger.current_source_revision = 0
         self.interaction_mode = normalize_interaction_mode(
             snapshot.interaction_mode
         )
@@ -3237,8 +3251,56 @@ class Conversation:
                 event,
                 (WorkspaceChanged, TurnCompleted),
             ),
+            resume_context=self._session_resume_context(),
+            acceptance_ledger=self.acceptance_ledger.as_dict(),
         )
         self.session_id = snapshot.id
+
+    def _session_resume_context(self) -> dict[str, object]:
+        success = next(
+            (
+                record
+                for record in reversed(self.verification_ledger.records)
+                if record.success
+            ),
+            None,
+        )
+        failure = next(
+            (
+                record
+                for record in reversed(self.verification_ledger.records)
+                if not record.success
+            ),
+            None,
+        )
+
+        def summary(record: object | None) -> str:
+            if record is None:
+                return ''
+            command = str(getattr(record, 'command', ''))
+            status = str(getattr(record, 'status', ''))
+            exit_code = int(getattr(record, 'exit_code', -1))
+            revision = int(getattr(record, 'source_revision', 0))
+            detail = str(getattr(record, 'stdout_stderr_summary', '')).strip()
+            rendered = (
+                f'{status}: {command} (exit {exit_code}, source revision '
+                f'{revision})'
+            )
+            if detail:
+                rendered += f'\n{detail[:2_000]}'
+            return rendered
+
+        task = self.task_manager.active
+        return {
+            'latest_success': summary(success),
+            'latest_failure': summary(failure),
+            'changed_paths': list(
+                self.workspace_tracker.changed_paths
+                if self.workspace_tracker is not None
+                else ()
+            ),
+            'blockers': list(task.blocked_reasons if task is not None else ()),
+        }
 
     def _persist_rollout_interruption(self, error: Exception) -> None:
         if not self._rollout_enabled:
@@ -3255,6 +3317,8 @@ class Conversation:
                 interaction_mode=self.interaction_mode,
                 permission_mode=self.permission.mode,
                 update_workspace=True,
+                resume_context=self._session_resume_context(),
+                acceptance_ledger=self.acceptance_ledger.as_dict(),
             )
         except OSError:
             pass
@@ -3377,6 +3441,7 @@ def _completion_evidence(
     tracker: WorkspaceTracker | None,
     verification: VerificationEvidence | None,
     working_state: WorkingState,
+    acceptance_ledger: AcceptanceLedger,
 ) -> CompletionEvidence:
     return CompletionEvidence.from_runtime(
         changed_paths=(
@@ -3384,6 +3449,7 @@ def _completion_evidence(
         ),
         verification=verification,
         repository_paths=working_state.evidence_paths,
+        acceptance_verified=acceptance_ledger.acceptance_verified,
     )
 
 

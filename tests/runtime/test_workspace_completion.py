@@ -26,6 +26,7 @@ from forge.runtime.workspace import WorkspaceTracker, should_skip_workspace_path
 from forge.runtime.workspace_classification import (
     ChangeSetClassification,
     ClassifiedChange,
+    WorkspaceChangeClassifier,
 )
 from forge.tasks.manager import TaskManager
 from forge.tools.filesystem import CreateDirectoryTool
@@ -1679,3 +1680,60 @@ def test_lockfile_does_not_expand_scope_to_unrelated_paths() -> None:
 
     assert relevance.relevant is False
     assert 'notes/debug.txt' in relevance.reasons[0]
+
+
+def test_new_npm_project_accepts_package_lock() -> None:
+    scope = infer_task_scope(
+        'Create a package-managed project',
+        scope_hints=('package.json',),
+        scope_hint_source='allowed_path',
+    )
+
+    relevance = evaluate_change_relevance(
+        ('package.json', 'package-lock.json'),
+        scope,
+    )
+
+    assert relevance.relevant is True
+
+
+def test_lockfile_rule_does_not_allow_unrelated_files() -> None:
+    scope = infer_task_scope(
+        'Update project dependencies',
+        scope_hints=('package.json',),
+        scope_hint_source='allowed_path',
+    )
+
+    for lockfile in (
+        'package-lock.json',
+        'pnpm-lock.yaml',
+        'yarn.lock',
+        'bun.lock',
+        'bun.lockb',
+    ):
+        relevance = evaluate_change_relevance(
+            ('package.json', lockfile, 'unrelated/private.txt'),
+            scope,
+        )
+        assert relevance.relevant is False
+        assert 'unrelated/private.txt' in relevance.reasons[0]
+
+
+def test_lockfile_requires_explicit_dependency_or_project_scope() -> None:
+    unconstrained = infer_task_scope('Make the requested change')
+
+    relevance = evaluate_change_relevance(
+        ('src/main.ts', 'package-lock.json'),
+        unconstrained,
+    )
+
+    assert relevance.relevant is False
+    assert 'package-lock.json' in relevance.reasons[0]
+
+
+def test_bun_lockfiles_are_supporting_config_not_generated_artifacts() -> None:
+    classifier = WorkspaceChangeClassifier()
+
+    for path in ('bun.lock', 'bun.lockb'):
+        classified = classifier.classify_path(path)
+        assert classified.kind == 'configuration'

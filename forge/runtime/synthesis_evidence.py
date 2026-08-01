@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from forge.context.working import answer_mentions_any_path
-from forge.runtime.state import VerificationEvidence
+from forge.runtime.state import VerificationEvidence, VerificationLevel
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +18,7 @@ class CompletionEvidence:
     verification_exit_code: int | None = None
     verification_source_revision: int | None = None
     repository_paths: tuple[str, ...] = ()
+    verification_levels: tuple[VerificationLevel, ...] = ()
 
     @classmethod
     def from_runtime(
@@ -26,7 +27,15 @@ class CompletionEvidence:
         changed_paths: tuple[str, ...],
         verification: VerificationEvidence | None,
         repository_paths: tuple[str, ...] = (),
+        acceptance_verified: bool = False,
     ) -> 'CompletionEvidence':
+        levels = list(
+            verification.verification_levels
+            if verification is not None
+            else ()
+        )
+        if acceptance_verified:
+            levels.append('acceptance_verified')
         return cls(
             changed_paths=changed_paths,
             verification_command=(
@@ -44,6 +53,7 @@ class CompletionEvidence:
                 else None
             ),
             repository_paths=repository_paths,
+            verification_levels=tuple(dict.fromkeys(levels)),
         )
 
     @property
@@ -124,6 +134,20 @@ def render_completion_evidence_requirements(
             'Repository evidence that may also be cited:\n'
             + '\n'.join(f'- {path}' for path in evidence.repository_paths)
         )
+    if evidence.verification_levels:
+        sections.append(
+            'Do not claim a stronger verification level than these recorded '
+            'levels:\n'
+            + '\n'.join(f'- {item}' for item in evidence.verification_levels)
+        )
+    if (
+        'build_verified' in evidence.verification_levels
+        and 'browser_smoke_verified' not in evidence.verification_levels
+    ):
+        sections.append(
+            'The project passed its build, but browser runtime and interaction '
+            'behavior have not been demonstrated.'
+        )
     return '\n\n'.join(sections)
 
 
@@ -153,13 +177,18 @@ def build_completion_fallback_summary(
             lines.append(
                 f'- source revision: {evidence.verification_source_revision}'
             )
-    lines.extend(
-        [
-            '',
-            'Limitations:',
-            '- No additional semantic or visual verification evidence was recorded.',
-        ]
-    )
+    lines.extend(['', 'Limitations:'])
+    if (
+        'build_verified' in evidence.verification_levels
+        and 'browser_smoke_verified' not in evidence.verification_levels
+    ):
+        lines.append(
+            '- Browser runtime and interaction behavior were not verified.'
+        )
+    else:
+        lines.append(
+            '- No additional semantic or visual verification evidence was recorded.'
+        )
     return '\n'.join(lines)
 
 

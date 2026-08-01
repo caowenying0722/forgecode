@@ -313,6 +313,12 @@ def recovery_system_suffix(
 ) -> str:
     synthesis_mode = _synthesis_mode(state)
     if synthesis_mode == 'finalization':
+        latest = _latest_verification(state)
+        levels = (
+            ', '.join(latest.verification_levels)
+            if latest is not None and latest.verification_levels
+            else 'none recorded'
+        )
         return (
             '\n\n[ForgeCode Finalization Recovery]\n'
             'The current workspace revision already has a real Diff and '
@@ -321,7 +327,9 @@ def recovery_system_suffix(
             "user's language or call finish_task alone. State what changed "
             'and the exact verification performed. Be honest about anything '
             'that was not semantically or visually verified. Do not request '
-            'any tool except finish_task.'
+            'any tool except finish_task. Recorded verification levels: '
+            f'{levels}. A build-only result does not prove browser runtime or '
+            'interaction behavior.'
         )
     if (
         _planning_recovery_active(state)

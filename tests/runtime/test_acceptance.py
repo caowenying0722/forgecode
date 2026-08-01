@@ -477,3 +477,34 @@ def test_session_rollout_replays_acceptance_ledger_state(
     assert resumed.acceptance_ledger is not None
     rebuilt = AcceptanceLedger.from_dict(resumed.acceptance_ledger)
     assert rebuilt.satisfied_ids() == ('criterion-1',)
+
+
+def test_acceptance_level_requires_every_criterion_to_be_satisfied() -> None:
+    ledger = AcceptanceLedger.from_contract(
+        change_contract(criteria=('Typecheck passes.', 'Unit tests pass.'))
+    )
+    ledger.record_evidence(
+        AcceptanceEvidence(
+            criterion_id='criterion-1',
+            criterion_text='Typecheck passes.',
+            status='satisfied',
+            evidence_type='typecheck',
+            producer='test',
+            confidence=1.0,
+        )
+    )
+
+    assert ledger.acceptance_verified is False
+
+    ledger.record_evidence(
+        AcceptanceEvidence(
+            criterion_id='criterion-2',
+            criterion_text='Unit tests pass.',
+            status='satisfied',
+            evidence_type='test_result',
+            producer='test',
+            confidence=1.0,
+        )
+    )
+
+    assert ledger.acceptance_verified is True

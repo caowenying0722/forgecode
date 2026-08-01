@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from forge.sessions.store import SessionSnapshot, SessionStore
 from forge.tasks.state import ActiveTask
 
@@ -18,6 +20,8 @@ class SessionManager:
         active_task: ActiveTask | None,
         interaction_mode: str,
         permission_mode: str,
+        resume_context: dict[str, Any] | None = None,
+        acceptance_ledger: dict[str, Any] | None = None,
     ) -> SessionSnapshot:
         return self.store.save(
             messages,
@@ -25,6 +29,8 @@ class SessionManager:
             active_task=active_task,
             interaction_mode=interaction_mode,
             permission_mode=permission_mode,
+            resume_context=resume_context,
+            acceptance_ledger=acceptance_ledger,
         )
 
     def record_event(
@@ -37,6 +43,8 @@ class SessionManager:
         interaction_mode: str,
         permission_mode: str,
         update_workspace: bool = False,
+        resume_context: dict[str, Any] | None = None,
+        acceptance_ledger: dict[str, Any] | None = None,
     ) -> SessionSnapshot:
         return self.store.record_event(
             event,
@@ -46,6 +54,8 @@ class SessionManager:
             interaction_mode=interaction_mode,
             permission_mode=permission_mode,
             update_workspace=update_workspace,
+            resume_context=resume_context,
+            acceptance_ledger=acceptance_ledger,
         )
 
     def load(self, session_id: str | None) -> SessionSnapshot:

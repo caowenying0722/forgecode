@@ -16,7 +16,11 @@ from forge.runtime.completion import (
     matches_any,
 )
 from forge.runtime.intent import TaskContract
-from forge.runtime.state import ToolCall, VerificationEvidence
+from forge.runtime.state import (
+    ToolCall,
+    VerificationEvidence,
+    normalize_verification_levels,
+)
 from forge.runtime.task_scope import (
     TaskScope,
     evaluate_change_relevance,
@@ -656,6 +660,20 @@ def _verification_type_evidence(
     if verification is None or not verification.success:
         return set()
     types = {verification.verification_type}
+    level_types = {
+        'typecheck_verified': 'typecheck',
+        'unit_tests_verified': 'test',
+        'build_verified': 'build',
+        'dev_server_verified': 'smoke',
+        'browser_smoke_verified': 'smoke',
+        'interaction_verified': 'runtime_integration',
+        'acceptance_verified': 'acceptance',
+    }
+    types.update(
+        level_types[level]
+        for level in verification.verification_levels
+        if level in level_types
+    )
     command = verification.command.casefold()
     if 'tsc' in command and ('--noemit' in command or '--no-emit' in command):
         types.add('typecheck')
@@ -728,6 +746,9 @@ def verification_from_result(
             verification_side_effect_paths=tuple(
                 str(path)
                 for path in metadata.get('verification_side_effect_paths', [])
+            ),
+            verification_levels=normalize_verification_levels(
+                metadata.get('verification_levels', [])
             ),
         )
     except (KeyError, TypeError, ValueError):

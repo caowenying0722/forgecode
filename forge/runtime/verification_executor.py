@@ -254,6 +254,12 @@ class VerificationExecutor:
             'verification': True,
             'verification_status': verification_status,
             'verification_type': workspace_scope.verification_type,
+            'verification_levels': list(
+                verification_levels_for(
+                    resolved.verification_types,
+                    command=command,
+                )
+            ),
             'verification_artifact_scope': [
                 {
                     'pattern': rule.pattern,
@@ -327,6 +333,27 @@ class VerificationExecutor:
         if workspace_scope.reusable:
             self.tracker.verification_cache[key] = passed
         return passed
+
+
+def verification_levels_for(
+    verification_types: tuple[str, ...],
+    *,
+    command: str,
+) -> tuple[str, ...]:
+    '''Map executed validators to claims no stronger than their evidence.'''
+    mapping = {
+        'typecheck': 'typecheck_verified',
+        'test': 'unit_tests_verified',
+        'build': 'build_verified',
+    }
+    levels = [
+        mapping[item]
+        for item in verification_types
+        if item in mapping
+    ]
+    if command.strip().casefold().startswith('git diff'):
+        levels.append('diff_verified')
+    return tuple(dict.fromkeys(levels))
 
 
 def _workspace_relative_scope(

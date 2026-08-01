@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from forge.runtime.acceptance import (
     AcceptanceEvidence,
@@ -13,7 +13,8 @@ from forge.runtime.acceptance import (
     evidence_from_payload,
 )
 from forge.runtime.task_scope import scope_patterns_from_hints
-from forge.tasks.manager import TaskManager
+from forge.tasks.manager import ExistingPlanError, TaskManager
+from forge.tasks.state import TaskSpecDigest
 from forge.tools.base import Tool, ToolExecutionError, ToolInput, ToolResult
 
 
@@ -51,8 +52,39 @@ class TaskPlanStepInput(BaseModel):
     criterion_ids: list[str] = Field(default_factory=list, max_length=20)
 
 
+class SourceSectionInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    path: str = Field(min_length=1, max_length=1_000)
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    title: str = Field(default='', max_length=1_000)
+
+    @model_validator(mode='after')
+    def validate_line_range(self) -> SourceSectionInput:
+        if self.end_line < self.start_line:
+            raise ValueError('end_line must be greater than or equal to start_line.')
+        return self
+
+
+class TaskSpecDigestInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    source_paths: list[str] = Field(min_length=1, max_length=20)
+    goal: str = Field(min_length=1, max_length=20_000)
+    requirements: list[str] = Field(default_factory=list, max_length=100)
+    acceptance_criteria: list[str] = Field(default_factory=list, max_length=100)
+    required_commands: list[str] = Field(default_factory=list, max_length=50)
+    required_modules: list[str] = Field(default_factory=list, max_length=50)
+    forbidden_changes: list[str] = Field(default_factory=list, max_length=50)
+    relevant_sections: list[SourceSectionInput] = Field(
+        default_factory=list,
+        max_length=50,
+    )
+
+
 class TaskPlanInput(ToolInput):
-    steps: list[str | TaskPlanStepInput] = Field(min_length=2, max_length=20)
+    steps: list[str | TaskPlanStepInput] = Field(min_length=1, max_length=20)
     constraints: list[str] = Field(default_factory=list, max_length=20)
     scope_hints: list[str] = Field(
         default_factory=list,
@@ -64,6 +96,17 @@ class TaskPlanInput(ToolInput):
         ),
     )
     replace: bool = False
+    operation: Literal['create', 'append', 'replace'] = 'create'
+    task_spec: TaskSpecDigestInput | None = None
+
+    @model_validator(mode='after')
+    def validate_step_count(self) -> TaskPlanInput:
+        operation = 'replace' if self.replace else self.operation
+        if operation != 'append' and len(self.steps) < 2:
+            raise ValueError(
+                'A created or replaced plan requires at least two steps.'
+            )
+        return self
 
 
 class TaskPlanTool(Tool[TaskPlanInput]):
@@ -75,7 +118,9 @@ class TaskPlanTool(Tool[TaskPlanInput]):
         'listings, one command, one file read, or a small focused edit. Do '
         'not use this for durable project task queues; use task-graph tools '
         'only when persistent dependency tracking is explicitly needed. A '
-        'current plan is replaced only when replace=true.'
+        'For an existing plan use operation="append", task_update to update '
+        'or complete a step, or operation="replace" (replace=true remains a '
+        'compatibility alias).'
     )
     input_model = TaskPlanInput
 
@@ -93,23 +138,51 @@ class TaskPlanTool(Tool[TaskPlanInput]):
             for value in arguments.scope_hints
             if not scope_patterns_from_hints((value,))
         ]
+        operation = 'replace' if arguments.replace else arguments.operation
+        digest = (
+            TaskSpecDigest.from_dict(arguments.task_spec.model_dump())
+            if arguments.task_spec is not None
+            else None
+        )
         try:
-            task = self.manager.plan(
-                titles,
-                constraints=arguments.constraints,
-                scope_hints=list(scope_patterns),
-                step_deliverables=step_deliverables,
-                step_criterion_ids=step_criterion_ids,
-                replace_existing=arguments.replace,
-            )
+            if operation == 'append':
+                task = self.manager.append_steps(
+                    titles,
+                    constraints=arguments.constraints,
+                    scope_hints=list(scope_patterns),
+                    task_spec_digest=digest,
+                    step_deliverables=step_deliverables,
+                    step_criterion_ids=step_criterion_ids,
+                )
+            else:
+                task = self.manager.plan(
+                    titles,
+                    constraints=arguments.constraints,
+                    scope_hints=list(scope_patterns),
+                    step_deliverables=step_deliverables,
+                    step_criterion_ids=step_criterion_ids,
+                    replace_existing=operation == 'replace',
+                    task_spec_digest=digest,
+                )
+        except ExistingPlanError as error:
+            raise ToolExecutionError(
+                'task_plan_rejected',
+                str(error),
+                details=error.details,
+            ) from error
         except ValueError as error:
             raise ToolExecutionError('task_plan_rejected', str(error)) from error
         return ToolResult.ok(
-            f'Created a {len(task.steps)}-step task plan.',
+            (
+                f'Appended {len(titles)} step(s) to the task plan.'
+                if operation == 'append'
+                else f'Created a {len(task.steps)}-step task plan.'
+            ),
             content=self.manager.describe(),
             metadata={
                 'task_id': task.id,
                 'step_count': len(task.steps),
+                'operation': operation,
                 'ignored_scope_hints': ignored_scope_hints,
                 'step_criterion_ids': {
                     step.id: list(step.criterion_ids)

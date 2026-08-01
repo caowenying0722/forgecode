@@ -43,6 +43,7 @@ class SessionSnapshot:
     workspace_digest: str | None = None
     parent_session_id: str | None = None
     forked_at_seq: int | None = None
+    resume_context: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +65,7 @@ class SessionSnapshot:
             'workspace_digest': self.workspace_digest,
             'parent_session_id': self.parent_session_id,
             'forked_at_seq': self.forked_at_seq,
+            'resume_context': self.resume_context,
         }
 
     @classmethod
@@ -101,6 +103,11 @@ class SessionSnapshot:
             workspace_digest=optional_string(data.get('workspace_digest')),
             parent_session_id=optional_string(data.get('parent_session_id')),
             forked_at_seq=optional_int(data.get('forked_at_seq')),
+            resume_context=(
+                dict(data['resume_context'])
+                if isinstance(data.get('resume_context'), dict)
+                else None
+            ),
         )
 
 
@@ -124,6 +131,8 @@ class SessionStore:
         update_workspace: bool = True,
         parent_session_id: str | None = None,
         forked_at_seq: int | None = None,
+        resume_context: dict[str, Any] | None = None,
+        acceptance_ledger: dict[str, Any] | None = None,
     ) -> SessionSnapshot:
         resolved_id = session_id or new_session_id()
         validate_session_id(resolved_id)
@@ -139,6 +148,8 @@ class SessionStore:
             update_workspace=update_workspace,
             parent_session_id=parent_session_id,
             forked_at_seq=forked_at_seq,
+            resume_context=resume_context,
+            acceptance_ledger=acceptance_ledger,
         )
         if existing is None:
             self._materialize(snapshot)
@@ -162,6 +173,8 @@ class SessionStore:
         interaction_mode: str,
         permission_mode: str,
         update_workspace: bool = False,
+        resume_context: dict[str, Any] | None = None,
+        acceptance_ledger: dict[str, Any] | None = None,
     ) -> SessionSnapshot:
         resolved_id = session_id or new_session_id()
         validate_session_id(resolved_id)
@@ -175,6 +188,8 @@ class SessionStore:
             interaction_mode=interaction_mode,
             permission_mode=permission_mode,
             update_workspace=update_workspace,
+            resume_context=resume_context,
+            acceptance_ledger=acceptance_ledger,
         )
         if existing is None:
             self._materialize(snapshot)
@@ -209,6 +224,8 @@ class SessionStore:
             permission_mode=source.permission_mode,
             parent_session_id=source.id,
             forked_at_seq=self.rollout.last_sequence(source.id),
+            resume_context=source.resume_context,
+            acceptance_ledger=source.acceptance_ledger,
         )
 
     def consistency_warnings(self, snapshot: SessionSnapshot) -> tuple[str, ...]:
@@ -243,6 +260,8 @@ class SessionStore:
         update_workspace: bool,
         parent_session_id: str | None = None,
         forked_at_seq: int | None = None,
+        resume_context: dict[str, Any] | None = None,
+        acceptance_ledger: dict[str, Any] | None = None,
     ) -> SessionSnapshot:
         now = datetime.now().astimezone().isoformat()
         identity = (
@@ -262,7 +281,9 @@ class SessionStore:
             messages=json_round_trip(messages),
             active_task=active_task,
             acceptance_ledger=(
-                existing.acceptance_ledger if existing is not None else None
+                json_round_trip(acceptance_ledger)
+                if acceptance_ledger is not None
+                else existing.acceptance_ledger if existing is not None else None
             ),
             interaction_mode=interaction_mode,
             permission_mode=permission_mode,
@@ -278,6 +299,11 @@ class SessionStore:
                 forked_at_seq
                 if forked_at_seq is not None
                 else existing.forked_at_seq if existing else None
+            ),
+            resume_context=(
+                json_round_trip(resume_context)
+                if resume_context is not None
+                else existing.resume_context if existing else None
             ),
         )
 
@@ -394,8 +420,8 @@ def validate_session_id(session_id: str) -> None:
         raise ValueError(f'Invalid session ID: {session_id}')
 
 
-def json_round_trip(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return json.loads(json.dumps(messages, ensure_ascii=False, default=str))
+def json_round_trip(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
 def workspace_identity(root: Path) -> dict[str, str | None]:

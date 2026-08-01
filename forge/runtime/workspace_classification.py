@@ -83,6 +83,8 @@ CONFIG_PATH_PATTERNS = (
     'vite.config.*',
     'webpack.config.*',
     'yarn.lock',
+    'bun.lock',
+    'bun.lockb',
 )
 SUPPORTING_PATH_PATTERNS = (
     'README*',

@@ -10,7 +10,7 @@ from forge.runtime.state import (
 )
 from forge.runtime.session_manager import SessionManager
 from forge.sessions.store import SessionStore
-from forge.tasks.state import ActiveTask
+from forge.tasks.state import ActiveTask, SourceSection, TaskSpecDigest
 from forge.tools.base import ToolResult
 
 
@@ -50,6 +50,52 @@ def test_session_store_reuses_session_id_on_save(tmp_path: Path) -> None:
     assert second.id == first.id
     assert second.created_at == first.created_at
     assert len(store.load(first.id).messages) == 2
+
+
+def test_session_round_trip_preserves_task_spec_and_resume_context(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path)
+    task = ActiveTask(
+        id='task-123456789abc',
+        goal='Implement specification',
+        task_spec_digest=TaskSpecDigest(
+            source_paths=('docs/task.md',),
+            goal='Implement specification',
+            acceptance_criteria=('All focused checks pass.',),
+            relevant_sections=(
+                SourceSection('docs/task.md', 10, 25, 'Requirements'),
+            ),
+        ),
+    )
+    saved = store.save(
+        [{'role': 'user', 'content': 'continue'}],
+        active_task=task,
+        resume_context={
+            'latest_success': 'passed: pytest -q',
+            'changed_paths': ['forge/runtime/state.py'],
+        },
+        acceptance_ledger={
+            'current_source_revision': 2,
+            'criteria': [],
+        },
+    )
+
+    restored = store.load(saved.id)
+
+    assert restored.active_task is not None
+    assert restored.active_task.task_spec_digest is not None
+    assert restored.active_task.task_spec_digest.acceptance_criteria == (
+        'All focused checks pass.',
+    )
+    assert restored.resume_context == {
+        'latest_success': 'passed: pytest -q',
+        'changed_paths': ['forge/runtime/state.py'],
+    }
+    assert restored.acceptance_ledger == {
+        'current_source_revision': 2,
+        'criteria': [],
+    }
 
 
 def test_session_store_saves_full_history(

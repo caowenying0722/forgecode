@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from hashlib import sha256
+import locale
 import os
 from pathlib import Path
 import signal
@@ -17,6 +19,62 @@ class ProcessResult:
     stderr: str
     duration_seconds: float
     timed_out: bool = False
+    stdout_encoding: str = 'utf-8'
+    stderr_encoding: str = 'utf-8'
+    decode_warnings: tuple[str, ...] = ()
+    stdout_raw_hash: str = ''
+    stderr_raw_hash: str = ''
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedProcessOutput:
+    text: str
+    encoding: str
+    warning: str = ''
+
+
+def decode_process_output(
+    data: bytes,
+    *,
+    stream: str,
+    preferred_encoding: str | None = None,
+    windows: bool | None = None,
+) -> DecodedProcessOutput:
+    '''Decode one subprocess stream without losing execution diagnostics.'''
+    if not data:
+        return DecodedProcessOutput('', 'utf-8')
+    preferred = preferred_encoding or locale.getpreferredencoding(False)
+    candidates = ['utf-8', preferred]
+    is_windows = windows if windows is not None else os.name == 'nt'
+    if is_windows:
+        candidates.extend(('cp936', 'gbk'))
+    unique_candidates = tuple(
+        dict.fromkeys(
+            encoding.strip().casefold()
+            for encoding in candidates
+            if encoding and encoding.strip()
+        )
+    )
+    failures: list[str] = []
+    for encoding in unique_candidates:
+        try:
+            text = data.decode(encoding, errors='strict')
+        except (LookupError, UnicodeDecodeError):
+            failures.append(encoding)
+            continue
+        warning = ''
+        if failures:
+            warning = (
+                f'{stream} was decoded using {encoding} after strict decode '
+                f'failed for {", ".join(failures)}.'
+            )
+        return DecodedProcessOutput(text, encoding, warning)
+    fallback = unique_candidates[0] if unique_candidates else 'utf-8'
+    return DecodedProcessOutput(
+        data.decode(fallback, errors='replace'),
+        fallback,
+        f'{stream} contained invalid bytes; undecodable sequences were replaced.',
+    )
 
 
 async def run_process(
@@ -74,12 +132,22 @@ async def run_process(
     except asyncio.CancelledError:
         await terminate_process_tree(process)
         raise
+    stdout = decode_process_output(stdout_bytes, stream='stdout')
+    stderr = decode_process_output(stderr_bytes, stream='stderr')
+    decode_warnings = tuple(
+        item for item in (stdout.warning, stderr.warning) if item
+    )
     return ProcessResult(
         exit_code=process.returncode if process.returncode is not None else -1,
-        stdout=stdout_bytes.decode('utf-8', errors='replace'),
-        stderr=stderr_bytes.decode('utf-8', errors='replace'),
+        stdout=stdout.text,
+        stderr=stderr.text,
         duration_seconds=perf_counter() - started,
         timed_out=timed_out,
+        stdout_encoding=stdout.encoding,
+        stderr_encoding=stderr.encoding,
+        decode_warnings=decode_warnings,
+        stdout_raw_hash=sha256(stdout_bytes).hexdigest(),
+        stderr_raw_hash=sha256(stderr_bytes).hexdigest(),
     )
 
 
@@ -119,6 +187,11 @@ def process_metadata(result: ProcessResult) -> dict[str, object]:
         'stderr': result.stderr,
         'duration_seconds': result.duration_seconds,
         'timed_out': result.timed_out,
+        'stdout_encoding': result.stdout_encoding,
+        'stderr_encoding': result.stderr_encoding,
+        'decode_warnings': list(result.decode_warnings),
+        'stdout_raw_hash': result.stdout_raw_hash,
+        'stderr_raw_hash': result.stderr_raw_hash,
     }
 
 

@@ -85,3 +85,52 @@ def test_task_plan_rejects_simple_one_step_plan(tmp_path: Path) -> None:
     assert manager.active is not None
     assert manager.active.planned is False
     assert not manager.store.current_path.exists()
+
+
+def test_existing_plan_error_explains_supported_update_operations(
+    tmp_path: Path,
+) -> None:
+    manager = TaskManager(tmp_path)
+    manager.start('Implement and verify')
+    registry = ToolRegistry(create_task_tools(tmp_path, manager))
+    asyncio.run(
+        registry.execute('task_plan', {'steps': ['Inspect', 'Implement']})
+    )
+
+    result = asyncio.run(
+        registry.execute('task_plan', {'steps': ['Re-read', 'Rebuild']})
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == 'task_plan_rejected'
+    assert result.error.details['task_id'] == manager.active.id
+    assert result.error.details['active_step_id'] == 'step-1'
+    assert 'append' in result.error.details['allowed_operations']
+    assert result.error.details['example']['operation'] == 'append'
+
+
+def test_task_plan_can_append_without_replacing_existing_steps(
+    tmp_path: Path,
+) -> None:
+    manager = TaskManager(tmp_path)
+    manager.start('Implement and verify')
+    registry = ToolRegistry(create_task_tools(tmp_path, manager))
+    asyncio.run(
+        registry.execute('task_plan', {'steps': ['Inspect', 'Implement']})
+    )
+
+    result = asyncio.run(
+        registry.execute(
+            'task_plan',
+            {'operation': 'append', 'steps': ['Verify acceptance']},
+        )
+    )
+
+    assert result.success is True
+    assert manager.active is not None
+    assert [step.title for step in manager.active.steps] == [
+        'Inspect',
+        'Implement',
+        'Verify acceptance',
+    ]
